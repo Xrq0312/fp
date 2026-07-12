@@ -27,6 +27,7 @@ python $renderer $input `
 & $exe $input `
     --output-dir $runOut `
     --input-scale 1000 `
+    --preserve-input-points `
     --point-spacing-resolution-estimator `
     --voxel-leaf 0.2 `
     --strict-plane-distance-scale 1.2 `

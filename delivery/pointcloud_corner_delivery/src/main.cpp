@@ -97,6 +97,7 @@ struct Config {
     float ror_radius_scale = 0.0f;
     int ror_min_neighbors = 0;
     float input_scale = 1.0f;
+    bool preserve_input_points = false;
 };
 
 struct Bounds {
@@ -110,6 +111,7 @@ static void plane_basis(const PlanePatch& patch, Eigen::Vector3f& axis_u, Eigen:
 
 struct PreparedCloud {
     CloudPtr points{new CloudT};
+    CloudPtr full_points{new CloudT};
     float model_resolution = 0.0f;
 };
 
@@ -310,6 +312,7 @@ static Config parse_args(int argc, char** argv) {
     if (auto v = value_after(args, "--ror-radius-scale")) cfg.ror_radius_scale = std::stof(*v);
     if (auto v = value_after(args, "--ror-min-neighbors")) cfg.ror_min_neighbors = std::stoi(*v);
     if (auto v = value_after(args, "--input-scale")) cfg.input_scale = std::stof(*v);
+    cfg.preserve_input_points = has_flag(args, "--preserve-input-points");
     cfg.legacy_resolution_estimator = !has_flag(args, "--point-spacing-resolution-estimator");
     if (has_flag(args, "--legacy-resolution-estimator")) cfg.legacy_resolution_estimator = true;
     cfg.verbose = !has_flag(args, "--quiet");
@@ -529,6 +532,7 @@ static PreparedCloud prepare_cloud(const CloudPtr& input_cloud, const Config& cf
     PreparedCloud prepared;
     const float reference_resolution = estimate_model_resolution(cropped, cfg);
     prepared.points = apply_preprocessing_filters(cropped, cfg, reference_resolution);
+    prepared.full_points = cfg.preserve_input_points ? cropped : prepared.points;
     prepared.model_resolution = estimate_model_resolution(prepared.points, cfg);
     if (prepared.model_resolution <= 0.0f) prepared.model_resolution = 1e-4f;
     return prepared;
@@ -1523,24 +1527,25 @@ public:
 
 private:
     CornerDetectionResult detect_prepared(PreparedCloud cloud) const {
-        const Bounds bounds = compute_bounds(cloud.points);
+        const Bounds bounds = compute_bounds(cloud.full_points);
         if (cfg_.verbose) {
-            std::cout << "Prepared points: " << cloud.points->size()
+            std::cout << "Detection points: " << cloud.points->size()
+                      << ", full points: " << cloud.full_points->size()
                       << ", model resolution: " << cloud.model_resolution << "\n";
         }
         const auto seed_patches = extract_plane_patches_atoms(
             cloud.points, bounds, cloud.model_resolution, cfg_);
 
         auto patches = expand_patches_per_plane(
-            seed_patches, cloud.points, cloud.model_resolution, cfg_);
+            seed_patches, cloud.full_points, cloud.model_resolution, cfg_);
         trim_support_cloud_conflicts(patches, cloud.model_resolution, cfg_);
         trim_core_cloud_conflicts(patches, cloud.model_resolution, cfg_);
         trim_support_cloud_conflicts(patches, cloud.model_resolution, cfg_);
         filter_weak_visible_patches(patches, cfg_);
-        refresh_output_clouds_from_full_cloud(patches, cloud.points, cloud.model_resolution, cfg_);
+        refresh_output_clouds_from_full_cloud(patches, cloud.full_points, cloud.model_resolution, cfg_);
 
         CornerDetectionResult result;
-        result.corners = extract_corners(cloud.points, patches, bounds, cloud.model_resolution, cfg_);
+        result.corners = extract_corners(cloud.full_points, patches, bounds, cloud.model_resolution, cfg_);
         result.plane_patches = std::move(patches);
         return result;
     }
