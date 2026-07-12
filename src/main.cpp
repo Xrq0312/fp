@@ -23,10 +23,13 @@
 #include <pcl/filters/radius_outlier_removal.h>
 #include <pcl/filters/statistical_outlier_removal.h>
 #include <pcl/filters/voxel_grid.h>
+#include <pcl/features/normal_3d.h>
 #include <pcl/io/ply_io.h>
 #include <pcl/kdtree/kdtree_flann.h>
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
+#include <pcl/search/kdtree.h>
+#include <pcl/segmentation/region_growing.h>
 
 namespace fs = std::filesystem;
 
@@ -67,6 +70,12 @@ struct Config {
     float atom_max_rms_scale = 1.0f;
     float atom_merge_angle_deg = 10.0f;
     float atom_merge_distance_scale = 4.0f;
+    bool region_growing_plane_mode = false;
+    int normal_k = 24;
+    int region_neighbors = 30;
+    float region_smoothness_deg = 3.0f;
+    float region_curvature_threshold = 0.05f;
+    int region_min_cluster_size = 200;
     int max_planes = 80;
     int min_plane_points = 80;
     float max_planarity_error = 0.06f;
@@ -245,7 +254,7 @@ static Config parse_args(int argc, char** argv) {
         std::cout
             << "Usage: pointcloud_corner_compare [inputs...] [options]\n"
             << "Common options: --output-dir, --input-scale, --min/max-x/y/z, --atom-cell-scales,\n"
-            << "  --merge-plane-*, --expand-plane-*, --min-corner-planes,\n"
+            << "  --region-growing-plane-mode, --merge-plane-*, --expand-plane-*, --min-corner-planes,\n"
             << "  --corner-edge-*, --sor-*, --ror-*, --voxel-leaf-scale.\n"
             << "  See README.md for recommended parameter sets.\n";
         std::exit(0);
@@ -282,6 +291,12 @@ static Config parse_args(int argc, char** argv) {
     if (auto v = value_after(args, "--atom-max-rms-scale")) cfg.atom_max_rms_scale = std::stof(*v);
     if (auto v = value_after(args, "--atom-merge-angle-deg")) cfg.atom_merge_angle_deg = std::stof(*v);
     if (auto v = value_after(args, "--atom-merge-distance-scale")) cfg.atom_merge_distance_scale = std::stof(*v);
+    cfg.region_growing_plane_mode = has_flag(args, "--region-growing-plane-mode");
+    if (auto v = value_after(args, "--normal-k")) cfg.normal_k = std::stoi(*v);
+    if (auto v = value_after(args, "--region-neighbors")) cfg.region_neighbors = std::stoi(*v);
+    if (auto v = value_after(args, "--region-smoothness-deg")) cfg.region_smoothness_deg = std::stof(*v);
+    if (auto v = value_after(args, "--region-curvature-threshold")) cfg.region_curvature_threshold = std::stof(*v);
+    if (auto v = value_after(args, "--region-min-cluster-size")) cfg.region_min_cluster_size = std::stoi(*v);
     if (auto v = value_after(args, "--max-planes")) cfg.max_planes = std::stoi(*v);
     if (auto v = value_after(args, "--min-plane-points")) cfg.min_plane_points = std::stoi(*v);
     if (auto v = value_after(args, "--max-planarity-error")) cfg.max_planarity_error = std::stof(*v);
@@ -326,6 +341,8 @@ static Config parse_args(int argc, char** argv) {
         "--min-visible-support-core-ratio", "--min-visible-support-median-ratio", "--min-visible-density-median-ratio",
         "--atom-cell-scales", "--atom-min-points", "--atom-max-planarity-error",
         "--atom-max-rms-scale", "--atom-merge-angle-deg", "--atom-merge-distance-scale",
+        "--normal-k", "--region-neighbors", "--region-smoothness-deg",
+        "--region-curvature-threshold", "--region-min-cluster-size",
         "--max-planes", "--min-plane-points", "--max-planarity-error",
         "--normal-parallel-cos", "--intersection-merge-scale", "--corner-support-radius-scale",
         "--corner-edge-radius-scale", "--corner-edge-multi-scales", "--corner-edge-sample-limit", "--max-corner-edge-score", "--max-corner-edge-growth-ratio",
@@ -834,6 +851,64 @@ static std::vector<PlanePatch> extract_plane_patches_atoms(const CloudPtr& cloud
     for (float scale : cfg.atom_cell_scales) {
         auto scale_patches = extract_plane_patches_atoms_one_scale(cloud, bounds, resolution, scale, cfg);
         patches.insert(patches.end(), scale_patches.begin(), scale_patches.end());
+    }
+    return merge_coplanar_patches(std::move(patches), resolution, cfg);
+}
+
+static std::vector<PlanePatch> extract_plane_patches_region_growing(const CloudPtr& cloud, float resolution, const Config& cfg) {
+    if (!cloud || cloud->size() < static_cast<std::size_t>(std::max(cfg.min_plane_points, 3))) return {};
+
+    pcl::search::Search<PointT>::Ptr tree(new pcl::search::KdTree<PointT>);
+    pcl::PointCloud<pcl::Normal>::Ptr normals(new pcl::PointCloud<pcl::Normal>);
+    pcl::NormalEstimation<PointT, pcl::Normal> normal_estimator;
+    normal_estimator.setInputCloud(cloud);
+    normal_estimator.setSearchMethod(tree);
+    normal_estimator.setKSearch(std::max(cfg.normal_k, 3));
+    normal_estimator.compute(*normals);
+
+    pcl::RegionGrowing<PointT, pcl::Normal> region_growing;
+    region_growing.setInputCloud(cloud);
+    region_growing.setInputNormals(normals);
+    region_growing.setSearchMethod(tree);
+    region_growing.setMinClusterSize(std::max(cfg.region_min_cluster_size, 3));
+    region_growing.setMaxClusterSize(static_cast<int>(std::min<std::size_t>(
+        cloud->size(), static_cast<std::size_t>(std::numeric_limits<int>::max()))));
+    region_growing.setNumberOfNeighbours(std::max(cfg.region_neighbors, 1));
+    region_growing.setSmoothnessThreshold(cfg.region_smoothness_deg / 180.0f * 3.14159265358979323846f);
+    region_growing.setCurvatureThreshold(std::max(cfg.region_curvature_threshold, 0.0f));
+
+    std::vector<pcl::PointIndices> clusters;
+    region_growing.extract(clusters);
+
+    std::vector<PlanePatch> patches;
+    patches.reserve(clusters.size());
+    for (const auto& cluster : clusters) {
+        if (cluster.indices.size() < static_cast<std::size_t>(std::max(cfg.min_plane_points, 3))) continue;
+
+        CloudPtr cluster_cloud(new CloudT);
+        cluster_cloud->reserve(cluster.indices.size());
+        for (int idx : cluster.indices) {
+            if (idx < 0 || static_cast<std::size_t>(idx) >= cloud->size()) continue;
+            cluster_cloud->push_back(cloud->points[static_cast<std::size_t>(idx)]);
+        }
+        cluster_cloud->width = static_cast<std::uint32_t>(cluster_cloud->size());
+        cluster_cloud->height = 1;
+        cluster_cloud->is_dense = cloud->is_dense;
+        if (cluster_cloud->size() < static_cast<std::size_t>(std::max(cfg.min_plane_points, 3))) continue;
+
+        PlanePatch patch = fit_plane_patch(cluster_cloud, cfg);
+        if (patch.planarity_error <= cfg.max_planarity_error) patches.push_back(std::move(patch));
+    }
+
+    std::sort(patches.begin(), patches.end(), [](const PlanePatch& a, const PlanePatch& b) {
+        return a.cloud->size() > b.cloud->size();
+    });
+    if (patches.size() > static_cast<std::size_t>(std::max(cfg.max_planes, 1))) {
+        patches.resize(static_cast<std::size_t>(std::max(cfg.max_planes, 1)));
+    }
+    if (cfg.verbose) {
+        std::cout << "Region-growing clusters: " << clusters.size()
+                  << ", planar seeds: " << patches.size() << "\n";
     }
     return merge_coplanar_patches(std::move(patches), resolution, cfg);
 }
@@ -1533,8 +1608,9 @@ private:
                       << ", full points: " << cloud.full_points->size()
                       << ", model resolution: " << cloud.model_resolution << "\n";
         }
-        const auto seed_patches = extract_plane_patches_atoms(
-            cloud.points, bounds, cloud.model_resolution, cfg_);
+        const auto seed_patches = cfg_.region_growing_plane_mode
+            ? extract_plane_patches_region_growing(cloud.points, cloud.model_resolution, cfg_)
+            : extract_plane_patches_atoms(cloud.points, bounds, cloud.model_resolution, cfg_);
 
         auto patches = expand_patches_per_plane(
             seed_patches, cloud.full_points, cloud.model_resolution, cfg_);

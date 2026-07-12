@@ -30,6 +30,12 @@ python $renderer $input `
     --preserve-input-points `
     --point-spacing-resolution-estimator `
     --voxel-leaf 0.2 `
+    --region-growing-plane-mode `
+    --normal-k 24 `
+    --region-neighbors 30 `
+    --region-smoothness-deg 3.0 `
+    --region-curvature-threshold 0.05 `
+    --region-min-cluster-size 200 `
     --strict-plane-distance-scale 1.2 `
     --support-conflict-scale 1.0 `
     --core-conflict-scale 0.5 `
@@ -40,14 +46,9 @@ python $renderer $input `
     --min-visible-support-median-ratio 0.06 `
     --min-visible-density-median-ratio 0.03 `
     --min-corner-planes 3 `
-    --max-y 30 `
     --expand-plane-distance-scale 1.5 `
     --expand-plane-margin-scale 120 `
-    --atom-cell-scales 48,96,160 `
-    --atom-min-points 40 `
-    --atom-merge-angle-deg 8 `
-    --atom-merge-distance-scale 8 `
-    --max-planes 80 `
+    --max-planes 100 `
     --min-plane-extent-scale 20 `
     --min-plane-aspect-ratio 0.03
 if ($LASTEXITCODE -ne 0) {

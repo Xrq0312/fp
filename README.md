@@ -10,8 +10,10 @@ and saves the final PLY outputs.
 
 1. Load PLY as XYZ.
 2. Optional crop, for example `--max-y 30` for `top_left_cut.ply`.
-3. Build multi-scale local plane atoms from resolution-scaled 3D cells.
-4. Merge adjacent compatible atoms into seed plane candidates.
+3. Build seed plane candidates with one of two modes:
+   - default scanned-cloud mode: multi-scale local plane atoms from resolution-scaled 3D cells;
+   - CAD/model-cloud mode: PCL normal estimation plus normal/curvature region growing.
+4. Merge adjacent compatible seed candidates when they are coplanar.
 5. Fit planes with `rspd-lite` robust residual trimming.
 6. Expand each plane independently on the full-resolution cloud.
 7. Fit each expanded plane strictly with robust residual trimming.
@@ -56,8 +58,15 @@ For the CAD-exported `top_left_cut2.ply` model cloud, use:
 
 That script reads meter coordinates with `--input-scale 1000`, runs the detector, and exports
 diagnostic PNG projections under `results\top_left_cut2_diagnostic\images`.
-The model-exported cloud uses true point-spacing scale plus `--voxel-leaf 0.2`; this avoids the
-historical sparse-sample scale that is calibrated for scanned clouds and over-splits CAD-style data.
+The model-exported cloud uses true point-spacing scale, `--voxel-leaf 0.2`, `--preserve-input-points`,
+and `--region-growing-plane-mode`. Detection runs on the downsampled cloud, but the final plane PLY is
+refilled from the scaled full input cloud.
+
+Current `top_left_cut2.ply` diagnostic count:
+
+| Dataset | Plane Patches | Corners | Output Plane Points |
+| --- | ---: | ---: | ---: |
+| top_left_cut2.ply | 57 | 75 | 9,745,373 / 10,000,014 |
 
 ## Build
 
@@ -77,6 +86,12 @@ historical sparse-sample scale that is calibrated for scanned clouds and over-sp
 - `--point-spacing-resolution-estimator`: use true sampled nearest-neighbor spacing instead of calibrated sparse-sample scale.
 - `--input-scale`: multiplier applied to loaded XYZ coordinates, for example `1000` for meter-to-millimeter model exports.
 - `--preserve-input-points`: use filtered/downsampled points only for detection, then refill output patches from the scaled/cropped input cloud.
+- `--region-growing-plane-mode`: use PCL normal-based Region Growing to produce plane seeds; this is recommended for clean CAD/model point clouds.
+- `--normal-k`: KNN count for normal estimation in Region Growing mode.
+- `--region-neighbors`: neighbor count used while growing smooth normal-consistent regions.
+- `--region-smoothness-deg`: maximum normal-angle difference for Region Growing.
+- `--region-curvature-threshold`: curvature threshold for accepting points into a smooth region.
+- `--region-min-cluster-size`: minimum Region Growing cluster size before plane fitting.
 - `--robust-fit-keep-ratio`: fraction of low-residual points used when refitting a plane in `rspd-lite`.
 - `--strict-plane-distance-scale`: strict post-fit inlier distance used after plane expansion.
 - `--support-conflict-scale`: trims visible support points that sit on ambiguous/non-parallel neighboring planes.
@@ -99,6 +114,10 @@ centroid, support size, and projected extents for debugging.
 
 ## Reference Ideas
 
+- PCL Region Growing Segmentation: normal-angle and curvature constrained connected growth; this is the basis of `--region-growing-plane-mode`.
+- CGAL Shape Detection and Region Growing: model-fitting and region-growing plane extraction for point sets.
+- Schnabel, Wahl, Klein, "Efficient RANSAC for Point-Cloud Shape Detection", 2007: useful baseline for primitive detection, but less stable here than connected normal growing because the model has many adjacent planar faces and edge residuals.
+- Open3D planar patch detection: another open-source reference for normal-driven planar patch extraction and robust patch validation.
 - `xiaohulugo/PointCloudSegmentation`: PLinkage-style local linkage and adjacency-aware patch merging.
 - `abner-math/PlaneDetection`: recursive planar patch detection, neighbor-limited growth, merge-update cycles, and false-positive rejection.
 - `denabazazian/Edge_Extraction`: local covariance eigenvalue contrast for edge-like/high-curvature points; this project scores only final corner candidates so edge evidence can be inspected, or used as a low/high threshold to reject false hull and occlusion-boundary corners without a full-cloud KNN pass.

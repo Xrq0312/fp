@@ -5,7 +5,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-find_package(PCL CONFIG REQUIRED COMPONENTS common io filters kdtree)
+find_package(PCL CONFIG REQUIRED COMPONENTS common io filters kdtree features segmentation)
 find_package(OpenMP)
 
 add_executable(pointcloud_corner_compare
