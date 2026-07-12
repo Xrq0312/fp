@@ -64,6 +64,7 @@ Current recommended counts:
 - `--ror-radius-scale` / `--ror-min-neighbors`: optional radius outlier removal.
 - `--resolution-sample-cap`: number of points sampled when estimating scale.
 - `--point-spacing-resolution-estimator`: use true sampled nearest-neighbor spacing instead of calibrated sparse-sample scale.
+- `--input-scale`: multiplier applied to loaded XYZ coordinates, for example `1000` for meter-to-millimeter model exports.
 - `--robust-fit-keep-ratio`: fraction of low-residual points used when refitting a plane in `rspd-lite`.
 - `--strict-plane-distance-scale`: strict post-fit inlier distance used after plane expansion.
 - `--support-conflict-scale`: trims visible support points that sit on ambiguous/non-parallel neighboring planes.
@@ -80,6 +81,9 @@ Current recommended counts:
 - `--expand-plane-distance-scale`: full-cloud point-to-plane distance threshold.
 - `--min-plane-extent-scale`: rejects patches whose short projected extent is too small.
 - `--min-plane-aspect-ratio`: rejects thin strip-like patches.
+
+Each run also writes `plane_report.csv` beside the output PLY files. It lists every plane patch's normal,
+centroid, support size, and projected extents for debugging.
 
 ## Reference Ideas
 

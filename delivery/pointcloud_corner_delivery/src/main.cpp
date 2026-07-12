@@ -96,6 +96,7 @@ struct Config {
     float sor_stddev = 1.0f;
     float ror_radius_scale = 0.0f;
     int ror_min_neighbors = 0;
+    float input_scale = 1.0f;
 };
 
 struct Bounds {
@@ -241,7 +242,7 @@ static Config parse_args(int argc, char** argv) {
     if (has_flag(args, "--help") || has_flag(args, "-h")) {
         std::cout
             << "Usage: pointcloud_corner_compare [inputs...] [options]\n"
-            << "Common options: --output-dir, --min/max-x/y/z, --atom-cell-scales,\n"
+            << "Common options: --output-dir, --input-scale, --min/max-x/y/z, --atom-cell-scales,\n"
             << "  --merge-plane-*, --expand-plane-*, --min-corner-planes,\n"
             << "  --corner-edge-*, --sor-*, --ror-*, --voxel-leaf-scale.\n"
             << "  See README.md for recommended parameter sets.\n";
@@ -308,6 +309,7 @@ static Config parse_args(int argc, char** argv) {
     if (auto v = value_after(args, "--sor-stddev")) cfg.sor_stddev = std::stof(*v);
     if (auto v = value_after(args, "--ror-radius-scale")) cfg.ror_radius_scale = std::stof(*v);
     if (auto v = value_after(args, "--ror-min-neighbors")) cfg.ror_min_neighbors = std::stoi(*v);
+    if (auto v = value_after(args, "--input-scale")) cfg.input_scale = std::stof(*v);
     cfg.legacy_resolution_estimator = !has_flag(args, "--point-spacing-resolution-estimator");
     if (has_flag(args, "--legacy-resolution-estimator")) cfg.legacy_resolution_estimator = true;
     cfg.verbose = !has_flag(args, "--quiet");
@@ -328,7 +330,8 @@ static Config parse_args(int argc, char** argv) {
         "--hull-min-edge-scale", "--hull-corner-cos", "--hull-max-plane-fraction",
         "--resolution-sample-cap",
         "--load-limit", "--voxel-leaf", "--voxel-leaf-scale",
-        "--sor-mean-k", "--sor-stddev", "--ror-radius-scale", "--ror-min-neighbors"
+        "--sor-mean-k", "--sor-stddev", "--ror-radius-scale", "--ror-min-neighbors",
+        "--input-scale"
     };
 
     for (std::size_t i = 0; i < args.size(); ++i) {
@@ -357,13 +360,20 @@ static std::vector<fs::path> discover_inputs(const Config& cfg) {
     return result;
 }
 
-static CloudPtr load_xyz_cloud(const fs::path& path) {
+static CloudPtr load_xyz_cloud(const fs::path& path, float input_scale) {
     pcl::PCLPointCloud2 blob;
     if (pcl::io::loadPLYFile(path.string(), blob) != 0) {
         throw std::runtime_error("Failed to load PLY: " + path.string());
     }
     CloudPtr cloud(new CloudT);
     pcl::fromPCLPointCloud2(blob, *cloud);
+    if (input_scale != 1.0f) {
+        for (auto& p : cloud->points) {
+            p.x *= input_scale;
+            p.y *= input_scale;
+            p.z *= input_scale;
+        }
+    }
     return cloud;
 }
 
@@ -1470,6 +1480,35 @@ static ColorCloudPtr make_patch_cloud(const std::vector<PlanePatch>& patches) {
     return out;
 }
 
+static void save_plane_report(const fs::path& path, const std::vector<PlanePatch>& patches) {
+    std::ofstream out(path);
+    if (!out) throw std::runtime_error("Failed to open plane report: " + path.string());
+    out << "id,core_points,visible_points,output_points,nx,ny,nz,d,cx,cy,cz,planarity_error,extent_u,extent_v,short_extent,long_extent,aspect_ratio\n";
+    out.setf(std::ios::fixed, std::ios::floatfield);
+    out.precision(6);
+    for (std::size_t i = 0; i < patches.size(); ++i) {
+        const auto& patch = patches[i];
+        const PlaneShapeMetrics metrics = compute_plane_shape_metrics(patch);
+        out << i << ','
+            << patch.cloud->size() << ','
+            << visible_cloud_for_patch(patch)->size() << ','
+            << output_cloud_for_patch(patch)->size() << ','
+            << patch.normal.x() << ','
+            << patch.normal.y() << ','
+            << patch.normal.z() << ','
+            << patch.d << ','
+            << patch.centroid.x() << ','
+            << patch.centroid.y() << ','
+            << patch.centroid.z() << ','
+            << patch.planarity_error << ','
+            << metrics.extent_u << ','
+            << metrics.extent_v << ','
+            << metrics.short_extent << ','
+            << metrics.long_extent << ','
+            << metrics.aspect_ratio << '\n';
+    }
+}
+
 class CornerFeatureDetector {
 public:
     explicit CornerFeatureDetector(Config cfg) : cfg_(std::move(cfg)) {}
@@ -1479,7 +1518,7 @@ public:
     }
 
     CornerDetectionResult detectFile(const fs::path& path) const {
-        return detect_prepared(prepare_cloud(load_xyz_cloud(path), cfg_));
+        return detect_prepared(prepare_cloud(load_xyz_cloud(path, cfg_.input_scale), cfg_));
     }
 
 private:
@@ -1520,6 +1559,7 @@ static void process_one(const fs::path& path, const Config& cfg, const CornerFea
     fs::create_directories(out_dir);
     save_cloud(out_dir / "plane_patches.ply", make_patch_cloud(result.plane_patches));
     save_cloud(out_dir / "polyhedron_corners.ply", make_corner_cloud(result.corners));
+    save_plane_report(out_dir / "plane_report.csv", result.plane_patches);
 }
 
 int main(int argc, char** argv) {
