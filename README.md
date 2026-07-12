@@ -66,7 +66,7 @@ Current `top_left_cut2.ply` diagnostic count:
 
 | Dataset | Plane Patches | Corners | Output Plane Points |
 | --- | ---: | ---: | ---: |
-| top_left_cut2.ply | 54 | 63 | 9,696,956 / 10,000,014 |
+| top_left_cut2.ply | 53 | 62 | 9,635,143 / 10,000,014 |
 
 ## Build
 
@@ -96,6 +96,10 @@ Current `top_left_cut2.ply` diagnostic count:
 - `--normal-family-angle-deg`: angular tolerance used to group parallel normal families.
 - `--min-normal-family-support-ratio`: support ratio below which a small normal family can be rejected.
 - `--min-normal-family-members`: minimum same-family patch count before a weak normal family is trusted.
+- `--enclosed-parallel-filter`: rejects small internal planes that are sandwiched between two larger parallel planes with overlapping footprints.
+- `--enclosed-parallel-support-ratio`: maximum support ratio for a sandwiched patch to be treated as internal.
+- `--enclosed-parallel-min-neighbor-points`: minimum support required for the two enclosing planes.
+- `--enclosed-parallel-overlap-margin-scale`: resolution-scaled margin for projected footprint overlap checks.
 - `--robust-fit-keep-ratio`: fraction of low-residual points used when refitting a plane in `rspd-lite`.
 - `--strict-plane-distance-scale`: strict post-fit inlier distance used after plane expansion.
 - `--support-conflict-scale`: trims visible support points that sit on ambiguous/non-parallel neighboring planes.

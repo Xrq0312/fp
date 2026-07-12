@@ -80,6 +80,11 @@ struct Config {
     float normal_family_angle_deg = 3.0f;
     float min_normal_family_support_ratio = 0.08f;
     int min_normal_family_members = 3;
+    bool enclosed_parallel_filter = false;
+    float enclosed_parallel_angle_deg = 3.0f;
+    float enclosed_parallel_support_ratio = 0.25f;
+    int enclosed_parallel_min_neighbor_points = 100000;
+    float enclosed_parallel_overlap_margin_scale = 20.0f;
     int max_planes = 80;
     int min_plane_points = 80;
     float max_planarity_error = 0.06f;
@@ -305,6 +310,11 @@ static Config parse_args(int argc, char** argv) {
     if (auto v = value_after(args, "--normal-family-angle-deg")) cfg.normal_family_angle_deg = std::stof(*v);
     if (auto v = value_after(args, "--min-normal-family-support-ratio")) cfg.min_normal_family_support_ratio = std::stof(*v);
     if (auto v = value_after(args, "--min-normal-family-members")) cfg.min_normal_family_members = std::stoi(*v);
+    cfg.enclosed_parallel_filter = has_flag(args, "--enclosed-parallel-filter");
+    if (auto v = value_after(args, "--enclosed-parallel-angle-deg")) cfg.enclosed_parallel_angle_deg = std::stof(*v);
+    if (auto v = value_after(args, "--enclosed-parallel-support-ratio")) cfg.enclosed_parallel_support_ratio = std::stof(*v);
+    if (auto v = value_after(args, "--enclosed-parallel-min-neighbor-points")) cfg.enclosed_parallel_min_neighbor_points = std::stoi(*v);
+    if (auto v = value_after(args, "--enclosed-parallel-overlap-margin-scale")) cfg.enclosed_parallel_overlap_margin_scale = std::stof(*v);
     if (auto v = value_after(args, "--max-planes")) cfg.max_planes = std::stoi(*v);
     if (auto v = value_after(args, "--min-plane-points")) cfg.min_plane_points = std::stoi(*v);
     if (auto v = value_after(args, "--max-planarity-error")) cfg.max_planarity_error = std::stof(*v);
@@ -352,6 +362,8 @@ static Config parse_args(int argc, char** argv) {
         "--normal-k", "--region-neighbors", "--region-smoothness-deg",
         "--region-curvature-threshold", "--region-min-cluster-size",
         "--normal-family-angle-deg", "--min-normal-family-support-ratio", "--min-normal-family-members",
+        "--enclosed-parallel-angle-deg", "--enclosed-parallel-support-ratio",
+        "--enclosed-parallel-min-neighbor-points", "--enclosed-parallel-overlap-margin-scale",
         "--max-planes", "--min-plane-points", "--max-planarity-error",
         "--normal-parallel-cos", "--intersection-merge-scale", "--corner-support-radius-scale",
         "--corner-edge-radius-scale", "--corner-edge-multi-scales", "--corner-edge-sample-limit", "--max-corner-edge-score", "--max-corner-edge-growth-ratio",
@@ -1302,6 +1314,108 @@ static void filter_isolated_normal_families(std::vector<PlanePatch>& patches, co
     }
 }
 
+struct ParallelPatchRef {
+    std::size_t index = 0;
+    Eigen::Vector3f normal{0.0f, 0.0f, 1.0f};
+    float d = 0.0f;
+    float offset = 0.0f;
+    std::size_t support_points = 0;
+};
+
+static Eigen::Vector3f canonical_normal(Eigen::Vector3f normal, float& d) {
+    int axis = 0;
+    if (std::abs(normal.y()) > std::abs(normal.x())) axis = 1;
+    if (std::abs(normal.z()) > std::abs(normal[axis])) axis = 2;
+    if (normal[axis] < 0.0f) {
+        normal = -normal;
+        d = -d;
+    }
+    return normal.normalized();
+}
+
+static bool projected_ranges_overlap_enough(
+    const PlanePatch& basis_patch,
+    const PlanePatch& candidate,
+    float margin) {
+    Eigen::Vector3f axis_u;
+    Eigen::Vector3f axis_v;
+    plane_basis(basis_patch, axis_u, axis_v);
+
+    const ProjectedRange2D basis_range = projected_range_on_patch_basis(
+        output_cloud_for_patch(basis_patch), basis_patch, axis_u, axis_v);
+    const ProjectedRange2D candidate_range = projected_range_on_patch_basis(
+        output_cloud_for_patch(candidate), basis_patch, axis_u, axis_v);
+    return projected_ranges_touch(basis_range, candidate_range, margin);
+}
+
+static void filter_enclosed_parallel_patches(std::vector<PlanePatch>& patches, float resolution, const Config& cfg) {
+    if (!cfg.enclosed_parallel_filter || patches.size() < 3) return;
+
+    const float cos_threshold = std::cos(cfg.enclosed_parallel_angle_deg / 180.0f * 3.14159265358979323846f);
+    std::vector<std::vector<ParallelPatchRef>> families;
+    for (std::size_t i = 0; i < patches.size(); ++i) {
+        float d = patches[i].d;
+        const Eigen::Vector3f normal = canonical_normal(patches[i].normal, d);
+        ParallelPatchRef ref;
+        ref.index = i;
+        ref.normal = normal;
+        ref.d = d;
+        ref.offset = -d;
+        ref.support_points = patch_output_point_count(patches[i]);
+
+        bool assigned = false;
+        for (auto& family : families) {
+            if (std::abs(ref.normal.dot(family.front().normal)) >= cos_threshold) {
+                family.push_back(ref);
+                assigned = true;
+                break;
+            }
+        }
+        if (!assigned) families.push_back({ref});
+    }
+
+    std::vector<bool> remove_patch(patches.size(), false);
+    const std::size_t min_neighbor_points =
+        static_cast<std::size_t>(std::max(cfg.enclosed_parallel_min_neighbor_points, 0));
+    const float overlap_margin = std::max(cfg.enclosed_parallel_overlap_margin_scale * resolution, 0.0f);
+
+    for (auto& family : families) {
+        if (family.size() < 3) continue;
+        std::sort(family.begin(), family.end(), [](const ParallelPatchRef& a, const ParallelPatchRef& b) {
+            return a.offset < b.offset;
+        });
+
+        for (std::size_t i = 1; i + 1 < family.size(); ++i) {
+            const auto& prev = family[i - 1];
+            const auto& current = family[i];
+            const auto& next = family[i + 1];
+            if (current.support_points == 0) continue;
+            if (prev.support_points < min_neighbor_points || next.support_points < min_neighbor_points) continue;
+
+            const std::size_t neighbor_support = std::min(prev.support_points, next.support_points);
+            const double support_ratio = static_cast<double>(current.support_points) /
+                static_cast<double>(std::max<std::size_t>(neighbor_support, 1));
+            if (support_ratio > static_cast<double>(cfg.enclosed_parallel_support_ratio)) continue;
+
+            const PlanePatch& current_patch = patches[current.index];
+            const bool overlaps_prev = projected_ranges_overlap_enough(patches[prev.index], current_patch, overlap_margin);
+            const bool overlaps_next = projected_ranges_overlap_enough(patches[next.index], current_patch, overlap_margin);
+            if (overlaps_prev && overlaps_next) remove_patch[current.index] = true;
+        }
+    }
+
+    const std::size_t before = patches.size();
+    std::size_t cursor = 0;
+    patches.erase(
+        std::remove_if(patches.begin(), patches.end(), [&](const PlanePatch&) {
+            return remove_patch[cursor++];
+        }),
+        patches.end());
+    if (cfg.verbose && before != patches.size()) {
+        std::cout << "Filtered enclosed parallel patches: " << (before - patches.size()) << "\n";
+    }
+}
+
 static int nearby_support_count(pcl::KdTreeFLANN<PointT>& tree, const Eigen::Vector3f& p, float radius) {
     PointT probe;
     probe.x = p.x();
@@ -1707,6 +1821,7 @@ private:
         filter_weak_visible_patches(patches, cfg_);
         refresh_output_clouds_from_full_cloud(patches, cloud.full_points, cloud.model_resolution, cfg_);
         filter_isolated_normal_families(patches, cfg_);
+        filter_enclosed_parallel_patches(patches, cloud.model_resolution, cfg_);
 
         CornerDetectionResult result;
         result.corners = extract_corners(cloud.full_points, patches, bounds, cloud.model_resolution, cfg_);

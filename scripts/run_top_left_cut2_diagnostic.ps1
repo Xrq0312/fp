@@ -40,6 +40,11 @@ python $renderer $input `
     --normal-family-angle-deg 3.0 `
     --min-normal-family-support-ratio 0.08 `
     --min-normal-family-members 3 `
+    --enclosed-parallel-filter `
+    --enclosed-parallel-angle-deg 3.0 `
+    --enclosed-parallel-support-ratio 0.25 `
+    --enclosed-parallel-min-neighbor-points 100000 `
+    --enclosed-parallel-overlap-margin-scale 20 `
     --strict-plane-distance-scale 1.2 `
     --support-conflict-scale 1.0 `
     --core-conflict-scale 0.5 `
