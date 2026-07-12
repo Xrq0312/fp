@@ -90,6 +90,11 @@ For CAD/model-exported PLY files in meters, use the Region Growing mode:
 This reads meter coordinates with `--input-scale 1000`. Detection runs on the downsampled cloud, but
 the final plane PLY is refilled from the scaled full input cloud.
 
+For full-density model detection without voxel downsampling, remove `--voxel-leaf` and add
+`--model-resolution-override <mm>`. For `top_left_cut2.ply`, `0.152606` is the tested threshold
+scale. Without this override, the full cloud's true nearest-neighbor spacing is so small that
+resolution-scaled plane thresholds fragment long faces.
+
 Current `top_left_cut2.ply` diagnostic count:
 
 | Dataset | Plane Patches | Corners | Output Plane Points |
@@ -113,6 +118,7 @@ Current `top_left_cut2.ply` diagnostic count:
 - `--resolution-sample-cap`: number of points sampled when estimating scale.
 - `--point-spacing-resolution-estimator`: use true sampled nearest-neighbor spacing instead of calibrated sparse-sample scale.
 - `--input-scale`: multiplier applied to loaded XYZ coordinates, for example `1000` for meter-to-millimeter model exports.
+- `--model-resolution-override`: fixed resolution value for all resolution-scaled thresholds; useful when full-density model exports have extremely small nearest-neighbor spacing.
 - `--preserve-input-points`: use filtered/downsampled points only for detection, then refill output patches from the scaled/cropped input cloud.
 - `--region-growing-plane-mode`: use PCL normal-based Region Growing to produce plane seeds; this is recommended for clean CAD/model point clouds.
 - `--normal-k`: KNN count for normal estimation in Region Growing mode.

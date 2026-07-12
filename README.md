@@ -68,6 +68,17 @@ Current `top_left_cut2.ply` diagnostic count:
 | --- | ---: | ---: | ---: |
 | top_left_cut2.ply | 53 | 62 | 9,635,143 / 10,000,014 |
 
+To test the same model without voxel downsampling, use:
+
+```powershell
+.\scripts\run_top_left_cut2_no_downsample_diagnostic.ps1
+```
+
+This keeps all input points for detection and fixes the threshold scale with
+`--model-resolution-override 0.152606`. Without this override, the full cloud's true
+nearest-neighbor spacing is about `0.0115 mm`, which makes all resolution-scaled plane
+thresholds too tight and fragments the long faces.
+
 ## Build
 
 ```powershell
@@ -85,6 +96,7 @@ Current `top_left_cut2.ply` diagnostic count:
 - `--resolution-sample-cap`: number of points sampled when estimating scale.
 - `--point-spacing-resolution-estimator`: use true sampled nearest-neighbor spacing instead of calibrated sparse-sample scale.
 - `--input-scale`: multiplier applied to loaded XYZ coordinates, for example `1000` for meter-to-millimeter model exports.
+- `--model-resolution-override`: fixed resolution value for all resolution-scaled thresholds; useful when full-density model exports have extremely small nearest-neighbor spacing.
 - `--preserve-input-points`: use filtered/downsampled points only for detection, then refill output patches from the scaled/cropped input cloud.
 - `--region-growing-plane-mode`: use PCL normal-based Region Growing to produce plane seeds; this is recommended for clean CAD/model point clouds.
 - `--normal-k`: KNN count for normal estimation in Region Growing mode.

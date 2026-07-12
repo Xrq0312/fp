@@ -115,6 +115,7 @@ struct Config {
     float ror_radius_scale = 0.0f;
     int ror_min_neighbors = 0;
     float input_scale = 1.0f;
+    float model_resolution_override = 0.0f;
     bool preserve_input_points = false;
 };
 
@@ -345,6 +346,7 @@ static Config parse_args(int argc, char** argv) {
     if (auto v = value_after(args, "--ror-radius-scale")) cfg.ror_radius_scale = std::stof(*v);
     if (auto v = value_after(args, "--ror-min-neighbors")) cfg.ror_min_neighbors = std::stoi(*v);
     if (auto v = value_after(args, "--input-scale")) cfg.input_scale = std::stof(*v);
+    if (auto v = value_after(args, "--model-resolution-override")) cfg.model_resolution_override = std::stof(*v);
     cfg.preserve_input_points = has_flag(args, "--preserve-input-points");
     cfg.legacy_resolution_estimator = !has_flag(args, "--point-spacing-resolution-estimator");
     if (has_flag(args, "--legacy-resolution-estimator")) cfg.legacy_resolution_estimator = true;
@@ -372,7 +374,7 @@ static Config parse_args(int argc, char** argv) {
         "--resolution-sample-cap",
         "--load-limit", "--voxel-leaf", "--voxel-leaf-scale",
         "--sor-mean-k", "--sor-stddev", "--ror-radius-scale", "--ror-min-neighbors",
-        "--input-scale"
+        "--input-scale", "--model-resolution-override"
     };
 
     for (std::size_t i = 0; i < args.size(); ++i) {
@@ -571,7 +573,9 @@ static PreparedCloud prepare_cloud(const CloudPtr& input_cloud, const Config& cf
     const float reference_resolution = estimate_model_resolution(cropped, cfg);
     prepared.points = apply_preprocessing_filters(cropped, cfg, reference_resolution);
     prepared.full_points = cfg.preserve_input_points ? cropped : prepared.points;
-    prepared.model_resolution = estimate_model_resolution(prepared.points, cfg);
+    prepared.model_resolution = cfg.model_resolution_override > 0.0f
+        ? cfg.model_resolution_override
+        : estimate_model_resolution(prepared.points, cfg);
     if (prepared.model_resolution <= 0.0f) prepared.model_resolution = 1e-4f;
     return prepared;
 }
