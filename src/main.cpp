@@ -76,6 +76,10 @@ struct Config {
     float region_smoothness_deg = 3.0f;
     float region_curvature_threshold = 0.05f;
     int region_min_cluster_size = 200;
+    bool normal_family_filter = false;
+    float normal_family_angle_deg = 3.0f;
+    float min_normal_family_support_ratio = 0.08f;
+    int min_normal_family_members = 3;
     int max_planes = 80;
     int min_plane_points = 80;
     float max_planarity_error = 0.06f;
@@ -297,6 +301,10 @@ static Config parse_args(int argc, char** argv) {
     if (auto v = value_after(args, "--region-smoothness-deg")) cfg.region_smoothness_deg = std::stof(*v);
     if (auto v = value_after(args, "--region-curvature-threshold")) cfg.region_curvature_threshold = std::stof(*v);
     if (auto v = value_after(args, "--region-min-cluster-size")) cfg.region_min_cluster_size = std::stoi(*v);
+    cfg.normal_family_filter = has_flag(args, "--normal-family-filter");
+    if (auto v = value_after(args, "--normal-family-angle-deg")) cfg.normal_family_angle_deg = std::stof(*v);
+    if (auto v = value_after(args, "--min-normal-family-support-ratio")) cfg.min_normal_family_support_ratio = std::stof(*v);
+    if (auto v = value_after(args, "--min-normal-family-members")) cfg.min_normal_family_members = std::stoi(*v);
     if (auto v = value_after(args, "--max-planes")) cfg.max_planes = std::stoi(*v);
     if (auto v = value_after(args, "--min-plane-points")) cfg.min_plane_points = std::stoi(*v);
     if (auto v = value_after(args, "--max-planarity-error")) cfg.max_planarity_error = std::stof(*v);
@@ -343,6 +351,7 @@ static Config parse_args(int argc, char** argv) {
         "--atom-max-rms-scale", "--atom-merge-angle-deg", "--atom-merge-distance-scale",
         "--normal-k", "--region-neighbors", "--region-smoothness-deg",
         "--region-curvature-threshold", "--region-min-cluster-size",
+        "--normal-family-angle-deg", "--min-normal-family-support-ratio", "--min-normal-family-members",
         "--max-planes", "--min-plane-points", "--max-planarity-error",
         "--normal-parallel-cos", "--intersection-merge-scale", "--corner-support-radius-scale",
         "--corner-edge-radius-scale", "--corner-edge-multi-scales", "--corner-edge-sample-limit", "--max-corner-edge-score", "--max-corner-edge-growth-ratio",
@@ -1215,6 +1224,84 @@ static void refresh_output_clouds_from_full_cloud(std::vector<PlanePatch>& patch
     }
 }
 
+struct NormalFamily {
+    Eigen::Vector3f normal{0.0f, 0.0f, 1.0f};
+    std::vector<std::size_t> patch_indices;
+    std::size_t support_points = 0;
+};
+
+static std::size_t patch_output_point_count(const PlanePatch& patch) {
+    const CloudPtr cloud = output_cloud_for_patch(patch);
+    return cloud ? cloud->size() : 0;
+}
+
+static void filter_isolated_normal_families(std::vector<PlanePatch>& patches, const Config& cfg) {
+    if (!cfg.normal_family_filter || patches.empty()) return;
+
+    std::vector<std::size_t> order(patches.size());
+    std::iota(order.begin(), order.end(), 0);
+    std::sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) {
+        return patch_output_point_count(patches[a]) > patch_output_point_count(patches[b]);
+    });
+
+    const float cos_threshold = std::cos(cfg.normal_family_angle_deg / 180.0f * 3.14159265358979323846f);
+    std::vector<NormalFamily> families;
+    for (std::size_t idx : order) {
+        const std::size_t support = patch_output_point_count(patches[idx]);
+        if (support == 0) continue;
+
+        std::size_t best_family = families.size();
+        float best_dot = -1.0f;
+        for (std::size_t family_idx = 0; family_idx < families.size(); ++family_idx) {
+            const float dot = std::abs(patches[idx].normal.dot(families[family_idx].normal));
+            if (dot >= cos_threshold && dot > best_dot) {
+                best_dot = dot;
+                best_family = family_idx;
+            }
+        }
+
+        if (best_family == families.size()) {
+            NormalFamily family;
+            family.normal = patches[idx].normal.normalized();
+            family.patch_indices.push_back(idx);
+            family.support_points = support;
+            families.push_back(std::move(family));
+        } else {
+            families[best_family].patch_indices.push_back(idx);
+            families[best_family].support_points += support;
+        }
+    }
+
+    std::size_t strongest_family_support = 0;
+    for (const auto& family : families) {
+        strongest_family_support = std::max(strongest_family_support, family.support_points);
+    }
+    if (strongest_family_support == 0) return;
+
+    const std::size_t min_family_support = static_cast<std::size_t>(
+        static_cast<double>(strongest_family_support) * std::max(cfg.min_normal_family_support_ratio, 0.0f));
+    std::vector<bool> remove_patch(patches.size(), false);
+    for (const auto& family : families) {
+        const bool weak_support = family.support_points < min_family_support;
+        const bool too_few_members = family.patch_indices.size() < static_cast<std::size_t>(std::max(cfg.min_normal_family_members, 1));
+        if (!weak_support || !too_few_members) continue;
+        for (std::size_t idx : family.patch_indices) {
+            remove_patch[idx] = true;
+        }
+    }
+
+    const std::size_t before = patches.size();
+    std::size_t cursor = 0;
+    patches.erase(
+        std::remove_if(patches.begin(), patches.end(), [&](const PlanePatch&) {
+            return remove_patch[cursor++];
+        }),
+        patches.end());
+    if (cfg.verbose && before != patches.size()) {
+        std::cout << "Filtered isolated normal-family patches: " << (before - patches.size()) << "\n";
+    }
+}
+
 static int nearby_support_count(pcl::KdTreeFLANN<PointT>& tree, const Eigen::Vector3f& p, float radius) {
     PointT probe;
     probe.x = p.x();
@@ -1619,6 +1706,7 @@ private:
         trim_support_cloud_conflicts(patches, cloud.model_resolution, cfg_);
         filter_weak_visible_patches(patches, cfg_);
         refresh_output_clouds_from_full_cloud(patches, cloud.full_points, cloud.model_resolution, cfg_);
+        filter_isolated_normal_families(patches, cfg_);
 
         CornerDetectionResult result;
         result.corners = extract_corners(cloud.full_points, patches, bounds, cloud.model_resolution, cfg_);

@@ -36,6 +36,10 @@ python $renderer $input `
     --region-smoothness-deg 3.0 `
     --region-curvature-threshold 0.05 `
     --region-min-cluster-size 200 `
+    --normal-family-filter `
+    --normal-family-angle-deg 3.0 `
+    --min-normal-family-support-ratio 0.08 `
+    --min-normal-family-members 3 `
     --strict-plane-distance-scale 1.2 `
     --support-conflict-scale 1.0 `
     --core-conflict-scale 0.5 `

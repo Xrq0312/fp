@@ -65,6 +65,10 @@ For CAD/model-exported PLY files in meters, use the Region Growing mode:
   --region-smoothness-deg 3.0 `
   --region-curvature-threshold 0.05 `
   --region-min-cluster-size 200 `
+  --normal-family-filter `
+  --normal-family-angle-deg 3.0 `
+  --min-normal-family-support-ratio 0.08 `
+  --min-normal-family-members 3 `
   --strict-plane-distance-scale 1.2 `
   --support-conflict-scale 1.0 `
   --core-conflict-scale 0.5 `
@@ -85,7 +89,7 @@ Current `top_left_cut2.ply` diagnostic count:
 
 | Dataset | Plane Patches | Corners | Output Plane Points |
 | --- | ---: | ---: | ---: |
-| top_left_cut2.ply | 57 | 75 | 9,745,373 / 10,000,014 |
+| top_left_cut2.ply | 54 | 63 | 9,696,956 / 10,000,014 |
 
 ## Build
 
@@ -111,6 +115,10 @@ Current `top_left_cut2.ply` diagnostic count:
 - `--region-smoothness-deg`: maximum normal-angle difference for Region Growing.
 - `--region-curvature-threshold`: curvature threshold for accepting points into a smooth region.
 - `--region-min-cluster-size`: minimum Region Growing cluster size before plane fitting.
+- `--normal-family-filter`: rejects small isolated normal families after full-cloud refill; useful for removing edge-mixed stripe patches on clean model clouds.
+- `--normal-family-angle-deg`: angular tolerance used to group parallel normal families.
+- `--min-normal-family-support-ratio`: support ratio below which a small normal family can be rejected.
+- `--min-normal-family-members`: minimum same-family patch count before a weak normal family is trusted.
 - `--robust-fit-keep-ratio`: fraction of low-residual points used when refitting a plane in `rspd-lite`.
 - `--strict-plane-distance-scale`: strict post-fit inlier distance used after plane expansion.
 - `--support-conflict-scale`: trims visible support points that sit on ambiguous/non-parallel neighboring planes.
