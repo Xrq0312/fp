@@ -1,0 +1,20 @@
+不是图片查看器/缩放的渲染问题，是生成出来的像素就不同。
+
+我把两张图按 mask 拆开比了：
+
+- `phase_unwrapped_with_background` 的前景差异平均约 `74.9` 灰度
+- 背景差异平均约 `70.7` 灰度
+- 单独比较 `phase_unwrapped.png`，前景差异也是 `74.9`
+- 单独比较 `phase_wrapped.png`，背景差异也是 `70.7`
+
+所以差异来源有两条：
+
+1. 物体内部来自 `phase_unwrapped.png`，也就是 unwrap 后的显示图不同。  
+   这不是 overlay 渲染造成的，是底层 unwrapped 结果/归一化已经不同。
+
+2. 背景来自 `phase_wrapped.png`，这张背景图也不同。  
+   所以合成后的 `phase_unwrapped_with_background.png` 会进一步不同。
+
+你给的第二张是旧的 `mask_b_only` 口径结果；第一张是我后来测试“原始灰度背景”的实验目录，虽然背景口径改了，但前景 unwrap 仍然不是旧版，所以还是不像。
+
+另外我已经把刚才用于排查的源码实验改动撤回并重新编译了；当前 `results_delivery\data2_phasex` 里的图还是按你指定的旧基准刷新过的版本。

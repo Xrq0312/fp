@@ -1,0 +1,33 @@
+# Build outputs
+/build/
+*.obj
+*.exe
+*.dll
+*.pdb
+*.ilk
+*.lib
+*.exp
+*.tlog
+*.recipe
+
+# Generated result folders
+/results/
+/phase_unwrap_task/results*/
+/delivery/pointcloud_corner_delivery/results/
+/delivery/pointcloud_corner_delivery/run_results/
+
+# Large source data and packaged artifacts
+/PMD_DATA/
+/PMD_DATA.zip
+/data01/
+/data02/
+/delivery/**/*.zip
+
+# Local/editor noise
+/.agents/
+/.codex/
+.vs/
+.vscode/
+*.user
+*.suo
+Thumbs.db
