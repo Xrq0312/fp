@@ -27,6 +27,8 @@ if (-not (Test-Path $input)) { throw "Input file not found: data02\data02\top_do
     --max-corner-edge-score 0.05 `
     --max-corner-edge-growth-ratio 1.5 `
     --expand-plane-distance-scale 0.25 `
+    --sor-mean-k 16 `
+    --sor-stddev 1.25 `
     --min-x -25 `
     --max-x 65 `
     --min-y -30 `

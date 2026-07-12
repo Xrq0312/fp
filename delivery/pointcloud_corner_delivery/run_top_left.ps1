@@ -16,6 +16,7 @@ if (-not (Test-Path $input)) { throw "Input file not found: data01\data01\top_le
     --min-visible-support-core-ratio 0.5 `
     --min-visible-support-median-ratio 0.10 `
     --min-visible-density-median-ratio 0.05 `
+    --min-corner-planes 3 `
     --max-y 30 `
     --expand-plane-distance-scale 0.25
 if ($LASTEXITCODE -ne 0) { throw "top_left run failed with exit code $LASTEXITCODE" }

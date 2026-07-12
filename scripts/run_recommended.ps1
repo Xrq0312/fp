@@ -16,6 +16,7 @@ if (-not (Test-Path $exe)) {
     --min-visible-support-core-ratio 0.5 `
     --min-visible-support-median-ratio 0.10 `
     --min-visible-density-median-ratio 0.05 `
+    --min-corner-planes 3 `
     --max-y 30 `
     --expand-plane-distance-scale 0.25
 
@@ -40,6 +41,8 @@ if (-not (Test-Path $exe)) {
     --max-corner-edge-score 0.05 `
     --max-corner-edge-growth-ratio 1.5 `
     --expand-plane-distance-scale 0.25 `
+    --sor-mean-k 16 `
+    --sor-stddev 1.25 `
     --min-x -25 `
     --max-x 65 `
     --min-y -30 `

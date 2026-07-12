@@ -20,6 +20,9 @@
 #include <pcl/common/common.h>
 #include <pcl/conversions.h>
 #include <pcl/filters/random_sample.h>
+#include <pcl/filters/radius_outlier_removal.h>
+#include <pcl/filters/statistical_outlier_removal.h>
+#include <pcl/filters/voxel_grid.h>
 #include <pcl/io/ply_io.h>
 #include <pcl/kdtree/kdtree_flann.h>
 #include <pcl/point_cloud.h>
@@ -83,6 +86,16 @@ struct Config {
     float hull_min_edge_scale = 10.0f;
     float hull_corner_cos = 0.8f;
     float hull_max_plane_fraction = 0.4f;
+    int resolution_sample_cap = 5000;
+    bool legacy_resolution_estimator = true;
+    bool verbose = true;
+    int load_limit = 0;
+    float voxel_leaf = 0.0f;
+    float voxel_leaf_scale = 0.0f;
+    int sor_mean_k = 0;
+    float sor_stddev = 1.0f;
+    float ror_radius_scale = 0.0f;
+    int ror_min_neighbors = 0;
 };
 
 struct Bounds {
@@ -230,7 +243,8 @@ static Config parse_args(int argc, char** argv) {
             << "Usage: pointcloud_corner_compare [inputs...] [options]\n"
             << "Common options: --output-dir, --min/max-x/y/z, --atom-cell-scales,\n"
             << "  --merge-plane-*, --expand-plane-*, --min-corner-planes,\n"
-            << "  --corner-edge-*. See README.md for recommended parameter sets.\n";
+            << "  --corner-edge-*, --sor-*, --ror-*, --voxel-leaf-scale.\n"
+            << "  See README.md for recommended parameter sets.\n";
         std::exit(0);
     }
 
@@ -286,6 +300,17 @@ static Config parse_args(int argc, char** argv) {
     if (auto v = value_after(args, "--hull-min-edge-scale")) cfg.hull_min_edge_scale = std::stof(*v);
     if (auto v = value_after(args, "--hull-corner-cos")) cfg.hull_corner_cos = std::stof(*v);
     if (auto v = value_after(args, "--hull-max-plane-fraction")) cfg.hull_max_plane_fraction = std::stof(*v);
+    if (auto v = value_after(args, "--resolution-sample-cap")) cfg.resolution_sample_cap = std::stoi(*v);
+    if (auto v = value_after(args, "--load-limit")) cfg.load_limit = std::stoi(*v);
+    if (auto v = value_after(args, "--voxel-leaf")) cfg.voxel_leaf = std::stof(*v);
+    if (auto v = value_after(args, "--voxel-leaf-scale")) cfg.voxel_leaf_scale = std::stof(*v);
+    if (auto v = value_after(args, "--sor-mean-k")) cfg.sor_mean_k = std::stoi(*v);
+    if (auto v = value_after(args, "--sor-stddev")) cfg.sor_stddev = std::stof(*v);
+    if (auto v = value_after(args, "--ror-radius-scale")) cfg.ror_radius_scale = std::stof(*v);
+    if (auto v = value_after(args, "--ror-min-neighbors")) cfg.ror_min_neighbors = std::stoi(*v);
+    cfg.legacy_resolution_estimator = !has_flag(args, "--point-spacing-resolution-estimator");
+    if (has_flag(args, "--legacy-resolution-estimator")) cfg.legacy_resolution_estimator = true;
+    cfg.verbose = !has_flag(args, "--quiet");
     const std::set<std::string> valued = {
         "--output-dir",
         "--min-x", "--max-x", "--min-y", "--max-y", "--min-z", "--max-z",
@@ -300,7 +325,10 @@ static Config parse_args(int argc, char** argv) {
         "--normal-parallel-cos", "--intersection-merge-scale", "--corner-support-radius-scale",
         "--corner-edge-radius-scale", "--corner-edge-multi-scales", "--corner-edge-sample-limit", "--max-corner-edge-score", "--max-corner-edge-growth-ratio",
         "--min-corner-support", "--min-plane-local-support", "--min-corner-planes", "--boundary-min-plane-supports",
-        "--hull-min-edge-scale", "--hull-corner-cos", "--hull-max-plane-fraction"
+        "--hull-min-edge-scale", "--hull-corner-cos", "--hull-max-plane-fraction",
+        "--resolution-sample-cap",
+        "--load-limit", "--voxel-leaf", "--voxel-leaf-scale",
+        "--sor-mean-k", "--sor-stddev", "--ror-radius-scale", "--ror-min-neighbors"
     };
 
     for (std::size_t i = 0; i < args.size(); ++i) {
@@ -345,8 +373,7 @@ static Bounds compute_bounds(const CloudPtr& cloud) {
     return bounds;
 }
 
-static float estimate_model_resolution(const CloudPtr& cloud, int sample_cap = 5000) {
-    if (cloud->size() < 2) return 0.0f;
+static CloudPtr sample_cloud_for_resolution(const CloudPtr& cloud, int sample_cap) {
     CloudPtr sample(new CloudT);
     if (cloud->size() <= static_cast<std::size_t>(sample_cap)) {
         sample.reset(new CloudT(*cloud));
@@ -357,21 +384,114 @@ static float estimate_model_resolution(const CloudPtr& cloud, int sample_cap = 5
         sampler.setSeed(42);
         sampler.filter(*sample);
     }
+    return sample;
+}
+
+static float robust_mean_nearest_distance(std::vector<float> distances) {
+    distances.erase(
+        std::remove_if(distances.begin(), distances.end(), [](float d) {
+            return !std::isfinite(d) || d <= 1e-8f;
+        }),
+        distances.end());
+    if (distances.empty()) return 0.0f;
+
+    std::sort(distances.begin(), distances.end());
+    const std::size_t trim = distances.size() >= 20 ? distances.size() / 20 : 0;
+    const std::size_t first = trim;
+    const std::size_t last = distances.size() - trim;
+    double sum = 0.0;
+    for (std::size_t i = first; i < last; ++i) sum += distances[i];
+    return static_cast<float>(sum / static_cast<double>(std::max<std::size_t>(last - first, 1)));
+}
+
+static float estimate_model_resolution(const CloudPtr& cloud, const Config& cfg) {
+    if (cloud->size() < 2) return 0.0f;
+    const int sample_cap = std::max(cfg.resolution_sample_cap, 2);
+    CloudPtr sample = sample_cloud_for_resolution(cloud, sample_cap);
 
     pcl::KdTreeFLANN<PointT> tree;
-    tree.setInputCloud(sample);
+    tree.setInputCloud(cfg.legacy_resolution_estimator ? sample : cloud);
 
     std::vector<int> indices(2);
     std::vector<float> distances(2);
-    double sum = 0.0;
-    int used = 0;
+    if (cfg.legacy_resolution_estimator) {
+        double sum = 0.0;
+        int used = 0;
+        for (std::size_t i = 0; i < sample->size(); ++i) {
+            if (tree.nearestKSearch(sample->points[i], 2, indices, distances) == 2) {
+                sum += std::sqrt(distances[1]);
+                ++used;
+            }
+        }
+        return used > 0 ? static_cast<float>(sum / used) : 0.0f;
+    }
+
+    std::vector<float> nearest_distances;
+    nearest_distances.reserve(sample->size());
     for (std::size_t i = 0; i < sample->size(); ++i) {
         if (tree.nearestKSearch(sample->points[i], 2, indices, distances) == 2) {
-            sum += std::sqrt(distances[1]);
-            ++used;
+            nearest_distances.push_back(std::sqrt(distances[1]));
         }
     }
-    return used > 0 ? static_cast<float>(sum / used) : 0.0f;
+    return robust_mean_nearest_distance(std::move(nearest_distances));
+}
+
+static CloudPtr random_limit_cloud(const CloudPtr& cloud, int limit) {
+    if (limit <= 0 || cloud->size() <= static_cast<std::size_t>(limit)) return cloud;
+    CloudPtr filtered(new CloudT);
+    pcl::RandomSample<PointT> sampler;
+    sampler.setInputCloud(cloud);
+    sampler.setSample(static_cast<unsigned int>(limit));
+    sampler.setSeed(42);
+    sampler.filter(*filtered);
+    return filtered;
+}
+
+static CloudPtr voxel_downsample_cloud(const CloudPtr& cloud, float leaf_size) {
+    if (leaf_size <= 0.0f || cloud->empty()) return cloud;
+    CloudPtr filtered(new CloudT);
+    pcl::VoxelGrid<PointT> voxel;
+    voxel.setInputCloud(cloud);
+    voxel.setLeafSize(leaf_size, leaf_size, leaf_size);
+    voxel.filter(*filtered);
+    return filtered;
+}
+
+static CloudPtr remove_statistical_outliers(const CloudPtr& cloud, int mean_k, float stddev) {
+    if (mean_k <= 1 || cloud->size() <= static_cast<std::size_t>(mean_k)) return cloud;
+    CloudPtr filtered(new CloudT);
+    pcl::StatisticalOutlierRemoval<PointT> sor;
+    sor.setInputCloud(cloud);
+    sor.setMeanK(mean_k);
+    sor.setStddevMulThresh(std::max(stddev, 0.01f));
+    sor.filter(*filtered);
+    return filtered;
+}
+
+static CloudPtr remove_radius_outliers(const CloudPtr& cloud, float radius, int min_neighbors) {
+    if (radius <= 0.0f || min_neighbors <= 0 || cloud->empty()) return cloud;
+    CloudPtr filtered(new CloudT);
+    pcl::RadiusOutlierRemoval<PointT> ror;
+    ror.setInputCloud(cloud);
+    ror.setRadiusSearch(radius);
+    ror.setMinNeighborsInRadius(min_neighbors);
+    ror.filter(*filtered);
+    return filtered;
+}
+
+static CloudPtr apply_preprocessing_filters(const CloudPtr& cloud, const Config& cfg, float reference_resolution) {
+    CloudPtr filtered = random_limit_cloud(cloud, cfg.load_limit);
+    const float scaled_leaf = cfg.voxel_leaf_scale > 0.0f
+        ? cfg.voxel_leaf_scale * reference_resolution
+        : 0.0f;
+    const float leaf = cfg.voxel_leaf > 0.0f ? cfg.voxel_leaf : scaled_leaf;
+    filtered = voxel_downsample_cloud(filtered, leaf);
+    filtered = remove_statistical_outliers(filtered, cfg.sor_mean_k, cfg.sor_stddev);
+    const float ror_radius = cfg.ror_radius_scale > 0.0f
+        ? cfg.ror_radius_scale * reference_resolution
+        : 0.0f;
+    filtered = remove_radius_outliers(filtered, ror_radius, cfg.ror_min_neighbors);
+    return filtered;
 }
 
 static PreparedCloud prepare_cloud(const CloudPtr& input_cloud, const Config& cfg) {
@@ -397,8 +517,9 @@ static PreparedCloud prepare_cloud(const CloudPtr& input_cloud, const Config& cf
     }
 
     PreparedCloud prepared;
-    prepared.points = cropped;
-    prepared.model_resolution = estimate_model_resolution(prepared.points);
+    const float reference_resolution = estimate_model_resolution(cropped, cfg);
+    prepared.points = apply_preprocessing_filters(cropped, cfg, reference_resolution);
+    prepared.model_resolution = estimate_model_resolution(prepared.points, cfg);
     if (prepared.model_resolution <= 0.0f) prepared.model_resolution = 1e-4f;
     return prepared;
 }
@@ -1364,6 +1485,10 @@ public:
 private:
     CornerDetectionResult detect_prepared(PreparedCloud cloud) const {
         const Bounds bounds = compute_bounds(cloud.points);
+        if (cfg_.verbose) {
+            std::cout << "Prepared points: " << cloud.points->size()
+                      << ", model resolution: " << cloud.model_resolution << "\n";
+        }
         const auto seed_patches = extract_plane_patches_atoms(
             cloud.points, bounds, cloud.model_resolution, cfg_);
 

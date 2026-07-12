@@ -45,8 +45,8 @@ Current verified counts:
 
 | Dataset | Plane Patches | Corners |
 | --- | ---: | ---: |
-| top_left_cut.ply | 26 | 30 |
-| top_down.ply | 17 | 8 |
+| top_left_cut.ply | 26 | 19 |
+| top_down.ply | 13 | 8 |
 
 ## Build From Source
 

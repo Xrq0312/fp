@@ -22,6 +22,10 @@ and saves the final PLY outputs.
 12. Reject weak visible patches that have little independent support or very low adaptive density.
 13. Compute corners from intersections of valid planes and boundary patch corners.
 
+The default resolution estimator keeps the historical calibrated scale used by the
+recommended scripts. Use `--point-spacing-resolution-estimator` when you want thresholds
+based on true nearest-neighbor point spacing instead.
+
 ## Recommended Runs
 
 Use:
@@ -37,6 +41,13 @@ results\top_left_y30
 results\top_down
 ```
 
+Current recommended counts:
+
+| Dataset | Plane Patches | Corners |
+| --- | ---: | ---: |
+| top_left_cut.ply | 26 | 19 |
+| top_down.ply | 13 | 8 |
+
 ## Build
 
 ```powershell
@@ -47,6 +58,12 @@ results\top_down
 ## Important Parameters
 
 - `--atom-cell-scales`: cell sizes, expressed as multiples of model resolution.
+- `--load-limit`: random cap for large experimental runs.
+- `--voxel-leaf` / `--voxel-leaf-scale`: optional voxel downsampling by absolute size or resolution multiple.
+- `--sor-mean-k` / `--sor-stddev`: optional statistical outlier removal.
+- `--ror-radius-scale` / `--ror-min-neighbors`: optional radius outlier removal.
+- `--resolution-sample-cap`: number of points sampled when estimating scale.
+- `--point-spacing-resolution-estimator`: use true sampled nearest-neighbor spacing instead of calibrated sparse-sample scale.
 - `--robust-fit-keep-ratio`: fraction of low-residual points used when refitting a plane in `rspd-lite`.
 - `--strict-plane-distance-scale`: strict post-fit inlier distance used after plane expansion.
 - `--support-conflict-scale`: trims visible support points that sit on ambiguous/non-parallel neighboring planes.
