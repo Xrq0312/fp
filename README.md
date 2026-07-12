@@ -56,6 +56,8 @@ For the CAD-exported `top_left_cut2.ply` model cloud, use:
 
 That script reads meter coordinates with `--input-scale 1000`, runs the detector, and exports
 diagnostic PNG projections under `results\top_left_cut2_diagnostic\images`.
+The model-exported cloud uses true point-spacing scale plus `--voxel-leaf 0.2`; this avoids the
+historical sparse-sample scale that is calibrated for scanned clouds and over-splits CAD-style data.
 
 ## Build
 

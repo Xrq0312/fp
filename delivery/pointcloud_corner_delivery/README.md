@@ -85,6 +85,9 @@ Current recommended counts:
 Each run also writes `plane_report.csv` beside the output PLY files. It lists every plane patch's normal,
 centroid, support size, and projected extents for debugging.
 
+For meter-based CAD/model exports, pass `--input-scale 1000` and prefer true point-spacing scale
+with a small voxel leaf instead of the scanned-cloud calibrated scale.
+
 ## Reference Ideas
 
 - `xiaohulugo/PointCloudSegmentation`: PLinkage-style local linkage and adjacency-aware patch merging.
