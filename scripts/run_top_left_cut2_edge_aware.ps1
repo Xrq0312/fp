@@ -1,6 +1,6 @@
 param(
     [string]$InputPly = ".\data01\data01\top_left_cut2.ply",
-    [string]$OutputDir = ".\results_edge_aware_v10_plane_support"
+    [string]$OutputDir = ".\results_edge_aware_v13_projected_merge_gap8"
 )
 
 $ErrorActionPreference = "Stop"
@@ -25,19 +25,19 @@ $args = @(
     "--coplanar-distance", "0.35",
     "--merge-angle-deg", "5",
     "--merge-distance", "0.5",
-    "--merge-gap", "1.0",
+    "--merge-gap", "8.0",
     "--assign-distance", "0.65",
     "--assign-margin", "2.5",
     "--visibility-filter",
     "--visibility-bin", "0.8",
     "--local-support-only",
     "--support-halo", "1",
-    "--support-normal-halo", "0.6",
     "--min-surfels", "20",
     "--min-output-points", "5000",
     "--min-extent", "3",
     "--min-aspect-ratio", "0.02",
-    "--max-planes", "120"
+    "--max-planes", "120",
+    "--save-plane-files"
 )
 
 & $exe @args

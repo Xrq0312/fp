@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <limits>
 #include <numeric>
@@ -53,12 +54,13 @@ struct Config {
     float visibility_bin = 0.8f;
     bool local_support_only = false;
     int support_halo = 1;
-    float support_normal_halo = 0.60f;
+    float support_bin_size = 0.0f;
     int min_surfels = 80;
     int min_output_points = 5000;
     float min_extent = 3.0f;
     float min_aspect_ratio = 0.02f;
     int max_planes = 120;
+    bool save_plane_files = false;
     bool verbose = true;
 };
 
@@ -159,7 +161,8 @@ static Config parse_args(int argc, char** argv) {
             << "Options: --output-dir, --input-scale, --surfel-size, --normal-k,\n"
             << "  --smooth-angle-deg, --edge-angle-deg, --coplanar-distance,\n"
             << "  --merge-*, --assign-*, --visibility-*, --local-support-only,\n"
-            << "  --support-halo, --support-normal-halo, --min-surfels, --min-output-points.\n";
+            << "  --support-halo, --support-bin-size, --save-plane-files,\n"
+            << "  --min-surfels, --min-output-points.\n";
         std::exit(args.empty() ? 1 : 0);
     }
 
@@ -184,12 +187,13 @@ static Config parse_args(int argc, char** argv) {
     if (auto v = value_after(args, "--visibility-bin")) cfg.visibility_bin = std::stof(*v);
     cfg.local_support_only = has_flag(args, "--local-support-only");
     if (auto v = value_after(args, "--support-halo")) cfg.support_halo = std::stoi(*v);
-    if (auto v = value_after(args, "--support-normal-halo")) cfg.support_normal_halo = std::stof(*v);
+    if (auto v = value_after(args, "--support-bin-size")) cfg.support_bin_size = std::stof(*v);
     if (auto v = value_after(args, "--min-surfels")) cfg.min_surfels = std::stoi(*v);
     if (auto v = value_after(args, "--min-output-points")) cfg.min_output_points = std::stoi(*v);
     if (auto v = value_after(args, "--min-extent")) cfg.min_extent = std::stof(*v);
     if (auto v = value_after(args, "--min-aspect-ratio")) cfg.min_aspect_ratio = std::stof(*v);
     if (auto v = value_after(args, "--max-planes")) cfg.max_planes = std::stoi(*v);
+    cfg.save_plane_files = has_flag(args, "--save-plane-files");
     cfg.verbose = !has_flag(args, "--quiet");
     return cfg;
 }
@@ -497,26 +501,42 @@ static bool patches_can_merge(const PlanePatch& a, const PlanePatch& b, const Co
     const float b_d = dot >= 0.0f ? b.d : -b.d;
     if (std::abs(a.d - b_d) > cfg.merge_distance) return false;
 
-    Eigen::Vector3f axis_u;
-    Eigen::Vector3f axis_v;
-    plane_basis(a, axis_u, axis_v);
-    auto range_for = [&](const PlanePatch& p) {
-        std::array<float, 4> r{
+    Eigen::Vector3f a_u;
+    Eigen::Vector3f a_v;
+    plane_basis(a, a_u, a_v);
+    auto projected_range = [&](const PlanePatch& p) {
+        Eigen::Vector3f p_u;
+        Eigen::Vector3f p_v;
+        plane_basis(p, p_u, p_v);
+        std::array<float, 4> range{
             std::numeric_limits<float>::max(),
             std::numeric_limits<float>::lowest(),
             std::numeric_limits<float>::max(),
             std::numeric_limits<float>::lowest()
         };
-        for (const auto corner : {Eigen::Vector2f(p.min_u, p.min_v), Eigen::Vector2f(p.min_u, p.max_v),
-                                  Eigen::Vector2f(p.max_u, p.min_v), Eigen::Vector2f(p.max_u, p.max_v)}) {
-            (void)corner;
+        const std::array<Eigen::Vector2f, 4> corners{
+            Eigen::Vector2f(p.min_u, p.min_v),
+            Eigen::Vector2f(p.min_u, p.max_v),
+            Eigen::Vector2f(p.max_u, p.min_v),
+            Eigen::Vector2f(p.max_u, p.max_v)
+        };
+        for (const Eigen::Vector2f& corner : corners) {
+            const Eigen::Vector3f q = p.centroid + p_u * corner.x() + p_v * corner.y();
+            const Eigen::Vector3f centered = q - a.centroid;
+            const float u = centered.dot(a_u);
+            const float v = centered.dot(a_v);
+            range[0] = std::min(range[0], u);
+            range[1] = std::max(range[1], u);
+            range[2] = std::min(range[2], v);
+            range[3] = std::max(range[3], v);
         }
-        return r;
+        return range;
     };
-    (void)range_for;
 
-    const bool u_touch = !(a.max_u + cfg.merge_gap < b.min_u || b.max_u + cfg.merge_gap < a.min_u);
-    const bool v_touch = !(a.max_v + cfg.merge_gap < b.min_v || b.max_v + cfg.merge_gap < a.min_v);
+    const auto a_range = projected_range(a);
+    const auto b_range = projected_range(b);
+    const bool u_touch = !(a_range[1] + cfg.merge_gap < b_range[0] || b_range[1] + cfg.merge_gap < a_range[0]);
+    const bool v_touch = !(a_range[3] + cfg.merge_gap < b_range[2] || b_range[3] + cfg.merge_gap < a_range[2]);
     return u_touch && v_touch;
 }
 
@@ -552,31 +572,46 @@ static bool point_inside_patch_envelope(const PlanePatch& patch, const Eigen::Ve
            v >= patch.min_v - margin && v <= patch.max_v + margin;
 }
 
-using CellSet = std::unordered_set<CellKey, CellKeyHash>;
+struct PatchSupport {
+    Eigen::Vector3f origin{0.0f, 0.0f, 0.0f};
+    Eigen::Vector3f axis_u{1.0f, 0.0f, 0.0f};
+    Eigen::Vector3f axis_v{0.0f, 1.0f, 0.0f};
+    float bin_size = 1.0f;
+    std::unordered_set<BinKey, BinKeyHash> bins;
 
-static std::vector<CellSet> build_patch_support_cells(
+    BinKey key_for(const Eigen::Vector3f& q) const {
+        const Eigen::Vector3f centered = q - origin;
+        return {
+            static_cast<int>(std::floor(centered.dot(axis_u) / bin_size)),
+            static_cast<int>(std::floor(centered.dot(axis_v) / bin_size))
+        };
+    }
+
+    bool contains(const Eigen::Vector3f& q) const {
+        return bins.find(key_for(q)) != bins.end();
+    }
+};
+
+static std::vector<PatchSupport> build_patch_supports(
     const std::vector<PlanePatch>& patches,
     const std::vector<Surfel>& surfels,
     const Config& cfg) {
-    std::vector<CellSet> support(patches.size());
+    std::vector<PatchSupport> support(patches.size());
     const int halo = std::max(cfg.support_halo, 0);
     const int kernel = 2 * halo + 1;
-    const std::size_t reserve_factor = static_cast<std::size_t>(kernel * kernel * kernel);
-    const float normal_limit = std::max(cfg.support_normal_halo, 0.0f) * cfg.surfel_size;
+    const std::size_t reserve_factor = static_cast<std::size_t>(kernel * kernel);
+    const float bin_size = cfg.support_bin_size > 0.0f ? cfg.support_bin_size : cfg.surfel_size;
     for (std::size_t patch_id = 0; patch_id < patches.size(); ++patch_id) {
-        support[patch_id].reserve(patches[patch_id].surfels.size() * reserve_factor);
+        PatchSupport& patch_support = support[patch_id];
+        patch_support.origin = patches[patch_id].centroid;
+        patch_support.bin_size = std::max(bin_size, 1e-4f);
+        plane_basis(patches[patch_id], patch_support.axis_u, patch_support.axis_v);
+        patch_support.bins.reserve(patches[patch_id].surfels.size() * reserve_factor);
         for (const int surfel_id : patches[patch_id].surfels) {
-            const CellKey base = surfels[static_cast<std::size_t>(surfel_id)].key;
-            for (int dx = -halo; dx <= halo; ++dx) {
-                for (int dy = -halo; dy <= halo; ++dy) {
-                    for (int dz = -halo; dz <= halo; ++dz) {
-                        const Eigen::Vector3f offset(
-                            static_cast<float>(dx) * cfg.surfel_size,
-                            static_cast<float>(dy) * cfg.surfel_size,
-                            static_cast<float>(dz) * cfg.surfel_size);
-                        if (std::abs(offset.dot(patches[patch_id].normal)) > normal_limit) continue;
-                        support[patch_id].insert({base.x + dx, base.y + dy, base.z + dz});
-                    }
+            const BinKey base = patch_support.key_for(surfels[static_cast<std::size_t>(surfel_id)].centroid);
+            for (int du = -halo; du <= halo; ++du) {
+                for (int dv = -halo; dv <= halo; ++dv) {
+                    patch_support.bins.insert({base.u + du, base.v + dv});
                 }
             }
         }
@@ -591,15 +626,15 @@ static void assign_full_points(
     std::vector<PlanePatch>& patches,
     const Config& cfg) {
     for (auto& patch : patches) patch.output.reset(new CloudT);
-    const std::vector<CellSet> support = cfg.local_support_only ? build_patch_support_cells(patches, surfels, cfg) : std::vector<CellSet>{};
+    const std::vector<PatchSupport> support = cfg.local_support_only ? build_patch_supports(patches, surfels, cfg) : std::vector<PatchSupport>{};
 
     for (const auto& p : cloud->points) {
         const Eigen::Vector3f q(p.x, p.y, p.z);
-        const CellKey key = cfg.local_support_only ? point_key(p, bounds, cfg.surfel_size) : CellKey{};
+        (void)bounds;
         int best = -1;
         float best_distance = std::numeric_limits<float>::max();
         for (std::size_t i = 0; i < patches.size(); ++i) {
-            if (cfg.local_support_only && support[i].find(key) == support[i].end()) continue;
+            if (cfg.local_support_only && !support[i].contains(q)) continue;
             const float distance = std::abs(patches[i].normal.dot(q) + patches[i].d);
             if (distance > cfg.assign_distance || distance >= best_distance) continue;
             if (!point_inside_patch_envelope(patches[i], q, cfg.assign_margin)) continue;
@@ -698,6 +733,17 @@ static void save_report(const fs::path& path, const std::vector<PlanePatch>& pat
     }
 }
 
+static void save_plane_files(const fs::path& out_dir, const std::vector<PlanePatch>& patches) {
+    const fs::path plane_dir = out_dir / "planes";
+    fs::create_directories(plane_dir);
+    for (std::size_t i = 0; i < patches.size(); ++i) {
+        std::ostringstream name;
+        name << "plane_" << std::setw(3) << std::setfill('0') << i << "_"
+             << patches[i].output->size() << "pts.ply";
+        pcl::io::savePLYFileASCII((plane_dir / name.str()).string(), *patches[i].output);
+    }
+}
+
 int main(int argc, char** argv) {
     try {
         const Config cfg = parse_args(argc, argv);
@@ -721,6 +767,7 @@ int main(int argc, char** argv) {
         pcl::io::savePLYFileASCII((out_dir / "edge_aware_plane_patches.ply").string(), *make_colored_patch_cloud(patches));
         pcl::io::savePLYFileASCII((out_dir / "edge_surfels.ply").string(), *make_edge_cloud(surfels));
         save_report(out_dir / "edge_aware_plane_report.csv", patches);
+        if (cfg.save_plane_files) save_plane_files(out_dir, patches);
 
         if (cfg.verbose) {
             std::size_t output_points = 0;
