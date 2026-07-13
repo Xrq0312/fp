@@ -13,6 +13,7 @@
 # Generated result folders
 /results/
 /results_edge_aware*/
+/results_seed_grow*/
 /phase_unwrap_task/results*/
 /delivery/pointcloud_corner_delivery/results/
 /delivery/pointcloud_corner_delivery/run_results/

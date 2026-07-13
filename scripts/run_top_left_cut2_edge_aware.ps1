@@ -1,6 +1,6 @@
 param(
     [string]$InputPly = ".\data01\data01\top_left_cut2.ply",
-    [string]$OutputDir = ".\results_edge_aware_v15_high_recall_d2"
+    [string]$OutputDir = ".\results_seed_grow"
 )
 
 $ErrorActionPreference = "Stop"
@@ -23,6 +23,7 @@ $args = @(
     "--smooth-angle-deg", "8",
     "--edge-angle-deg", "20",
     "--coplanar-distance", "0.35",
+    "--grow-refine-iterations", "2",
     "--merge-angle-deg", "5",
     "--merge-distance", "0.5",
     "--merge-gap", "8.0",
@@ -41,4 +42,5 @@ $args = @(
 $stem = [IO.Path]::GetFileNameWithoutExtension($InputPly)
 $ply = Join-Path (Join-Path $OutputDir $stem) "edge_aware_plane_patches.ply"
 $imageDir = Join-Path (Join-Path $OutputDir $stem) "images"
-python .\scripts\render_ply_views.py $ply --out-dir $imageDir --prefix edge_aware_plane_support --rgb --sample-limit 300000 --size 1800
+python .\scripts\render_ply_views.py $ply --out-dir $imageDir --prefix seed_grow --rgb --sample-limit 300000 --size 1800
+python .\scripts\render_ply_views.py (Join-Path (Join-Path $OutputDir $stem) "feature_edges.ply") --out-dir $imageDir --prefix seed_grow_edges --rgb --point-radius 3 --sample-limit 200000 --size 1800

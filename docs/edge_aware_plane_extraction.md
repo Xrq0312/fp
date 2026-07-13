@@ -1,6 +1,6 @@
-# Edge-Aware Plane Extraction
+# Seed-Grown Plane Extraction
 
-This is a fresh implementation for clean model-exported PLY point clouds. The main target is to keep each real planar face continuous while preserving as many model faces as possible.
+This implementation targets clean model-exported PLY point clouds. The current direction is seed-fitted plane extraction with feature-aware plane growth, not post-hoc point filtering.
 
 ## References Checked
 
@@ -13,29 +13,32 @@ This is a fresh implementation for clean model-exported PLY point clouds. The ma
 ## Current Strategy
 
 1. Load the model-exported PLY and scale meters to millimeters with `--input-scale 1000`.
-2. Build a surfel grid instead of operating directly on all 10M points. This keeps the model dense enough while removing sampling-order artifacts.
+2. Build a 0.5 mm surfel grid as the segmentation graph. The original dense points are preserved for final assignment.
 3. Estimate surfel normals with PCL k-nearest normal estimation.
-4. Grow connected planar regions over neighboring surfel cells using normal angle and point-to-plane residual checks.
-5. Mark sharp normal discontinuities as edge-like so they do not seed stripe fragments inside a planar face.
-6. Merge coplanar neighboring patches after growth.
-7. Keep visibility and local-support filters off in the recommended high-recall mode; those filters removed too many model faces on `top_left_cut2.ply`.
-8. Assign original dense points back to detected planes with a wider nearest-plane distance threshold. This keeps model-exported faces instead of throwing away internal/back-side patches.
-9. Save each plane as an individual PLY for debugging when `--save-plane-files` is enabled.
+4. Detect sharp normal discontinuities as line features. These edge surfels are allowed to belong to a plane, but they do not act as seeds that grow through an edge.
+5. Sort candidate seeds by non-edge status, low curvature, and support count.
+6. Fit a local seed plane from each seed neighborhood.
+7. Grow the plane by BFS over neighboring surfels, accepting only surfels that match the seed-fitted plane by normal angle and residual distance.
+8. Refit and refine each grown region, then merge coplanar adjacent patches.
+9. Assign original dense points to the nearest accepted plane. This is a final recovery step, not the main segmentation mechanism.
+10. Export plane patches, per-plane PLY files, edge-feature points, and corner-feature candidates for diagnosis.
 
 ## Recommended Command
 
 Use the script:
 
 ```powershell
-.\scripts\run_top_left_cut2_edge_aware.ps1
+.\scripts\run_top_left_cut2_seed_grow.ps1
 ```
 
 Current best diagnostic output:
 
 ```text
-results_edge_aware_v15_high_recall_d2\top_left_cut2\edge_aware_plane_patches.ply
-results_edge_aware_v15_high_recall_d2\top_left_cut2\planes\
-results_edge_aware_v15_high_recall_d2\top_left_cut2\images\
+results_seed_grow\top_left_cut2\edge_aware_plane_patches.ply
+results_seed_grow\top_left_cut2\planes\
+results_seed_grow\top_left_cut2\feature_edges.ply
+results_seed_grow\top_left_cut2\feature_corners.ply
+results_seed_grow\top_left_cut2\images\
 ```
 
 Observed on `top_left_cut2.ply`:
@@ -43,17 +46,17 @@ Observed on `top_left_cut2.ply`:
 ```text
 Input points: 10000014
 Surfels: 27545
-Plane patches: 27
-Output points: 9265315
+Plane patches: 54
+Output points: 9888831
 ```
 
-For `top_left_cut2.ply`, the four long connector planes are represented as four dominant plane patches rather than many stripe-like fragments:
+For `top_left_cut2.ply`, the connector's four long planes are represented by the four largest grown patches rather than stripe-like fragments:
 
 ```text
-plane 2: normal ~= (-0.985, 0, 0.174), 976151 points
-plane 3: normal ~= (-0.985, 0, 0.173), 860160 points
-plane 7: normal ~= (0, 1, 0), 699528 points
-plane 8: normal ~= (0, 1, 0), 702368 points
+plane 0: normal ~= (-0.980, 0, 0.198), 665729 points
+plane 1: normal ~= (-0.980, 0, 0.198), 668153 points
+plane 2: normal ~= (0, 1, 0), 562251 points
+plane 3: normal ~= (0, 1, 0), 544151 points
 ```
 
-The earlier v13 result used visibility and UV local-support filtering. It looked cleaner in some projections, but it only kept 5,988,552 / 10,000,014 points and therefore lost too many faces for the current goal.
+The earlier v13 result used visibility and UV local-support filtering. It looked cleaner in some projections, but it only kept 5,988,552 / 10,000,014 points and therefore lost too many faces. The later v15 result recovered points but still relied too much on wide point assignment. The current seed-grown result moves the segmentation decision back to fitted local planes and growth constraints.

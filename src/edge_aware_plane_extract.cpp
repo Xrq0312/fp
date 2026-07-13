@@ -9,6 +9,8 @@
 #include <limits>
 #include <numeric>
 #include <optional>
+#include <queue>
+#include <set>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -50,6 +52,7 @@ struct Config {
     float merge_gap = 0.60f;
     float assign_distance = 0.24f;
     float assign_margin = 0.45f;
+    int grow_refine_iterations = 2;
     bool visibility_filter = false;
     float visibility_bin = 0.8f;
     bool local_support_only = false;
@@ -183,6 +186,7 @@ static Config parse_args(int argc, char** argv) {
     if (auto v = value_after(args, "--merge-gap")) cfg.merge_gap = std::stof(*v);
     if (auto v = value_after(args, "--assign-distance")) cfg.assign_distance = std::stof(*v);
     if (auto v = value_after(args, "--assign-margin")) cfg.assign_margin = std::stof(*v);
+    if (auto v = value_after(args, "--grow-refine-iterations")) cfg.grow_refine_iterations = std::stoi(*v);
     cfg.visibility_filter = has_flag(args, "--visibility-filter");
     if (auto v = value_after(args, "--visibility-bin")) cfg.visibility_bin = std::stof(*v);
     cfg.local_support_only = has_flag(args, "--local-support-only");
@@ -471,6 +475,116 @@ static bool valid_shape(const PlanePatch& patch, const Config& cfg) {
     return short_extent >= cfg.min_extent && aspect >= cfg.min_aspect_ratio;
 }
 
+static std::vector<int> surfel_neighbors(
+    int surfel_id,
+    const std::vector<Surfel>& surfels,
+    const std::unordered_map<CellKey, int, CellKeyHash>& index_by_key) {
+    std::vector<int> out;
+    out.reserve(26);
+    const CellKey base = surfels[static_cast<std::size_t>(surfel_id)].key;
+    for (int dx = -1; dx <= 1; ++dx) {
+        for (int dy = -1; dy <= 1; ++dy) {
+            for (int dz = -1; dz <= 1; ++dz) {
+                if (dx == 0 && dy == 0 && dz == 0) continue;
+                const CellKey key{base.x + dx, base.y + dy, base.z + dz};
+                auto it = index_by_key.find(key);
+                if (it != index_by_key.end()) out.push_back(it->second);
+            }
+        }
+    }
+    return out;
+}
+
+static bool surfel_matches_plane(const Surfel& surfel, const PlanePatch& patch, const Config& cfg, float angle_cos, float distance_scale) {
+    const float normal_dot = std::abs(surfel.normal.dot(patch.normal));
+    if (normal_dot < angle_cos) return false;
+    const float distance = std::abs(patch.normal.dot(surfel.centroid) + patch.d);
+    return distance <= cfg.coplanar_distance * distance_scale;
+}
+
+static std::vector<PlanePatch> extract_seed_grown_patches(
+    const std::vector<Surfel>& surfels,
+    const std::unordered_map<CellKey, int, CellKeyHash>& index_by_key,
+    const Config& cfg) {
+    std::vector<int> order(surfels.size());
+    std::iota(order.begin(), order.end(), 0);
+    std::sort(order.begin(), order.end(), [&](int a, int b) {
+        const Surfel& lhs = surfels[static_cast<std::size_t>(a)];
+        const Surfel& rhs = surfels[static_cast<std::size_t>(b)];
+        if (lhs.edge_like != rhs.edge_like) return !lhs.edge_like;
+        if (std::abs(lhs.curvature - rhs.curvature) > 1e-8f) return lhs.curvature < rhs.curvature;
+        return lhs.count > rhs.count;
+    });
+
+    const int min_seed = std::max(6, cfg.min_surfels / 4);
+    const int min_patch = std::max(cfg.min_surfels, 6);
+    const float smooth_cos = std::cos(cfg.smooth_angle_deg / 180.0f * 3.14159265358979323846f);
+    std::vector<int> owner(surfels.size(), -1);
+    std::vector<PlanePatch> patches;
+
+    for (int seed : order) {
+        if (owner[static_cast<std::size_t>(seed)] >= 0 || surfels[static_cast<std::size_t>(seed)].edge_like) continue;
+
+        std::vector<int> seed_ids{seed};
+        for (int neighbor : surfel_neighbors(seed, surfels, index_by_key)) {
+            if (owner[static_cast<std::size_t>(neighbor)] >= 0 || surfels[static_cast<std::size_t>(neighbor)].edge_like) continue;
+            if (std::abs(surfels[static_cast<std::size_t>(seed)].normal.dot(surfels[static_cast<std::size_t>(neighbor)].normal)) >= smooth_cos) {
+                seed_ids.push_back(neighbor);
+            }
+        }
+        if (seed_ids.size() < static_cast<std::size_t>(min_seed)) continue;
+
+        PlanePatch patch = fit_patch_from_surfels(seed_ids, surfels);
+        std::vector<int> ids;
+        ids.reserve(512);
+        std::queue<int> q;
+        std::set<int> touched;
+
+        auto try_add = [&](int id, bool can_expand) {
+            if (owner[static_cast<std::size_t>(id)] >= 0 || touched.find(id) != touched.end()) return;
+            if (!surfel_matches_plane(surfels[static_cast<std::size_t>(id)], patch, cfg, smooth_cos, 1.0f)) return;
+            touched.insert(id);
+            ids.push_back(id);
+            if (can_expand && !surfels[static_cast<std::size_t>(id)].edge_like) q.push(id);
+        };
+
+        for (int id : seed_ids) try_add(id, true);
+        while (!q.empty()) {
+            const int current = q.front();
+            q.pop();
+            for (int neighbor : surfel_neighbors(current, surfels, index_by_key)) {
+                try_add(neighbor, true);
+            }
+        }
+
+        for (int iter = 0; iter < std::max(cfg.grow_refine_iterations, 0); ++iter) {
+            if (ids.size() < static_cast<std::size_t>(min_seed)) break;
+            patch = fit_patch_from_surfels(ids, surfels);
+            std::vector<int> frontier = ids;
+            for (int current : frontier) {
+                for (int neighbor : surfel_neighbors(current, surfels, index_by_key)) {
+                    try_add(neighbor, !surfels[static_cast<std::size_t>(neighbor)].edge_like);
+                }
+            }
+        }
+
+        if (ids.size() < static_cast<std::size_t>(min_patch)) continue;
+        patch = fit_patch_from_surfels(ids, surfels);
+        update_patch_envelope(patch, surfels);
+        if (!valid_shape(patch, cfg)) continue;
+
+        const int patch_id = static_cast<int>(patches.size());
+        for (int id : ids) owner[static_cast<std::size_t>(id)] = patch_id;
+        patches.push_back(std::move(patch));
+        if (patches.size() >= static_cast<std::size_t>(std::max(cfg.max_planes, 1))) break;
+    }
+
+    std::sort(patches.begin(), patches.end(), [](const PlanePatch& a, const PlanePatch& b) {
+        return a.surfels.size() > b.surfels.size();
+    });
+    return patches;
+}
+
 static std::vector<PlanePatch> components_to_patches(const std::vector<Surfel>& surfels, DisjointSet& dsu, const Config& cfg) {
     std::unordered_map<int, std::vector<int>> components;
     for (std::size_t i = 0; i < surfels.size(); ++i) {
@@ -711,6 +825,114 @@ static ColorCloudPtr make_edge_cloud(const std::vector<Surfel>& surfels) {
     return out;
 }
 
+static std::vector<int> build_surfel_labels(const std::vector<PlanePatch>& patches, std::size_t surfel_count) {
+    std::vector<int> labels(surfel_count, -1);
+    for (std::size_t i = 0; i < patches.size(); ++i) {
+        for (int surfel_id : patches[i].surfels) {
+            if (surfel_id >= 0 && static_cast<std::size_t>(surfel_id) < labels.size()) {
+                labels[static_cast<std::size_t>(surfel_id)] = static_cast<int>(i);
+            }
+        }
+    }
+    return labels;
+}
+
+static ColorCloudPtr make_feature_cloud(
+    const std::vector<Surfel>& surfels,
+    const std::unordered_map<CellKey, int, CellKeyHash>& index_by_key,
+    const std::vector<PlanePatch>& patches,
+    bool corners) {
+    const std::vector<int> labels = build_surfel_labels(patches, surfels.size());
+    ColorCloudPtr out(new ColorCloudT);
+    for (std::size_t i = 0; i < surfels.size(); ++i) {
+        if (labels[i] < 0) continue;
+        std::set<int> neighbor_labels{labels[i]};
+        for (int neighbor : surfel_neighbors(static_cast<int>(i), surfels, index_by_key)) {
+            const int label = labels[static_cast<std::size_t>(neighbor)];
+            if (label >= 0) neighbor_labels.insert(label);
+        }
+        const std::size_t required = corners ? 3 : 2;
+        if (neighbor_labels.size() < required) continue;
+        ColorPointT p;
+        p.x = surfels[i].centroid.x();
+        p.y = surfels[i].centroid.y();
+        p.z = surfels[i].centroid.z();
+        p.r = corners ? 255 : 255;
+        p.g = corners ? 255 : 160;
+        p.b = corners ? 255 : 20;
+        out->push_back(p);
+    }
+    out->width = static_cast<std::uint32_t>(out->size());
+    out->height = 1;
+    out->is_dense = true;
+    return out;
+}
+
+static ColorCloudPtr make_plane_intersection_corners(const std::vector<PlanePatch>& patches, const Config& cfg) {
+    ColorCloudPtr out(new ColorCloudT);
+    const float det_threshold = 0.05f;
+    const float merge_distance = std::max(cfg.surfel_size * 2.0f, 0.5f);
+    const float envelope_margin = std::max(cfg.assign_margin, cfg.surfel_size * 4.0f);
+
+    auto duplicate = [&](const Eigen::Vector3f& q) {
+        for (const auto& p : out->points) {
+            const Eigen::Vector3f existing(p.x, p.y, p.z);
+            if ((existing - q).norm() <= merge_distance) return true;
+        }
+        return false;
+    };
+
+    for (std::size_t i = 0; i < patches.size(); ++i) {
+        for (std::size_t j = i + 1; j < patches.size(); ++j) {
+            for (std::size_t k = j + 1; k < patches.size(); ++k) {
+                Eigen::Matrix3f a;
+                a.row(0) = patches[i].normal.transpose();
+                a.row(1) = patches[j].normal.transpose();
+                a.row(2) = patches[k].normal.transpose();
+                const float det = std::abs(a.determinant());
+                if (det < det_threshold) continue;
+                Eigen::Vector3f b(-patches[i].d, -patches[j].d, -patches[k].d);
+                const Eigen::Vector3f q = a.colPivHouseholderQr().solve(b);
+                if (!std::isfinite(q.x()) || !std::isfinite(q.y()) || !std::isfinite(q.z())) continue;
+                if (!point_inside_patch_envelope(patches[i], q, envelope_margin)) continue;
+                if (!point_inside_patch_envelope(patches[j], q, envelope_margin)) continue;
+                if (!point_inside_patch_envelope(patches[k], q, envelope_margin)) continue;
+                if (duplicate(q)) continue;
+                ColorPointT p;
+                p.x = q.x();
+                p.y = q.y();
+                p.z = q.z();
+                p.r = 255;
+                p.g = 255;
+                p.b = 255;
+                out->push_back(p);
+            }
+        }
+    }
+    out->width = static_cast<std::uint32_t>(out->size());
+    out->height = 1;
+    out->is_dense = true;
+    return out;
+}
+
+static void save_color_ply_allow_empty(const fs::path& path, const ColorCloudT& cloud) {
+    if (!cloud.empty()) {
+        pcl::io::savePLYFileASCII(path.string(), cloud);
+        return;
+    }
+    std::ofstream out(path);
+    out << "ply\n"
+        << "format ascii 1.0\n"
+        << "element vertex 0\n"
+        << "property float x\n"
+        << "property float y\n"
+        << "property float z\n"
+        << "property uchar red\n"
+        << "property uchar green\n"
+        << "property uchar blue\n"
+        << "end_header\n";
+}
+
 static void save_report(const fs::path& path, const std::vector<PlanePatch>& patches) {
     std::ofstream out(path);
     out << "id,surfels,output_points,nx,ny,nz,d,cx,cy,cz,extent_u,extent_v\n";
@@ -758,7 +980,7 @@ int main(int argc, char** argv) {
 
         DisjointSet dsu(surfels.size());
         mark_edge_surfels_and_union(surfels, index_by_key, cfg, dsu);
-        std::vector<PlanePatch> patches = components_to_patches(surfels, dsu, cfg);
+        std::vector<PlanePatch> patches = extract_seed_grown_patches(surfels, index_by_key, cfg);
         merge_patches(patches, surfels, cfg);
         assign_full_points(cloud, bounds, surfels, patches, cfg);
 
@@ -766,6 +988,8 @@ int main(int argc, char** argv) {
         fs::create_directories(out_dir);
         pcl::io::savePLYFileASCII((out_dir / "edge_aware_plane_patches.ply").string(), *make_colored_patch_cloud(patches));
         pcl::io::savePLYFileASCII((out_dir / "edge_surfels.ply").string(), *make_edge_cloud(surfels));
+        save_color_ply_allow_empty(out_dir / "feature_edges.ply", *make_feature_cloud(surfels, index_by_key, patches, false));
+        save_color_ply_allow_empty(out_dir / "feature_corners.ply", *make_plane_intersection_corners(patches, cfg));
         save_report(out_dir / "edge_aware_plane_report.csv", patches);
         if (cfg.save_plane_files) save_plane_files(out_dir, patches);
 
