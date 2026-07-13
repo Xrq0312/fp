@@ -63,6 +63,17 @@ struct Config {
     float min_extent = 3.0f;
     float min_aspect_ratio = 0.02f;
     int max_planes = 120;
+    float normal_parallel_cos = 0.975f;
+    float corner_support_radius_scale = 7.0f;
+    float intersection_merge_scale = 4.5f;
+    int min_corner_support = 8;
+    int min_plane_local_support = 3;
+    int min_corner_planes = 3;
+    float corner_edge_radius_scale = 3.5f;
+    std::vector<float> corner_edge_multi_scales{2.5f, 4.5f, 7.0f};
+    int corner_edge_sample_limit = 40000;
+    float max_corner_edge_score = 0.0f;
+    float max_corner_edge_growth_ratio = 0.0f;
     bool save_plane_files = false;
     bool verbose = true;
 };
@@ -121,6 +132,12 @@ struct PlanePatch {
     float extent_v = 0.0f;
 };
 
+struct CornerCandidate {
+    Eigen::Vector3f position{0.0f, 0.0f, 0.0f};
+    std::vector<int> plane_ids;
+    int support = 0;
+};
+
 struct DisjointSet {
     std::vector<int> parent;
     std::vector<int> rank;
@@ -165,7 +182,7 @@ static Config parse_args(int argc, char** argv) {
             << "  --smooth-angle-deg, --edge-angle-deg, --coplanar-distance,\n"
             << "  --merge-*, --assign-*, --visibility-*, --local-support-only,\n"
             << "  --support-halo, --support-bin-size, --save-plane-files,\n"
-            << "  --min-surfels, --min-output-points.\n";
+            << "  --min-surfels, --min-output-points, --corner-*.\n";
         std::exit(args.empty() ? 1 : 0);
     }
 
@@ -197,6 +214,16 @@ static Config parse_args(int argc, char** argv) {
     if (auto v = value_after(args, "--min-extent")) cfg.min_extent = std::stof(*v);
     if (auto v = value_after(args, "--min-aspect-ratio")) cfg.min_aspect_ratio = std::stof(*v);
     if (auto v = value_after(args, "--max-planes")) cfg.max_planes = std::stoi(*v);
+    if (auto v = value_after(args, "--normal-parallel-cos")) cfg.normal_parallel_cos = std::stof(*v);
+    if (auto v = value_after(args, "--corner-support-radius-scale")) cfg.corner_support_radius_scale = std::stof(*v);
+    if (auto v = value_after(args, "--intersection-merge-scale")) cfg.intersection_merge_scale = std::stof(*v);
+    if (auto v = value_after(args, "--min-corner-support")) cfg.min_corner_support = std::stoi(*v);
+    if (auto v = value_after(args, "--min-plane-local-support")) cfg.min_plane_local_support = std::stoi(*v);
+    if (auto v = value_after(args, "--min-corner-planes")) cfg.min_corner_planes = std::stoi(*v);
+    if (auto v = value_after(args, "--corner-edge-radius-scale")) cfg.corner_edge_radius_scale = std::stof(*v);
+    if (auto v = value_after(args, "--corner-edge-sample-limit")) cfg.corner_edge_sample_limit = std::stoi(*v);
+    if (auto v = value_after(args, "--max-corner-edge-score")) cfg.max_corner_edge_score = std::stof(*v);
+    if (auto v = value_after(args, "--max-corner-edge-growth-ratio")) cfg.max_corner_edge_growth_ratio = std::stof(*v);
     cfg.save_plane_files = has_flag(args, "--save-plane-files");
     cfg.verbose = !has_flag(args, "--quiet");
     return cfg;
@@ -915,6 +942,216 @@ static ColorCloudPtr make_plane_intersection_corners(const std::vector<PlanePatc
     return out;
 }
 
+static int nearby_support_count(pcl::KdTreeFLANN<PointT>& tree, const Eigen::Vector3f& p, float radius) {
+    PointT probe;
+    probe.x = p.x();
+    probe.y = p.y();
+    probe.z = p.z();
+    std::vector<int> indices;
+    std::vector<float> distances;
+    return tree.radiusSearch(probe, radius, indices, distances);
+}
+
+static int nearby_support_count_on_patch(const PlanePatch& patch, const Eigen::Vector3f& p, float radius) {
+    const float radius_sq = radius * radius;
+    int count = 0;
+    for (const auto& q : patch.output->points) {
+        const float dx = q.x - p.x();
+        const float dy = q.y - p.y();
+        const float dz = q.z - p.z();
+        if (dx * dx + dy * dy + dz * dz <= radius_sq) ++count;
+    }
+    return count;
+}
+
+static bool intersection_of_three_planes(const PlanePatch& a, const PlanePatch& b, const PlanePatch& c, Eigen::Vector3f& out) {
+    Eigen::Matrix3f A;
+    A.row(0) = a.normal.transpose();
+    A.row(1) = b.normal.transpose();
+    A.row(2) = c.normal.transpose();
+    if (std::abs(A.determinant()) < 1e-4f) return false;
+    out = A.colPivHouseholderQr().solve(Eigen::Vector3f(-a.d, -b.d, -c.d));
+    return out.allFinite();
+}
+
+static bool within_bounds(const Eigen::Vector3f& p, const Bounds& bounds, float margin) {
+    return p.x() >= bounds.min_pt.x - margin && p.x() <= bounds.max_pt.x + margin &&
+           p.y() >= bounds.min_pt.y - margin && p.y() <= bounds.max_pt.y + margin &&
+           p.z() >= bounds.min_pt.z - margin && p.z() <= bounds.max_pt.z + margin;
+}
+
+class CornerEdgeScorer {
+public:
+    CornerEdgeScorer(pcl::KdTreeFLANN<PointT>& tree, CloudPtr cloud, float resolution, const Config& cfg)
+        : tree_(tree), cloud_(std::move(cloud)), resolution_(resolution), cfg_(cfg) {}
+
+    bool passes_filter(const CornerCandidate& candidate) const {
+        const float edge_score = score_at_scale(candidate.position, cfg_.corner_edge_radius_scale);
+        if (cfg_.max_corner_edge_score > 0.0f && edge_score > cfg_.max_corner_edge_score) return false;
+        if (cfg_.max_corner_edge_growth_ratio > 0.0f) {
+            const float mid = std::max(score_at_scale(candidate.position, edge_scale(1)), 1e-6f);
+            const float large = score_at_scale(candidate.position, edge_scale(2));
+            if (large / mid > cfg_.max_corner_edge_growth_ratio) return false;
+        }
+        return true;
+    }
+
+private:
+    float edge_scale(std::size_t index) const {
+        if (cfg_.corner_edge_multi_scales.empty()) return cfg_.corner_edge_radius_scale;
+        return cfg_.corner_edge_multi_scales[std::min(index, cfg_.corner_edge_multi_scales.size() - 1)];
+    }
+
+    float score_at_scale(const Eigen::Vector3f& p, float scale) const {
+        return local_covariance_score(p, std::max(scale * resolution_, 1e-4f));
+    }
+
+    float local_covariance_score(const Eigen::Vector3f& p, float radius) const {
+        PointT probe;
+        probe.x = p.x();
+        probe.y = p.y();
+        probe.z = p.z();
+        std::vector<int> indices;
+        std::vector<float> distances;
+        const int found = tree_.radiusSearch(probe, radius, indices, distances);
+        if (found < 6) return 0.0f;
+
+        const std::size_t limit = cfg_.corner_edge_sample_limit > 0
+            ? static_cast<std::size_t>(cfg_.corner_edge_sample_limit)
+            : std::numeric_limits<std::size_t>::max();
+        const std::size_t step = indices.size() > limit
+            ? static_cast<std::size_t>(std::ceil(static_cast<double>(indices.size()) / static_cast<double>(limit)))
+            : 1;
+
+        Eigen::Vector3f mean = Eigen::Vector3f::Zero();
+        std::size_t used = 0;
+        for (std::size_t i = 0; i < indices.size() && used < limit; i += step) {
+            const auto& q = cloud_->points[static_cast<std::size_t>(indices[i])];
+            mean += Eigen::Vector3f(q.x, q.y, q.z);
+            ++used;
+        }
+        if (used < 6) return 0.0f;
+        mean /= static_cast<float>(used);
+
+        Eigen::Matrix3f covariance = Eigen::Matrix3f::Zero();
+        std::size_t used_cov = 0;
+        for (std::size_t i = 0; i < indices.size() && used_cov < limit; i += step) {
+            const auto& q = cloud_->points[static_cast<std::size_t>(indices[i])];
+            const Eigen::Vector3f centered = Eigen::Vector3f(q.x, q.y, q.z) - mean;
+            covariance += centered * centered.transpose();
+            ++used_cov;
+        }
+        covariance /= static_cast<float>(std::max<std::size_t>(used_cov, 1));
+
+        Eigen::SelfAdjointEigenSolver<Eigen::Matrix3f> solver(covariance);
+        if (solver.info() != Eigen::Success) return 0.0f;
+        const Eigen::Vector3f eigenvalues = solver.eigenvalues().cwiseMax(0.0f);
+        const float sum = eigenvalues.sum();
+        return sum > 1e-12f ? eigenvalues.x() / sum : 0.0f;
+    }
+
+    pcl::KdTreeFLANN<PointT>& tree_;
+    CloudPtr cloud_;
+    float resolution_ = 0.0f;
+    const Config& cfg_;
+};
+
+static std::vector<CornerCandidate> merge_corner_candidates(std::vector<CornerCandidate> candidates, float merge_radius) {
+    std::vector<CornerCandidate> merged;
+    const float merge_sq = merge_radius * merge_radius;
+    for (auto& candidate : candidates) {
+        bool absorbed = false;
+        for (auto& group : merged) {
+            if ((group.position - candidate.position).squaredNorm() <= merge_sq) {
+                if (candidate.support > group.support) group.position = candidate.position;
+                group.support = std::max(group.support, candidate.support);
+                group.plane_ids.insert(group.plane_ids.end(), candidate.plane_ids.begin(), candidate.plane_ids.end());
+                std::sort(group.plane_ids.begin(), group.plane_ids.end());
+                group.plane_ids.erase(std::unique(group.plane_ids.begin(), group.plane_ids.end()), group.plane_ids.end());
+                absorbed = true;
+                break;
+            }
+        }
+        if (!absorbed) merged.push_back(candidate);
+    }
+    std::sort(merged.begin(), merged.end(), [](const CornerCandidate& a, const CornerCandidate& b) {
+        return a.support > b.support;
+    });
+    return merged;
+}
+
+static std::vector<CornerCandidate> extract_corners_filtered(
+    const CloudPtr& cloud,
+    const std::vector<PlanePatch>& patches,
+    const Bounds& bounds,
+    const Config& cfg) {
+    std::vector<CornerCandidate> candidates;
+    pcl::KdTreeFLANN<PointT> support_tree;
+    support_tree.setInputCloud(cloud);
+
+    const float support_radius = std::max(cfg.corner_support_radius_scale * cfg.surfel_size, 1e-4f);
+    const float merge_radius = std::max(cfg.intersection_merge_scale * cfg.surfel_size, 1e-4f);
+    const float bbox_margin = std::max(3.0f * cfg.surfel_size, cfg.assign_distance);
+    const float envelope_margin = std::max(cfg.assign_margin, cfg.surfel_size * 2.0f);
+    const float plane_distance_threshold = std::max(2.0f * cfg.surfel_size, cfg.assign_distance);
+
+    for (std::size_t i = 0; i < patches.size(); ++i) {
+        for (std::size_t j = i + 1; j < patches.size(); ++j) {
+            if (std::abs(patches[i].normal.dot(patches[j].normal)) > cfg.normal_parallel_cos) continue;
+            for (std::size_t k = j + 1; k < patches.size(); ++k) {
+                if (std::abs(patches[i].normal.dot(patches[k].normal)) > cfg.normal_parallel_cos) continue;
+                if (std::abs(patches[j].normal.dot(patches[k].normal)) > cfg.normal_parallel_cos) continue;
+
+                Eigen::Vector3f p;
+                if (!intersection_of_three_planes(patches[i], patches[j], patches[k], p)) continue;
+                if (!within_bounds(p, bounds, bbox_margin)) continue;
+                if (!point_inside_patch_envelope(patches[i], p, envelope_margin)) continue;
+                if (!point_inside_patch_envelope(patches[j], p, envelope_margin)) continue;
+                if (!point_inside_patch_envelope(patches[k], p, envelope_margin)) continue;
+                if (std::abs(patches[i].normal.dot(p) + patches[i].d) > plane_distance_threshold) continue;
+                if (std::abs(patches[j].normal.dot(p) + patches[j].d) > plane_distance_threshold) continue;
+                if (std::abs(patches[k].normal.dot(p) + patches[k].d) > plane_distance_threshold) continue;
+
+                const int support = nearby_support_count(support_tree, p, support_radius);
+                if (support < cfg.min_corner_support) continue;
+                if (nearby_support_count_on_patch(patches[i], p, support_radius) < cfg.min_plane_local_support) continue;
+                if (nearby_support_count_on_patch(patches[j], p, support_radius) < cfg.min_plane_local_support) continue;
+                if (nearby_support_count_on_patch(patches[k], p, support_radius) < cfg.min_plane_local_support) continue;
+                candidates.push_back({p, {static_cast<int>(i), static_cast<int>(j), static_cast<int>(k)}, support});
+            }
+        }
+    }
+
+    auto merged = merge_corner_candidates(std::move(candidates), merge_radius);
+    const CornerEdgeScorer edge_scorer(support_tree, cloud, cfg.surfel_size, cfg);
+    const std::size_t min_planes = static_cast<std::size_t>(std::max(cfg.min_corner_planes, 1));
+    merged.erase(
+        std::remove_if(merged.begin(), merged.end(), [&](const CornerCandidate& candidate) {
+            if (candidate.plane_ids.size() < min_planes) return true;
+            return !edge_scorer.passes_filter(candidate);
+        }),
+        merged.end());
+    return merged;
+}
+
+static ColorCloudPtr make_corner_cloud(const std::vector<CornerCandidate>& corners) {
+    ColorCloudPtr out(new ColorCloudT);
+    for (const auto& corner : corners) {
+        ColorPointT p;
+        p.x = corner.position.x();
+        p.y = corner.position.y();
+        p.z = corner.position.z();
+        p.r = 255;
+        p.g = 255;
+        p.b = 255;
+        out->push_back(p);
+    }
+    out->width = static_cast<std::uint32_t>(out->size());
+    out->height = 1;
+    out->is_dense = true;
+    return out;
+}
+
 static void save_color_ply_allow_empty(const fs::path& path, const ColorCloudT& cloud) {
     if (!cloud.empty()) {
         pcl::io::savePLYFileASCII(path.string(), cloud);
@@ -955,6 +1192,26 @@ static void save_report(const fs::path& path, const std::vector<PlanePatch>& pat
     }
 }
 
+static void save_corner_report(const fs::path& path, const std::vector<CornerCandidate>& corners) {
+    std::ofstream out(path);
+    out << "id,x,y,z,support,plane_count,plane_ids\n";
+    out.setf(std::ios::fixed, std::ios::floatfield);
+    out.precision(6);
+    for (std::size_t i = 0; i < corners.size(); ++i) {
+        out << i << ','
+            << corners[i].position.x() << ','
+            << corners[i].position.y() << ','
+            << corners[i].position.z() << ','
+            << corners[i].support << ','
+            << corners[i].plane_ids.size() << ',';
+        for (std::size_t j = 0; j < corners[i].plane_ids.size(); ++j) {
+            if (j > 0) out << '|';
+            out << corners[i].plane_ids[j];
+        }
+        out << '\n';
+    }
+}
+
 static void save_plane_files(const fs::path& out_dir, const std::vector<PlanePatch>& patches) {
     const fs::path plane_dir = out_dir / "planes";
     fs::create_directories(plane_dir);
@@ -983,6 +1240,7 @@ int main(int argc, char** argv) {
         std::vector<PlanePatch> patches = extract_seed_grown_patches(surfels, index_by_key, cfg);
         merge_patches(patches, surfels, cfg);
         assign_full_points(cloud, bounds, surfels, patches, cfg);
+        const std::vector<CornerCandidate> corners = extract_corners_filtered(cloud, patches, bounds, cfg);
 
         fs::path out_dir = cfg.output_dir / cfg.input.stem();
         fs::create_directories(out_dir);
@@ -990,7 +1248,9 @@ int main(int argc, char** argv) {
         pcl::io::savePLYFileASCII((out_dir / "edge_surfels.ply").string(), *make_edge_cloud(surfels));
         save_color_ply_allow_empty(out_dir / "feature_edges.ply", *make_feature_cloud(surfels, index_by_key, patches, false));
         save_color_ply_allow_empty(out_dir / "feature_corners.ply", *make_plane_intersection_corners(patches, cfg));
+        save_color_ply_allow_empty(out_dir / "extracted_corners.ply", *make_corner_cloud(corners));
         save_report(out_dir / "edge_aware_plane_report.csv", patches);
+        save_corner_report(out_dir / "corner_report.csv", corners);
         if (cfg.save_plane_files) save_plane_files(out_dir, patches);
 
         if (cfg.verbose) {
@@ -1006,6 +1266,7 @@ int main(int argc, char** argv) {
             }
             std::cout << "Plane patches: " << patches.size() << "\n";
             std::cout << "Output points: " << output_points << "\n";
+            std::cout << "Extracted corners: " << corners.size() << "\n";
             std::cout << "Saved to " << fs::absolute(out_dir).string() << "\n";
         }
         return 0;

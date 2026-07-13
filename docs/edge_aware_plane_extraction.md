@@ -21,7 +21,7 @@ This implementation targets clean model-exported PLY point clouds. The current d
 7. Grow the plane by BFS over neighboring surfels, accepting only surfels that match the seed-fitted plane by normal angle and residual distance.
 8. Refit and refine each grown region, then merge coplanar adjacent patches.
 9. Assign original dense points to the nearest accepted plane. This is a final recovery step, not the main segmentation mechanism.
-10. Export plane patches, per-plane PLY files, edge-feature points, and corner-feature candidates for diagnosis.
+10. Generate diagnostic edge/corner candidates, then extract stricter corner points from three-plane intersections validated by real point support and per-plane local support.
 
 ## Recommended Command
 
@@ -38,6 +38,8 @@ results_seed_grow\top_left_cut2\edge_aware_plane_patches.ply
 results_seed_grow\top_left_cut2\planes\
 results_seed_grow\top_left_cut2\feature_edges.ply
 results_seed_grow\top_left_cut2\feature_corners.ply
+results_seed_grow\top_left_cut2\extracted_corners.ply
+results_seed_grow\top_left_cut2\corner_report.csv
 results_seed_grow\top_left_cut2\images\
 ```
 
@@ -48,6 +50,7 @@ Input points: 10000014
 Surfels: 27545
 Plane patches: 54
 Output points: 9888831
+Extracted corners: 76
 ```
 
 For `top_left_cut2.ply`, the connector's four long planes are represented by the four largest grown patches rather than stripe-like fragments:

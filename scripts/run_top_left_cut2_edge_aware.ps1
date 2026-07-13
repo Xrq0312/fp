@@ -33,7 +33,12 @@ $args = @(
     "--min-output-points", "5000",
     "--min-extent", "3",
     "--min-aspect-ratio", "0.02",
-    "--max-planes", "120",
+    "--max-planes", "160",
+    "--corner-support-radius-scale", "7.0",
+    "--intersection-merge-scale", "4.5",
+    "--min-corner-support", "8",
+    "--min-plane-local-support", "3",
+    "--min-corner-planes", "3",
     "--save-plane-files"
 )
 
@@ -44,3 +49,4 @@ $ply = Join-Path (Join-Path $OutputDir $stem) "edge_aware_plane_patches.ply"
 $imageDir = Join-Path (Join-Path $OutputDir $stem) "images"
 python .\scripts\render_ply_views.py $ply --out-dir $imageDir --prefix seed_grow --rgb --sample-limit 300000 --size 1800
 python .\scripts\render_ply_views.py (Join-Path (Join-Path $OutputDir $stem) "feature_edges.ply") --out-dir $imageDir --prefix seed_grow_edges --rgb --point-radius 3 --sample-limit 200000 --size 1800
+python .\scripts\render_ply_views.py (Join-Path (Join-Path $OutputDir $stem) "extracted_corners.ply") --out-dir $imageDir --prefix seed_grow_corners --rgb --point-radius 6 --sample-limit 200000 --size 1800
