@@ -1,6 +1,6 @@
 param(
     [string]$InputPly = ".\data01\data01\top_left_cut2.ply",
-    [string]$OutputDir = ".\results_edge_aware_v13_projected_merge_gap8"
+    [string]$OutputDir = ".\results_edge_aware_v15_high_recall_d2"
 )
 
 $ErrorActionPreference = "Stop"
@@ -26,12 +26,8 @@ $args = @(
     "--merge-angle-deg", "5",
     "--merge-distance", "0.5",
     "--merge-gap", "8.0",
-    "--assign-distance", "0.65",
-    "--assign-margin", "2.5",
-    "--visibility-filter",
-    "--visibility-bin", "0.8",
-    "--local-support-only",
-    "--support-halo", "1",
+    "--assign-distance", "2.0",
+    "--assign-margin", "12.0",
     "--min-surfels", "20",
     "--min-output-points", "5000",
     "--min-extent", "3",
