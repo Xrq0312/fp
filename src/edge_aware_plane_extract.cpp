@@ -53,8 +53,6 @@ struct Config {
     float assign_distance = 0.24f;
     float assign_margin = 0.45f;
     int grow_refine_iterations = 2;
-    bool visibility_filter = false;
-    float visibility_bin = 0.8f;
     bool local_support_only = false;
     int support_halo = 1;
     float support_bin_size = 0.0f;
@@ -115,7 +113,6 @@ struct Surfel {
     float curvature = 0.0f;
     int count = 0;
     bool edge_like = false;
-    bool visible = true;
 };
 
 struct PlanePatch {
@@ -138,29 +135,6 @@ struct CornerCandidate {
     int support = 0;
 };
 
-struct DisjointSet {
-    std::vector<int> parent;
-    std::vector<int> rank;
-
-    explicit DisjointSet(std::size_t n) : parent(n), rank(n, 0) {
-        std::iota(parent.begin(), parent.end(), 0);
-    }
-
-    int find(int x) {
-        if (parent[static_cast<std::size_t>(x)] != x) parent[static_cast<std::size_t>(x)] = find(parent[static_cast<std::size_t>(x)]);
-        return parent[static_cast<std::size_t>(x)];
-    }
-
-    void unite(int a, int b) {
-        int ra = find(a);
-        int rb = find(b);
-        if (ra == rb) return;
-        if (rank[static_cast<std::size_t>(ra)] < rank[static_cast<std::size_t>(rb)]) std::swap(ra, rb);
-        parent[static_cast<std::size_t>(rb)] = ra;
-        if (rank[static_cast<std::size_t>(ra)] == rank[static_cast<std::size_t>(rb)]) ++rank[static_cast<std::size_t>(ra)];
-    }
-};
-
 static bool has_flag(const std::vector<std::string>& args, const std::string& flag) {
     return std::find(args.begin(), args.end(), flag) != args.end();
 }
@@ -180,7 +154,7 @@ static Config parse_args(int argc, char** argv) {
             << "Usage: edge_aware_plane_extract input.ply [options]\n"
             << "Options: --output-dir, --input-scale, --surfel-size, --normal-k,\n"
             << "  --smooth-angle-deg, --edge-angle-deg, --coplanar-distance,\n"
-            << "  --merge-*, --assign-*, --visibility-*, --local-support-only,\n"
+            << "  --merge-*, --assign-*, --local-support-only,\n"
             << "  --support-halo, --support-bin-size, --save-plane-files,\n"
             << "  --min-surfels, --min-output-points, --corner-*.\n";
         std::exit(args.empty() ? 1 : 0);
@@ -204,8 +178,6 @@ static Config parse_args(int argc, char** argv) {
     if (auto v = value_after(args, "--assign-distance")) cfg.assign_distance = std::stof(*v);
     if (auto v = value_after(args, "--assign-margin")) cfg.assign_margin = std::stof(*v);
     if (auto v = value_after(args, "--grow-refine-iterations")) cfg.grow_refine_iterations = std::stoi(*v);
-    cfg.visibility_filter = has_flag(args, "--visibility-filter");
-    if (auto v = value_after(args, "--visibility-bin")) cfg.visibility_bin = std::stof(*v);
     cfg.local_support_only = has_flag(args, "--local-support-only");
     if (auto v = value_after(args, "--support-halo")) cfg.support_halo = std::stoi(*v);
     if (auto v = value_after(args, "--support-bin-size")) cfg.support_bin_size = std::stof(*v);
@@ -321,98 +293,10 @@ static void estimate_surfel_normals(std::vector<Surfel>& surfels, const CloudPtr
     }
 }
 
-struct BinKey {
-    int u = 0;
-    int v = 0;
-
-    bool operator==(const BinKey& other) const {
-        return u == other.u && v == other.v;
-    }
-};
-
-struct BinKeyHash {
-    std::size_t operator()(const BinKey& key) const {
-        std::size_t h = static_cast<std::size_t>(key.u) * 73856093u;
-        h ^= static_cast<std::size_t>(key.v) * 19349663u;
-        return h;
-    }
-};
-
-static void basis_for_direction(const Eigen::Vector3f& direction, Eigen::Vector3f& axis_u, Eigen::Vector3f& axis_v) {
-    const Eigen::Vector3f reference =
-        std::abs(direction.z()) < 0.9f ? Eigen::Vector3f::UnitZ() : Eigen::Vector3f::UnitY();
-    axis_u = direction.cross(reference).normalized();
-    axis_v = direction.cross(axis_u).normalized();
-}
-
-static std::vector<Eigen::Vector3f> visibility_directions() {
-    std::vector<Eigen::Vector3f> directions;
-    for (int x = -1; x <= 1; ++x) {
-        for (int y = -1; y <= 1; ++y) {
-            for (int z = -1; z <= 1; ++z) {
-                if (x == 0 && y == 0 && z == 0) continue;
-                Eigen::Vector3f d(static_cast<float>(x), static_cast<float>(y), static_cast<float>(z));
-                directions.push_back(d.normalized());
-            }
-        }
-    }
-    return directions;
-}
-
-static void mark_visible_surfels(std::vector<Surfel>& surfels, const Config& cfg) {
-    if (!cfg.visibility_filter) {
-        for (auto& surfel : surfels) surfel.visible = true;
-        return;
-    }
-
-    for (auto& surfel : surfels) surfel.visible = false;
-    const float bin_size = std::max(cfg.visibility_bin, 1e-4f);
-    const auto directions = visibility_directions();
-
-    for (const auto& direction : directions) {
-        Eigen::Vector3f axis_u;
-        Eigen::Vector3f axis_v;
-        basis_for_direction(direction, axis_u, axis_v);
-
-        struct Best {
-            float depth = -std::numeric_limits<float>::infinity();
-            int index = -1;
-        };
-        std::unordered_map<BinKey, Best, BinKeyHash> best_by_bin;
-        best_by_bin.reserve(surfels.size() / 2);
-
-        for (std::size_t i = 0; i < surfels.size(); ++i) {
-            const Eigen::Vector3f p = surfels[i].centroid;
-            const int u = static_cast<int>(std::floor(p.dot(axis_u) / bin_size));
-            const int v = static_cast<int>(std::floor(p.dot(axis_v) / bin_size));
-            const float depth = p.dot(direction);
-            auto& best = best_by_bin[BinKey{u, v}];
-            if (depth > best.depth) {
-                best.depth = depth;
-                best.index = static_cast<int>(i);
-            }
-        }
-
-        for (const auto& [key, best] : best_by_bin) {
-            if (best.index >= 0) surfels[static_cast<std::size_t>(best.index)].visible = true;
-        }
-    }
-}
-
-static bool compatible_surfel_pair(const Surfel& a, const Surfel& b, const Config& cfg) {
-    const float smooth_cos = std::cos(cfg.smooth_angle_deg / 180.0f * 3.14159265358979323846f);
-    if (std::abs(a.normal.dot(b.normal)) < smooth_cos) return false;
-
-    const float da = std::abs(a.normal.dot(b.centroid) + a.d);
-    const float db = std::abs(b.normal.dot(a.centroid) + b.d);
-    return da <= cfg.coplanar_distance && db <= cfg.coplanar_distance;
-}
-
-static void mark_edge_surfels_and_union(
+static void mark_edge_surfels(
     std::vector<Surfel>& surfels,
     const std::unordered_map<CellKey, int, CellKeyHash>& index_by_key,
-    const Config& cfg,
-    DisjointSet& dsu) {
+    const Config& cfg) {
     const float edge_cos = std::cos(cfg.edge_angle_deg / 180.0f * 3.14159265358979323846f);
     for (std::size_t i = 0; i < surfels.size(); ++i) {
         const CellKey key = surfels[i].key;
@@ -427,10 +311,7 @@ static void mark_edge_surfels_and_union(
                     if (j <= static_cast<int>(i)) continue;
 
                     const bool angle_edge = std::abs(surfels[i].normal.dot(surfels[static_cast<std::size_t>(j)].normal)) < edge_cos;
-                    const bool compatible = compatible_surfel_pair(surfels[i], surfels[static_cast<std::size_t>(j)], cfg);
-                    if (compatible && !angle_edge) {
-                        dsu.unite(static_cast<int>(i), j);
-                    } else if (angle_edge) {
+                    if (angle_edge) {
                         surfels[i].edge_like = true;
                         surfels[static_cast<std::size_t>(j)].edge_like = true;
                     }
@@ -612,29 +493,6 @@ static std::vector<PlanePatch> extract_seed_grown_patches(
     return patches;
 }
 
-static std::vector<PlanePatch> components_to_patches(const std::vector<Surfel>& surfels, DisjointSet& dsu, const Config& cfg) {
-    std::unordered_map<int, std::vector<int>> components;
-    for (std::size_t i = 0; i < surfels.size(); ++i) {
-        if (surfels[i].edge_like || !surfels[i].visible) continue;
-        components[dsu.find(static_cast<int>(i))].push_back(static_cast<int>(i));
-    }
-
-    std::vector<PlanePatch> patches;
-    for (auto& [root, ids] : components) {
-        if (ids.size() < static_cast<std::size_t>(std::max(cfg.min_surfels, 3))) continue;
-        PlanePatch patch = fit_patch_from_surfels(ids, surfels);
-        update_patch_envelope(patch, surfels);
-        if (valid_shape(patch, cfg)) patches.push_back(std::move(patch));
-    }
-    std::sort(patches.begin(), patches.end(), [](const PlanePatch& a, const PlanePatch& b) {
-        return a.surfels.size() > b.surfels.size();
-    });
-    if (patches.size() > static_cast<std::size_t>(std::max(cfg.max_planes, 1))) {
-        patches.resize(static_cast<std::size_t>(std::max(cfg.max_planes, 1)));
-    }
-    return patches;
-}
-
 static bool patches_can_merge(const PlanePatch& a, const PlanePatch& b, const Config& cfg) {
     const float normal_cos = std::cos(cfg.merge_angle_deg / 180.0f * 3.14159265358979323846f);
     const float dot = a.normal.dot(b.normal);
@@ -712,6 +570,23 @@ static bool point_inside_patch_envelope(const PlanePatch& patch, const Eigen::Ve
     return u >= patch.min_u - margin && u <= patch.max_u + margin &&
            v >= patch.min_v - margin && v <= patch.max_v + margin;
 }
+
+struct BinKey {
+    int u = 0;
+    int v = 0;
+
+    bool operator==(const BinKey& other) const {
+        return u == other.u && v == other.v;
+    }
+};
+
+struct BinKeyHash {
+    std::size_t operator()(const BinKey& key) const {
+        std::size_t h = static_cast<std::size_t>(key.u) * 73856093u;
+        h ^= static_cast<std::size_t>(key.v) * 19349663u;
+        return h;
+    }
+};
 
 struct PatchSupport {
     Eigen::Vector3f origin{0.0f, 0.0f, 0.0f};
@@ -1233,10 +1108,7 @@ int main(int argc, char** argv) {
         CloudPtr surfel_cloud;
         std::vector<Surfel> surfels = build_surfels(cloud, bounds, cfg, index_by_key, surfel_cloud);
         estimate_surfel_normals(surfels, surfel_cloud, cfg);
-        mark_visible_surfels(surfels, cfg);
-
-        DisjointSet dsu(surfels.size());
-        mark_edge_surfels_and_union(surfels, index_by_key, cfg, dsu);
+        mark_edge_surfels(surfels, index_by_key, cfg);
         std::vector<PlanePatch> patches = extract_seed_grown_patches(surfels, index_by_key, cfg);
         merge_patches(patches, surfels, cfg);
         assign_full_points(cloud, bounds, surfels, patches, cfg);
@@ -1258,12 +1130,6 @@ int main(int argc, char** argv) {
             for (const auto& patch : patches) output_points += patch.output->size();
             std::cout << "Input points: " << cloud->size() << "\n";
             std::cout << "Surfels: " << surfels.size() << "\n";
-            if (cfg.visibility_filter) {
-                const auto visible_count = std::count_if(surfels.begin(), surfels.end(), [](const Surfel& surfel) {
-                    return surfel.visible;
-                });
-                std::cout << "Visible surfels: " << visible_count << "\n";
-            }
             std::cout << "Plane patches: " << patches.size() << "\n";
             std::cout << "Output points: " << output_points << "\n";
             std::cout << "Extracted corners: " << corners.size() << "\n";
