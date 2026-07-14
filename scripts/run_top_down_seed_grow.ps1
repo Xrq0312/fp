@@ -17,28 +17,7 @@ if (-not (Test-Path $exe)) {
 $args = @(
     $InputPly,
     "--output-dir", $OutputDir,
-    "--input-scale", "1",
-    "--surfel-size", "0.5",
-    "--normal-k", "18",
-    "--smooth-angle-deg", "8",
-    "--edge-angle-deg", "20",
-    "--coplanar-distance", "0.35",
-    "--grow-refine-iterations", "2",
-    "--merge-angle-deg", "5",
-    "--merge-distance", "0.5",
-    "--merge-gap", "8.0",
-    "--assign-distance", "2.0",
-    "--assign-margin", "2.0",
-    "--min-surfels", "20",
-    "--min-output-points", "5000",
-    "--min-extent", "3",
-    "--min-aspect-ratio", "0.02",
-    "--max-planes", "160",
-    "--corner-support-radius-scale", "7.0",
-    "--intersection-merge-scale", "4.5",
-    "--min-corner-support", "8",
-    "--min-plane-local-support", "3",
-    "--min-corner-planes", "3"
+    "--input-scale", "1"
 )
 
 & $exe @args
