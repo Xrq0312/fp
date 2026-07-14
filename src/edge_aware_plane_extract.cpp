@@ -8,7 +8,6 @@
 #include <iostream>
 #include <limits>
 #include <numeric>
-#include <optional>
 #include <queue>
 #include <set>
 #include <sstream>
@@ -41,7 +40,8 @@ using ColorCloudPtr = ColorCloudT::Ptr;
 struct Config {
     fs::path input;
     fs::path output_dir = "results_edge_aware";
-    float input_scale = 1000.0f;
+    std::string profile = "model-mm";
+    float input_scale = 1.0f;
     float surfel_size = 0.50f;
     int normal_k = 18;
     float smooth_angle_deg = 8.0f;
@@ -139,11 +139,25 @@ static bool has_flag(const std::vector<std::string>& args, const std::string& fl
     return std::find(args.begin(), args.end(), flag) != args.end();
 }
 
-static std::optional<std::string> value_after(const std::vector<std::string>& args, const std::string& key) {
-    for (std::size_t i = 0; i + 1 < args.size(); ++i) {
-        if (args[i] == key) return args[i + 1];
+static void apply_profile(Config& cfg, const std::string& profile) {
+    cfg.profile = profile;
+    if (profile == "model-mm" || profile == "top-down") {
+        cfg.input_scale = 1.0f;
+        cfg.assign_margin = 2.0f;
+        return;
     }
-    return std::nullopt;
+    if (profile == "model-m") {
+        cfg.input_scale = 1000.0f;
+        cfg.assign_margin = 12.0f;
+        return;
+    }
+    if (profile == "top-left-cut2") {
+        cfg.input_scale = 1000.0f;
+        cfg.assign_margin = 12.0f;
+        cfg.save_plane_files = true;
+        return;
+    }
+    throw std::runtime_error("Unknown profile: " + profile + ". Use model-mm, model-m, top-down, or top-left-cut2.");
 }
 
 static Config parse_args(int argc, char** argv) {
@@ -152,52 +166,36 @@ static Config parse_args(int argc, char** argv) {
     if (args.empty() || has_flag(args, "--help") || has_flag(args, "-h")) {
         std::cout
             << "Usage: edge_aware_plane_extract input.ply [options]\n"
-            << "Options: --output-dir, --input-scale, --surfel-size, --normal-k,\n"
-            << "  --smooth-angle-deg, --edge-angle-deg, --coplanar-distance,\n"
-            << "  --merge-*, --assign-*, --local-support-only,\n"
-            << "  --support-halo, --support-bin-size, --save-plane-files,\n"
-            << "  --min-surfels, --min-output-points, --corner-*.\n";
+            << "Options:\n"
+            << "  --profile model-mm|model-m|top-down|top-left-cut2\n"
+            << "  --output-dir DIR\n"
+            << "  --save-plane-files\n"
+            << "  --quiet\n";
         std::exit(args.empty() ? 1 : 0);
     }
 
-    for (const auto& arg : args) {
-        if (!arg.empty() && arg.front() != '-' && cfg.input.empty()) cfg.input = arg;
+    apply_profile(cfg, cfg.profile);
+    for (std::size_t i = 0; i < args.size(); ++i) {
+        const std::string& arg = args[i];
+        if (arg == "--profile") {
+            if (i + 1 >= args.size()) throw std::runtime_error("Missing value after --profile.");
+            apply_profile(cfg, args[++i]);
+        } else if (arg == "--output-dir") {
+            if (i + 1 >= args.size()) throw std::runtime_error("Missing value after --output-dir.");
+            cfg.output_dir = args[++i];
+        } else if (arg == "--save-plane-files") {
+            cfg.save_plane_files = true;
+        } else if (arg == "--quiet") {
+            cfg.verbose = false;
+        } else if (!arg.empty() && arg.front() == '-') {
+            throw std::runtime_error("Unknown option: " + arg + ". Use --profile instead of tuning internal thresholds.");
+        } else if (cfg.input.empty()) {
+            cfg.input = arg;
+        } else {
+            throw std::runtime_error("Unexpected positional argument: " + arg);
+        }
     }
     if (cfg.input.empty()) throw std::runtime_error("Missing input PLY path.");
-
-    if (auto v = value_after(args, "--output-dir")) cfg.output_dir = *v;
-    if (auto v = value_after(args, "--input-scale")) cfg.input_scale = std::stof(*v);
-    if (auto v = value_after(args, "--surfel-size")) cfg.surfel_size = std::stof(*v);
-    if (auto v = value_after(args, "--normal-k")) cfg.normal_k = std::stoi(*v);
-    if (auto v = value_after(args, "--smooth-angle-deg")) cfg.smooth_angle_deg = std::stof(*v);
-    if (auto v = value_after(args, "--edge-angle-deg")) cfg.edge_angle_deg = std::stof(*v);
-    if (auto v = value_after(args, "--coplanar-distance")) cfg.coplanar_distance = std::stof(*v);
-    if (auto v = value_after(args, "--merge-angle-deg")) cfg.merge_angle_deg = std::stof(*v);
-    if (auto v = value_after(args, "--merge-distance")) cfg.merge_distance = std::stof(*v);
-    if (auto v = value_after(args, "--merge-gap")) cfg.merge_gap = std::stof(*v);
-    if (auto v = value_after(args, "--assign-distance")) cfg.assign_distance = std::stof(*v);
-    if (auto v = value_after(args, "--assign-margin")) cfg.assign_margin = std::stof(*v);
-    if (auto v = value_after(args, "--grow-refine-iterations")) cfg.grow_refine_iterations = std::stoi(*v);
-    cfg.local_support_only = has_flag(args, "--local-support-only");
-    if (auto v = value_after(args, "--support-halo")) cfg.support_halo = std::stoi(*v);
-    if (auto v = value_after(args, "--support-bin-size")) cfg.support_bin_size = std::stof(*v);
-    if (auto v = value_after(args, "--min-surfels")) cfg.min_surfels = std::stoi(*v);
-    if (auto v = value_after(args, "--min-output-points")) cfg.min_output_points = std::stoi(*v);
-    if (auto v = value_after(args, "--min-extent")) cfg.min_extent = std::stof(*v);
-    if (auto v = value_after(args, "--min-aspect-ratio")) cfg.min_aspect_ratio = std::stof(*v);
-    if (auto v = value_after(args, "--max-planes")) cfg.max_planes = std::stoi(*v);
-    if (auto v = value_after(args, "--normal-parallel-cos")) cfg.normal_parallel_cos = std::stof(*v);
-    if (auto v = value_after(args, "--corner-support-radius-scale")) cfg.corner_support_radius_scale = std::stof(*v);
-    if (auto v = value_after(args, "--intersection-merge-scale")) cfg.intersection_merge_scale = std::stof(*v);
-    if (auto v = value_after(args, "--min-corner-support")) cfg.min_corner_support = std::stoi(*v);
-    if (auto v = value_after(args, "--min-plane-local-support")) cfg.min_plane_local_support = std::stoi(*v);
-    if (auto v = value_after(args, "--min-corner-planes")) cfg.min_corner_planes = std::stoi(*v);
-    if (auto v = value_after(args, "--corner-edge-radius-scale")) cfg.corner_edge_radius_scale = std::stof(*v);
-    if (auto v = value_after(args, "--corner-edge-sample-limit")) cfg.corner_edge_sample_limit = std::stoi(*v);
-    if (auto v = value_after(args, "--max-corner-edge-score")) cfg.max_corner_edge_score = std::stof(*v);
-    if (auto v = value_after(args, "--max-corner-edge-growth-ratio")) cfg.max_corner_edge_growth_ratio = std::stof(*v);
-    cfg.save_plane_files = has_flag(args, "--save-plane-files");
-    cfg.verbose = !has_flag(args, "--quiet");
     return cfg;
 }
 

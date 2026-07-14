@@ -17,7 +17,7 @@ if (-not (Test-Path $exe)) {
 $args = @(
     $InputPly,
     "--output-dir", $OutputDir,
-    "--input-scale", "1"
+    "--profile", "top-down"
 )
 
 & $exe @args

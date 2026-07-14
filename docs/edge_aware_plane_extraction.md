@@ -23,6 +23,28 @@ This implementation targets clean model-exported PLY point clouds. The current d
 9. Assign original dense points to the nearest accepted plane. This is a final recovery step, not the main segmentation mechanism.
 10. Generate diagnostic edge/corner candidates, then extract stricter corner points from three-plane intersections validated by real point support and per-plane local support.
 
+## Public Parameters
+
+The executable intentionally exposes only a small public interface:
+
+```powershell
+edge_aware_plane_extract input.ply --profile model-mm --output-dir results
+```
+
+Use one of these profiles:
+
+```text
+model-mm       model-exported PLY already in millimeters
+model-m        model-exported PLY in meters; coordinates are scaled by 1000
+top-down       tuned profile for data02/data02/top_down.ply
+top-left-cut2  tuned profile for data01/data01/top_left_cut2.ply
+```
+
+The plane-growth thresholds, merge thresholds, dense assignment distance, and
+corner support thresholds are internal preset values. They are not command-line
+knobs because the intended workflow is to choose the correct profile, not tune
+twenty coupled parameters by hand.
+
 ## Recommended Command
 
 Use the script:
@@ -37,15 +59,11 @@ For `top_down.ply`, use:
 .\scripts\run_top_down_seed_grow.ps1
 ```
 
-`top_down.ply` is already in millimeters, so the script uses `--input-scale 1`.
-The shared seed-grown extraction parameters are now the executable defaults, so
-the recommended scripts only set dataset-specific values. The default
-`--assign-margin 2.0` prevents upper sloped patches from mathematically
+The `top_down` script selects `--profile top-down`; the profile uses the smaller
+assignment margin needed to prevent upper sloped patches from mathematically
 extending into the lower `z ~= -15` plane during dense point assignment.
-`top_left_cut2.ply` still overrides `--assign-margin 12.0` because that dataset
-benefits from the wider dense-point recovery margin. `--local-support-only` was
-tested but is not enabled by default because it removed more points without
-improving the remaining true lower-slope intersections.
+`top_left_cut2.ply` uses `--profile top-left-cut2`, which applies meter-to-mm
+scaling and the wider dense-point recovery margin needed for that dataset.
 
 Current best diagnostic output:
 
