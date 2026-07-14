@@ -31,6 +31,20 @@ Use the script:
 .\scripts\run_top_left_cut2_seed_grow.ps1
 ```
 
+For `top_down.ply`, use:
+
+```powershell
+.\scripts\run_top_down_seed_grow.ps1
+```
+
+`top_down.ply` is already in millimeters, so the script uses `--input-scale 1`.
+It also uses `--assign-margin 2.0` instead of the wider 12 mm margin used for
+`top_left_cut2.ply`. The smaller margin prevents upper sloped patches from
+mathematically extending into the lower `z ~= -15` plane during dense point
+assignment. `--local-support-only` was tested but is not enabled by default
+because it removed more points without improving the remaining true lower-slope
+intersections.
+
 Current best diagnostic output:
 
 ```text

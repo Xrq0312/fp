@@ -12,6 +12,7 @@
 
 # Generated result folders
 /results/
+/results_*/
 /results_edge_aware*/
 /results_seed_grow*/
 /phase_unwrap_task/results*/
