@@ -52,6 +52,7 @@ struct Config {
     float merge_gap = 8.0f;
     float assign_distance = 2.0f;
     float assign_margin = 2.0f;
+    bool auto_assign_margin = true;
     int grow_refine_iterations = 2;
     bool local_support_only = false;
     int support_halo = 1;
@@ -143,17 +144,14 @@ static void apply_profile(Config& cfg, const std::string& profile) {
     cfg.profile = profile;
     if (profile == "model-mm" || profile == "top-down") {
         cfg.input_scale = 1.0f;
-        cfg.assign_margin = 2.0f;
         return;
     }
     if (profile == "model-m") {
         cfg.input_scale = 1000.0f;
-        cfg.assign_margin = 12.0f;
         return;
     }
     if (profile == "top-left-cut2") {
         cfg.input_scale = 1000.0f;
-        cfg.assign_margin = 12.0f;
         cfg.save_plane_files = true;
         return;
     }
@@ -605,6 +603,76 @@ struct PatchSupport {
         return bins.find(key_for(q)) != bins.end();
     }
 };
+
+static std::vector<PatchSupport> build_patch_supports(
+    const std::vector<PlanePatch>& patches,
+    const std::vector<Surfel>& surfels,
+    const Config& cfg);
+
+struct AssignMarginEstimate {
+    float margin = 2.0f;
+    std::size_t sampled = 0;
+    std::size_t tight_assigned = 0;
+    std::size_t loose_assigned = 0;
+    double estimated_rescued_points = 0.0;
+};
+
+static bool point_assignable_with_margin(
+    const Eigen::Vector3f& q,
+    const std::vector<PlanePatch>& patches,
+    const std::vector<PatchSupport>& support,
+    const Config& cfg,
+    float margin) {
+    for (std::size_t i = 0; i < patches.size(); ++i) {
+        if (cfg.local_support_only && !support[i].contains(q)) continue;
+        const float distance = std::abs(patches[i].normal.dot(q) + patches[i].d);
+        if (distance > cfg.assign_distance) continue;
+        if (!point_inside_patch_envelope(patches[i], q, margin)) continue;
+        return true;
+    }
+    return false;
+}
+
+static AssignMarginEstimate estimate_assign_margin(
+    const CloudPtr& cloud,
+    const std::vector<Surfel>& surfels,
+    const std::vector<PlanePatch>& patches,
+    const Config& cfg) {
+    AssignMarginEstimate estimate;
+    const float tight_margin = std::max(4.0f * cfg.surfel_size, 2.0f);
+    const float loose_margin = std::max(24.0f * cfg.surfel_size, tight_margin);
+    estimate.margin = tight_margin;
+    if (!cfg.auto_assign_margin || cloud->empty() || patches.empty()) return estimate;
+
+    const std::vector<PatchSupport> support = cfg.local_support_only ? build_patch_supports(patches, surfels, cfg) : std::vector<PatchSupport>{};
+    const std::size_t sample_limit = 200000;
+    const std::size_t stride = std::max<std::size_t>(1, cloud->size() / sample_limit);
+
+    for (std::size_t i = 0; i < cloud->size(); i += stride) {
+        const PointT& p = cloud->points[i];
+        const Eigen::Vector3f q(p.x, p.y, p.z);
+        ++estimate.sampled;
+        const bool tight = point_assignable_with_margin(q, patches, support, cfg, tight_margin);
+        if (tight) {
+            ++estimate.tight_assigned;
+            ++estimate.loose_assigned;
+            continue;
+        }
+        if (point_assignable_with_margin(q, patches, support, cfg, loose_margin)) {
+            ++estimate.loose_assigned;
+        }
+    }
+
+    const std::size_t rescued = estimate.loose_assigned - estimate.tight_assigned;
+    if (estimate.sampled == 0 || rescued == 0) return estimate;
+
+    const double rescued_rate = static_cast<double>(rescued) / static_cast<double>(estimate.sampled);
+    estimate.estimated_rescued_points = rescued_rate * static_cast<double>(cloud->size());
+    if (rescued_rate >= 0.003 || estimate.estimated_rescued_points >= 20000.0) {
+        estimate.margin = loose_margin;
+    }
+    return estimate;
+}
 
 static std::vector<PatchSupport> build_patch_supports(
     const std::vector<PlanePatch>& patches,
@@ -1098,7 +1166,7 @@ static void save_plane_files(const fs::path& out_dir, const std::vector<PlanePat
 
 int main(int argc, char** argv) {
     try {
-        const Config cfg = parse_args(argc, argv);
+        Config cfg = parse_args(argc, argv);
         CloudPtr cloud = load_cloud(cfg.input, cfg.input_scale);
         const Bounds bounds = compute_bounds(cloud);
 
@@ -1109,6 +1177,8 @@ int main(int argc, char** argv) {
         mark_edge_surfels(surfels, index_by_key, cfg);
         std::vector<PlanePatch> patches = extract_seed_grown_patches(surfels, index_by_key, cfg);
         merge_patches(patches, surfels, cfg);
+        const AssignMarginEstimate assign_margin_estimate = estimate_assign_margin(cloud, surfels, patches, cfg);
+        cfg.assign_margin = assign_margin_estimate.margin;
         assign_full_points(cloud, bounds, surfels, patches, cfg);
         const std::vector<CornerCandidate> corners = extract_corners_filtered(cloud, patches, bounds, cfg);
 
@@ -1128,6 +1198,14 @@ int main(int argc, char** argv) {
             for (const auto& patch : patches) output_points += patch.output->size();
             std::cout << "Input points: " << cloud->size() << "\n";
             std::cout << "Surfels: " << surfels.size() << "\n";
+            std::cout << "Assignment margin: " << cfg.assign_margin << "\n";
+            if (assign_margin_estimate.sampled > 0) {
+                std::cout << "Assignment margin sample: " << assign_margin_estimate.sampled
+                          << ", tight=" << assign_margin_estimate.tight_assigned
+                          << ", loose=" << assign_margin_estimate.loose_assigned
+                          << ", estimated rescued=" << static_cast<std::size_t>(assign_margin_estimate.estimated_rescued_points)
+                          << "\n";
+            }
             std::cout << "Plane patches: " << patches.size() << "\n";
             std::cout << "Output points: " << output_points << "\n";
             std::cout << "Extracted corners: " << corners.size() << "\n";

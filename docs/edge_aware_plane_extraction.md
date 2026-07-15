@@ -40,10 +40,11 @@ top-down       tuned profile for data02/data02/top_down.ply
 top-left-cut2  tuned profile for data01/data01/top_left_cut2.ply
 ```
 
-The plane-growth thresholds, merge thresholds, dense assignment distance, and
-corner support thresholds are internal preset values. They are not command-line
-knobs because the intended workflow is to choose the correct profile, not tune
-twenty coupled parameters by hand.
+The plane-growth thresholds, merge thresholds, dense assignment distance, corner
+support thresholds, and dense assignment margin are internal values. The
+assignment margin is inferred from the point cloud after plane growth: it starts
+with a tight 2 mm envelope and only widens when many dense points are close to a
+plane but fall just outside that plane's grown support envelope.
 
 ## Recommended Command
 
@@ -59,11 +60,10 @@ For `top_down.ply`, use:
 .\scripts\run_top_down_seed_grow.ps1
 ```
 
-The `top_down` script selects `--profile top-down`; the profile uses the smaller
-assignment margin needed to prevent upper sloped patches from mathematically
-extending into the lower `z ~= -15` plane during dense point assignment.
-`top_left_cut2.ply` uses `--profile top-left-cut2`, which applies meter-to-mm
-scaling and the wider dense-point recovery margin needed for that dataset.
+The `top_down` script selects `--profile top-down`; this keeps millimeter-scale
+input. `top_left_cut2.ply` uses `--profile top-left-cut2`, which applies
+meter-to-mm scaling and saves per-plane diagnostic files. Both profiles use the
+same automatic assignment-margin inference.
 
 Current best diagnostic output:
 
