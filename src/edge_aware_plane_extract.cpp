@@ -943,15 +943,12 @@ static ColorCloudPtr make_corner_cloud(const std::vector<CornerCandidate>& corne
     return out;
 }
 
-static void save_color_ply_allow_empty(const fs::path& path, const ColorCloudT& cloud) {
-    if (!cloud.empty()) {
-        pcl::io::savePLYFileASCII(path.string(), cloud);
-        return;
-    }
+static void save_color_ply(const fs::path& path, const ColorCloudT& cloud) {
     std::ofstream out(path);
+    if (!out) throw std::runtime_error("Failed to write PLY: " + path.string());
     out << "ply\n"
         << "format ascii 1.0\n"
-        << "element vertex 0\n"
+        << "element vertex " << cloud.size() << "\n"
         << "property float x\n"
         << "property float y\n"
         << "property float z\n"
@@ -959,6 +956,31 @@ static void save_color_ply_allow_empty(const fs::path& path, const ColorCloudT& 
         << "property uchar green\n"
         << "property uchar blue\n"
         << "end_header\n";
+    out.setf(std::ios::fixed, std::ios::floatfield);
+    out.precision(6);
+    for (const auto& p : cloud.points) {
+        out << p.x << ' ' << p.y << ' ' << p.z << ' '
+            << static_cast<int>(p.r) << ' '
+            << static_cast<int>(p.g) << ' '
+            << static_cast<int>(p.b) << '\n';
+    }
+}
+
+static void save_xyz_ply(const fs::path& path, const CloudT& cloud) {
+    std::ofstream out(path);
+    if (!out) throw std::runtime_error("Failed to write PLY: " + path.string());
+    out << "ply\n"
+        << "format ascii 1.0\n"
+        << "element vertex " << cloud.size() << "\n"
+        << "property float x\n"
+        << "property float y\n"
+        << "property float z\n"
+        << "end_header\n";
+    out.setf(std::ios::fixed, std::ios::floatfield);
+    out.precision(6);
+    for (const auto& p : cloud.points) {
+        out << p.x << ' ' << p.y << ' ' << p.z << '\n';
+    }
 }
 
 static void save_plane_files(const fs::path& out_dir, const std::vector<PlanePatch>& patches) {
@@ -968,7 +990,7 @@ static void save_plane_files(const fs::path& out_dir, const std::vector<PlanePat
         std::ostringstream name;
         name << "plane_" << std::setw(3) << std::setfill('0') << i << "_"
              << patches[i].output->size() << "pts.ply";
-        pcl::io::savePLYFileASCII((plane_dir / name.str()).string(), *patches[i].output);
+        save_xyz_ply(plane_dir / name.str(), *patches[i].output);
     }
 }
 
@@ -1000,9 +1022,9 @@ int main(int argc, char** argv) {
         fs::remove(out_dir / "edge_aware_plane_report.csv", cleanup_error);
         cleanup_error.clear();
         fs::remove(out_dir / "corner_report.csv", cleanup_error);
-        pcl::io::savePLYFileASCII((out_dir / "edge_aware_plane_patches.ply").string(), *make_colored_patch_cloud(patches));
-        save_color_ply_allow_empty(out_dir / "feature_edges.ply", *make_feature_cloud(surfels, index_by_key, patches));
-        save_color_ply_allow_empty(out_dir / "extracted_corners.ply", *make_corner_cloud(corners));
+        save_color_ply(out_dir / "edge_aware_plane_patches.ply", *make_colored_patch_cloud(patches));
+        save_color_ply(out_dir / "feature_edges.ply", *make_feature_cloud(surfels, index_by_key, patches));
+        save_color_ply(out_dir / "extracted_corners.ply", *make_corner_cloud(corners));
         if (cfg.save_plane_files) save_plane_files(out_dir, patches);
 
         if (cfg.verbose) {
