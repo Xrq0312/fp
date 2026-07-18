@@ -13,7 +13,6 @@
 #include <sstream>
 #include <string>
 #include <unordered_map>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -52,11 +51,7 @@ struct Config {
     float merge_gap = 8.0f;
     float assign_distance = 2.0f;
     float assign_margin = 2.0f;
-    bool auto_assign_margin = true;
     int grow_refine_iterations = 2;
-    bool local_support_only = false;
-    int support_halo = 1;
-    float support_bin_size = 0.0f;
     int min_surfels = 20;
     int min_output_points = 5000;
     float min_extent = 3.0f;
@@ -567,48 +562,6 @@ static bool point_inside_patch_envelope(const PlanePatch& patch, const Eigen::Ve
            v >= patch.min_v - margin && v <= patch.max_v + margin;
 }
 
-struct BinKey {
-    int u = 0;
-    int v = 0;
-
-    bool operator==(const BinKey& other) const {
-        return u == other.u && v == other.v;
-    }
-};
-
-struct BinKeyHash {
-    std::size_t operator()(const BinKey& key) const {
-        std::size_t h = static_cast<std::size_t>(key.u) * 73856093u;
-        h ^= static_cast<std::size_t>(key.v) * 19349663u;
-        return h;
-    }
-};
-
-struct PatchSupport {
-    Eigen::Vector3f origin{0.0f, 0.0f, 0.0f};
-    Eigen::Vector3f axis_u{1.0f, 0.0f, 0.0f};
-    Eigen::Vector3f axis_v{0.0f, 1.0f, 0.0f};
-    float bin_size = 1.0f;
-    std::unordered_set<BinKey, BinKeyHash> bins;
-
-    BinKey key_for(const Eigen::Vector3f& q) const {
-        const Eigen::Vector3f centered = q - origin;
-        return {
-            static_cast<int>(std::floor(centered.dot(axis_u) / bin_size)),
-            static_cast<int>(std::floor(centered.dot(axis_v) / bin_size))
-        };
-    }
-
-    bool contains(const Eigen::Vector3f& q) const {
-        return bins.find(key_for(q)) != bins.end();
-    }
-};
-
-static std::vector<PatchSupport> build_patch_supports(
-    const std::vector<PlanePatch>& patches,
-    const std::vector<Surfel>& surfels,
-    const Config& cfg);
-
 struct AssignMarginEstimate {
     float margin = 2.0f;
     std::size_t sampled = 0;
@@ -620,14 +573,12 @@ struct AssignMarginEstimate {
 static bool point_assignable_with_margin(
     const Eigen::Vector3f& q,
     const std::vector<PlanePatch>& patches,
-    const std::vector<PatchSupport>& support,
     const Config& cfg,
     float margin) {
-    for (std::size_t i = 0; i < patches.size(); ++i) {
-        if (cfg.local_support_only && !support[i].contains(q)) continue;
-        const float distance = std::abs(patches[i].normal.dot(q) + patches[i].d);
+    for (const auto& patch : patches) {
+        const float distance = std::abs(patch.normal.dot(q) + patch.d);
         if (distance > cfg.assign_distance) continue;
-        if (!point_inside_patch_envelope(patches[i], q, margin)) continue;
+        if (!point_inside_patch_envelope(patch, q, margin)) continue;
         return true;
     }
     return false;
@@ -635,16 +586,14 @@ static bool point_assignable_with_margin(
 
 static AssignMarginEstimate estimate_assign_margin(
     const CloudPtr& cloud,
-    const std::vector<Surfel>& surfels,
     const std::vector<PlanePatch>& patches,
     const Config& cfg) {
     AssignMarginEstimate estimate;
     const float tight_margin = std::max(4.0f * cfg.surfel_size, 2.0f);
     const float loose_margin = std::max(24.0f * cfg.surfel_size, tight_margin);
     estimate.margin = tight_margin;
-    if (!cfg.auto_assign_margin || cloud->empty() || patches.empty()) return estimate;
+    if (cloud->empty() || patches.empty()) return estimate;
 
-    const std::vector<PatchSupport> support = cfg.local_support_only ? build_patch_supports(patches, surfels, cfg) : std::vector<PatchSupport>{};
     const std::size_t sample_limit = 200000;
     const std::size_t stride = std::max<std::size_t>(1, cloud->size() / sample_limit);
 
@@ -652,13 +601,13 @@ static AssignMarginEstimate estimate_assign_margin(
         const PointT& p = cloud->points[i];
         const Eigen::Vector3f q(p.x, p.y, p.z);
         ++estimate.sampled;
-        const bool tight = point_assignable_with_margin(q, patches, support, cfg, tight_margin);
+        const bool tight = point_assignable_with_margin(q, patches, cfg, tight_margin);
         if (tight) {
             ++estimate.tight_assigned;
             ++estimate.loose_assigned;
             continue;
         }
-        if (point_assignable_with_margin(q, patches, support, cfg, loose_margin)) {
+        if (point_assignable_with_margin(q, patches, cfg, loose_margin)) {
             ++estimate.loose_assigned;
         }
     }
@@ -674,41 +623,12 @@ static AssignMarginEstimate estimate_assign_margin(
     return estimate;
 }
 
-static std::vector<PatchSupport> build_patch_supports(
-    const std::vector<PlanePatch>& patches,
-    const std::vector<Surfel>& surfels,
-    const Config& cfg) {
-    std::vector<PatchSupport> support(patches.size());
-    const int halo = std::max(cfg.support_halo, 0);
-    const int kernel = 2 * halo + 1;
-    const std::size_t reserve_factor = static_cast<std::size_t>(kernel * kernel);
-    const float bin_size = cfg.support_bin_size > 0.0f ? cfg.support_bin_size : cfg.surfel_size;
-    for (std::size_t patch_id = 0; patch_id < patches.size(); ++patch_id) {
-        PatchSupport& patch_support = support[patch_id];
-        patch_support.origin = patches[patch_id].centroid;
-        patch_support.bin_size = std::max(bin_size, 1e-4f);
-        plane_basis(patches[patch_id], patch_support.axis_u, patch_support.axis_v);
-        patch_support.bins.reserve(patches[patch_id].surfels.size() * reserve_factor);
-        for (const int surfel_id : patches[patch_id].surfels) {
-            const BinKey base = patch_support.key_for(surfels[static_cast<std::size_t>(surfel_id)].centroid);
-            for (int du = -halo; du <= halo; ++du) {
-                for (int dv = -halo; dv <= halo; ++dv) {
-                    patch_support.bins.insert({base.u + du, base.v + dv});
-                }
-            }
-        }
-    }
-    return support;
-}
-
 static void assign_full_points(
     const CloudPtr& cloud,
     const Bounds& bounds,
-    const std::vector<Surfel>& surfels,
     std::vector<PlanePatch>& patches,
     const Config& cfg) {
     for (auto& patch : patches) patch.output.reset(new CloudT);
-    const std::vector<PatchSupport> support = cfg.local_support_only ? build_patch_supports(patches, surfels, cfg) : std::vector<PatchSupport>{};
 
     for (const auto& p : cloud->points) {
         const Eigen::Vector3f q(p.x, p.y, p.z);
@@ -716,7 +636,6 @@ static void assign_full_points(
         int best = -1;
         float best_distance = std::numeric_limits<float>::max();
         for (std::size_t i = 0; i < patches.size(); ++i) {
-            if (cfg.local_support_only && !support[i].contains(q)) continue;
             const float distance = std::abs(patches[i].normal.dot(q) + patches[i].d);
             if (distance > cfg.assign_distance || distance >= best_distance) continue;
             if (!point_inside_patch_envelope(patches[i], q, cfg.assign_margin)) continue;
@@ -1177,9 +1096,9 @@ int main(int argc, char** argv) {
         mark_edge_surfels(surfels, index_by_key, cfg);
         std::vector<PlanePatch> patches = extract_seed_grown_patches(surfels, index_by_key, cfg);
         merge_patches(patches, surfels, cfg);
-        const AssignMarginEstimate assign_margin_estimate = estimate_assign_margin(cloud, surfels, patches, cfg);
+        const AssignMarginEstimate assign_margin_estimate = estimate_assign_margin(cloud, patches, cfg);
         cfg.assign_margin = assign_margin_estimate.margin;
-        assign_full_points(cloud, bounds, surfels, patches, cfg);
+        assign_full_points(cloud, bounds, patches, cfg);
         const std::vector<CornerCandidate> corners = extract_corners_filtered(cloud, patches, bounds, cfg);
 
         fs::path out_dir = cfg.output_dir / cfg.input.stem();
