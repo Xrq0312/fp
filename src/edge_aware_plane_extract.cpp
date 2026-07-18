@@ -30,9 +30,6 @@ namespace fs = std::filesystem;
 using PointT = pcl::PointXYZ;
 using CloudT = pcl::PointCloud<PointT>;
 using CloudPtr = CloudT::Ptr;
-using ColorPointT = pcl::PointXYZRGB;
-using ColorCloudT = pcl::PointCloud<ColorPointT>;
-using ColorCloudPtr = ColorCloudT::Ptr;
 
 struct Config {
     fs::path input;
@@ -54,12 +51,10 @@ struct Config {
     float min_extent = 3.0f;
     float min_aspect_ratio = 0.02f;
     int max_planes = 160;
-    float normal_parallel_cos = 0.975f;
     float corner_support_radius_scale = 7.0f;
     float intersection_merge_scale = 4.5f;
     int min_corner_support = 8;
     int min_plane_local_support = 3;
-    int min_corner_planes = 3;
     bool verbose = true;
 };
 
@@ -91,7 +86,6 @@ struct Surfel {
     CellKey key;
     Eigen::Vector3f centroid{0.0f, 0.0f, 0.0f};
     Eigen::Vector3f normal{0.0f, 0.0f, 1.0f};
-    float d = 0.0f;
     float curvature = 0.0f;
     int count = 0;
     bool edge_like = false;
@@ -113,7 +107,6 @@ struct PlanePatch {
 
 struct CornerCandidate {
     Eigen::Vector3f position{0.0f, 0.0f, 0.0f};
-    std::vector<int> plane_ids;
     int support = 0;
 };
 
@@ -255,7 +248,6 @@ static void estimate_surfel_normals(std::vector<Surfel>& surfels, const CloudPtr
         if (!std::isfinite(normal.x()) || normal.squaredNorm() < 1e-8f) normal = Eigen::Vector3f::UnitZ();
         normal.normalize();
         surfels[i].normal = normal;
-        surfels[i].d = -normal.dot(surfels[i].centroid);
         surfels[i].curvature = std::isfinite(n.curvature) ? n.curvature : 1.0f;
     }
 }
@@ -629,64 +621,6 @@ static std::array<std::uint8_t, 3> color_for(std::size_t id) {
     };
 }
 
-static ColorCloudPtr make_colored_patch_cloud(const std::vector<PlanePatch>& patches) {
-    ColorCloudPtr out(new ColorCloudT);
-    for (std::size_t i = 0; i < patches.size(); ++i) {
-        const auto color = color_for(i);
-        for (const auto& src : patches[i].output->points) {
-            ColorPointT p;
-            p.x = src.x;
-            p.y = src.y;
-            p.z = src.z;
-            p.r = color[0];
-            p.g = color[1];
-            p.b = color[2];
-            out->push_back(p);
-        }
-    }
-    out->width = static_cast<std::uint32_t>(out->size());
-    out->height = 1;
-    out->is_dense = true;
-    return out;
-}
-
-static ColorCloudPtr make_feature_cloud(
-    const std::vector<Surfel>& surfels,
-    const std::unordered_map<CellKey, int, CellKeyHash>& index_by_key,
-    const std::vector<PlanePatch>& patches) {
-    std::vector<int> labels(surfels.size(), -1);
-    for (std::size_t patch_id = 0; patch_id < patches.size(); ++patch_id) {
-        for (int surfel_id : patches[patch_id].surfels) {
-            if (surfel_id >= 0 && static_cast<std::size_t>(surfel_id) < labels.size()) {
-                labels[static_cast<std::size_t>(surfel_id)] = static_cast<int>(patch_id);
-            }
-        }
-    }
-
-    ColorCloudPtr out(new ColorCloudT);
-    for (std::size_t i = 0; i < surfels.size(); ++i) {
-        if (labels[i] < 0) continue;
-        std::set<int> neighbor_labels{labels[i]};
-        for (int neighbor : surfel_neighbors(static_cast<int>(i), surfels, index_by_key)) {
-            const int label = labels[static_cast<std::size_t>(neighbor)];
-            if (label >= 0) neighbor_labels.insert(label);
-        }
-        if (neighbor_labels.size() < 2) continue;
-        ColorPointT p;
-        p.x = surfels[i].centroid.x();
-        p.y = surfels[i].centroid.y();
-        p.z = surfels[i].centroid.z();
-        p.r = 255;
-        p.g = 160;
-        p.b = 20;
-        out->push_back(p);
-    }
-    out->width = static_cast<std::uint32_t>(out->size());
-    out->height = 1;
-    out->is_dense = true;
-    return out;
-}
-
 static int nearby_support_count_on_patch(const PlanePatch& patch, const Eigen::Vector3f& p, float radius) {
     const float radius_sq = radius * radius;
     int count = 0;
@@ -724,9 +658,6 @@ static std::vector<CornerCandidate> merge_corner_candidates(std::vector<CornerCa
             if ((group.position - candidate.position).squaredNorm() <= merge_sq) {
                 if (candidate.support > group.support) group.position = candidate.position;
                 group.support = std::max(group.support, candidate.support);
-                group.plane_ids.insert(group.plane_ids.end(), candidate.plane_ids.begin(), candidate.plane_ids.end());
-                std::sort(group.plane_ids.begin(), group.plane_ids.end());
-                group.plane_ids.erase(std::unique(group.plane_ids.begin(), group.plane_ids.end()), group.plane_ids.end());
                 absorbed = true;
                 break;
             }
@@ -762,13 +693,14 @@ static std::vector<CornerCandidate> extract_corners_filtered(
     const float bbox_margin = std::max(3.0f * cfg.surfel_size, cfg.assign_distance);
     const float envelope_margin = std::max(cfg.assign_margin, cfg.surfel_size * 2.0f);
     const float plane_distance_threshold = std::max(2.0f * cfg.surfel_size, cfg.assign_distance);
+    const float parallel_cos = 0.975f;
 
     for (std::size_t i = 0; i < patches.size(); ++i) {
         for (std::size_t j = i + 1; j < patches.size(); ++j) {
-            if (std::abs(patches[i].normal.dot(patches[j].normal)) > cfg.normal_parallel_cos) continue;
+            if (std::abs(patches[i].normal.dot(patches[j].normal)) > parallel_cos) continue;
             for (std::size_t k = j + 1; k < patches.size(); ++k) {
-                if (std::abs(patches[i].normal.dot(patches[k].normal)) > cfg.normal_parallel_cos) continue;
-                if (std::abs(patches[j].normal.dot(patches[k].normal)) > cfg.normal_parallel_cos) continue;
+                if (std::abs(patches[i].normal.dot(patches[k].normal)) > parallel_cos) continue;
+                if (std::abs(patches[j].normal.dot(patches[k].normal)) > parallel_cos) continue;
 
                 Eigen::Vector3f p;
                 if (!intersection_of_three_planes(patches[i], patches[j], patches[k], p)) continue;
@@ -785,45 +717,18 @@ static std::vector<CornerCandidate> extract_corners_filtered(
                 if (nearby_support_count_on_patch(patches[i], p, support_radius) < cfg.min_plane_local_support) continue;
                 if (nearby_support_count_on_patch(patches[j], p, support_radius) < cfg.min_plane_local_support) continue;
                 if (nearby_support_count_on_patch(patches[k], p, support_radius) < cfg.min_plane_local_support) continue;
-                candidates.push_back({p, {static_cast<int>(i), static_cast<int>(j), static_cast<int>(k)}, support});
+                candidates.push_back({p, support});
             }
         }
     }
 
-    auto merged = merge_corner_candidates(std::move(candidates), merge_radius);
-    const std::size_t min_planes = static_cast<std::size_t>(std::max(cfg.min_corner_planes, 1));
-    merged.erase(
-        std::remove_if(merged.begin(), merged.end(), [&](const CornerCandidate& candidate) {
-            return candidate.plane_ids.size() < min_planes;
-        }),
-        merged.end());
-    return merged;
+    return merge_corner_candidates(std::move(candidates), merge_radius);
 }
 
-static ColorCloudPtr make_corner_cloud(const std::vector<CornerCandidate>& corners) {
-    ColorCloudPtr out(new ColorCloudT);
-    for (const auto& corner : corners) {
-        ColorPointT p;
-        p.x = corner.position.x();
-        p.y = corner.position.y();
-        p.z = corner.position.z();
-        p.r = 255;
-        p.g = 255;
-        p.b = 255;
-        out->push_back(p);
-    }
-    out->width = static_cast<std::uint32_t>(out->size());
-    out->height = 1;
-    out->is_dense = true;
-    return out;
-}
-
-static void save_color_ply(const fs::path& path, const ColorCloudT& cloud) {
-    std::ofstream out(path);
-    if (!out) throw std::runtime_error("Failed to write PLY: " + path.string());
+static void write_color_ply_header(std::ofstream& out, std::size_t vertex_count) {
     out << "ply\n"
         << "format ascii 1.0\n"
-        << "element vertex " << cloud.size() << "\n"
+        << "element vertex " << vertex_count << "\n"
         << "property float x\n"
         << "property float y\n"
         << "property float z\n"
@@ -833,11 +738,72 @@ static void save_color_ply(const fs::path& path, const ColorCloudT& cloud) {
         << "end_header\n";
     out.setf(std::ios::fixed, std::ios::floatfield);
     out.precision(6);
-    for (const auto& p : cloud.points) {
-        out << p.x << ' ' << p.y << ' ' << p.z << ' '
-            << static_cast<int>(p.r) << ' '
-            << static_cast<int>(p.g) << ' '
-            << static_cast<int>(p.b) << '\n';
+}
+
+static void save_plane_patches(const fs::path& path, const std::vector<PlanePatch>& patches) {
+    std::ofstream out(path);
+    if (!out) throw std::runtime_error("Failed to write PLY: " + path.string());
+    std::size_t vertex_count = 0;
+    for (const auto& patch : patches) vertex_count += patch.output->size();
+    write_color_ply_header(out, vertex_count);
+    for (std::size_t i = 0; i < patches.size(); ++i) {
+        const auto color = color_for(i);
+        for (const auto& p : patches[i].output->points) {
+            out << p.x << ' ' << p.y << ' ' << p.z << ' '
+                << static_cast<int>(color[0]) << ' '
+                << static_cast<int>(color[1]) << ' '
+                << static_cast<int>(color[2]) << '\n';
+        }
+    }
+}
+
+static void save_feature_edges(
+    const fs::path& path,
+    const std::vector<Surfel>& surfels,
+    const std::unordered_map<CellKey, int, CellKeyHash>& index_by_key,
+    const std::vector<PlanePatch>& patches) {
+    std::vector<int> labels(surfels.size(), -1);
+    for (std::size_t patch_id = 0; patch_id < patches.size(); ++patch_id) {
+        for (int surfel_id : patches[patch_id].surfels) {
+            if (surfel_id >= 0 && static_cast<std::size_t>(surfel_id) < labels.size()) {
+                labels[static_cast<std::size_t>(surfel_id)] = static_cast<int>(patch_id);
+            }
+        }
+    }
+
+    const auto is_feature_edge = [&](std::size_t i) {
+        if (labels[i] < 0) return false;
+        for (int neighbor : surfel_neighbors(static_cast<int>(i), surfels, index_by_key)) {
+            const int label = labels[static_cast<std::size_t>(neighbor)];
+            if (label >= 0 && label != labels[i]) return true;
+        }
+        return false;
+    };
+
+    std::size_t vertex_count = 0;
+    for (std::size_t i = 0; i < surfels.size(); ++i) {
+        if (is_feature_edge(i)) ++vertex_count;
+    }
+
+    std::ofstream out(path);
+    if (!out) throw std::runtime_error("Failed to write PLY: " + path.string());
+    write_color_ply_header(out, vertex_count);
+    for (std::size_t i = 0; i < surfels.size(); ++i) {
+        if (!is_feature_edge(i)) continue;
+        out << surfels[i].centroid.x() << ' '
+            << surfels[i].centroid.y() << ' '
+            << surfels[i].centroid.z() << " 255 160 20\n";
+    }
+}
+
+static void save_corners(const fs::path& path, const std::vector<CornerCandidate>& corners) {
+    std::ofstream out(path);
+    if (!out) throw std::runtime_error("Failed to write PLY: " + path.string());
+    write_color_ply_header(out, corners.size());
+    for (const auto& corner : corners) {
+        out << corner.position.x() << ' '
+            << corner.position.y() << ' '
+            << corner.position.z() << " 255 255 255\n";
     }
 }
 
@@ -865,9 +831,9 @@ int main(int argc, char** argv) {
         fs::remove(out_dir / "edge_surfels.ply", cleanup_error);
         cleanup_error.clear();
         fs::remove(out_dir / "feature_corners.ply", cleanup_error);
-        save_color_ply(out_dir / "edge_aware_plane_patches.ply", *make_colored_patch_cloud(patches));
-        save_color_ply(out_dir / "feature_edges.ply", *make_feature_cloud(surfels, index_by_key, patches));
-        save_color_ply(out_dir / "extracted_corners.ply", *make_corner_cloud(corners));
+        save_plane_patches(out_dir / "edge_aware_plane_patches.ply", patches);
+        save_feature_edges(out_dir / "feature_edges.ply", surfels, index_by_key, patches);
+        save_corners(out_dir / "extracted_corners.ply", corners);
 
         if (cfg.verbose) {
             std::size_t output_points = 0;
