@@ -961,48 +961,6 @@ static void save_color_ply_allow_empty(const fs::path& path, const ColorCloudT& 
         << "end_header\n";
 }
 
-static void save_report(const fs::path& path, const std::vector<PlanePatch>& patches) {
-    std::ofstream out(path);
-    out << "id,surfels,output_points,nx,ny,nz,d,cx,cy,cz,extent_u,extent_v\n";
-    out.setf(std::ios::fixed, std::ios::floatfield);
-    out.precision(6);
-    for (std::size_t i = 0; i < patches.size(); ++i) {
-        const auto& p = patches[i];
-        out << i << ','
-            << p.surfels.size() << ','
-            << p.output->size() << ','
-            << p.normal.x() << ','
-            << p.normal.y() << ','
-            << p.normal.z() << ','
-            << p.d << ','
-            << p.centroid.x() << ','
-            << p.centroid.y() << ','
-            << p.centroid.z() << ','
-            << p.extent_u << ','
-            << p.extent_v << '\n';
-    }
-}
-
-static void save_corner_report(const fs::path& path, const std::vector<CornerCandidate>& corners) {
-    std::ofstream out(path);
-    out << "id,x,y,z,support,plane_count,plane_ids\n";
-    out.setf(std::ios::fixed, std::ios::floatfield);
-    out.precision(6);
-    for (std::size_t i = 0; i < corners.size(); ++i) {
-        out << i << ','
-            << corners[i].position.x() << ','
-            << corners[i].position.y() << ','
-            << corners[i].position.z() << ','
-            << corners[i].support << ','
-            << corners[i].plane_ids.size() << ',';
-        for (std::size_t j = 0; j < corners[i].plane_ids.size(); ++j) {
-            if (j > 0) out << '|';
-            out << corners[i].plane_ids[j];
-        }
-        out << '\n';
-    }
-}
-
 static void save_plane_files(const fs::path& out_dir, const std::vector<PlanePatch>& patches) {
     const fs::path plane_dir = out_dir / "planes";
     fs::create_directories(plane_dir);
@@ -1038,11 +996,13 @@ int main(int argc, char** argv) {
         fs::remove(out_dir / "edge_surfels.ply", cleanup_error);
         cleanup_error.clear();
         fs::remove(out_dir / "feature_corners.ply", cleanup_error);
+        cleanup_error.clear();
+        fs::remove(out_dir / "edge_aware_plane_report.csv", cleanup_error);
+        cleanup_error.clear();
+        fs::remove(out_dir / "corner_report.csv", cleanup_error);
         pcl::io::savePLYFileASCII((out_dir / "edge_aware_plane_patches.ply").string(), *make_colored_patch_cloud(patches));
         save_color_ply_allow_empty(out_dir / "feature_edges.ply", *make_feature_cloud(surfels, index_by_key, patches));
         save_color_ply_allow_empty(out_dir / "extracted_corners.ply", *make_corner_cloud(corners));
-        save_report(out_dir / "edge_aware_plane_report.csv", patches);
-        save_corner_report(out_dir / "corner_report.csv", corners);
         if (cfg.save_plane_files) save_plane_files(out_dir, patches);
 
         if (cfg.verbose) {

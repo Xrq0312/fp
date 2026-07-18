@@ -71,8 +71,6 @@ Current extraction output:
 results_seed_grow\top_left_cut2\edge_aware_plane_patches.ply
 results_seed_grow\top_left_cut2\feature_edges.ply
 results_seed_grow\top_left_cut2\extracted_corners.ply
-results_seed_grow\top_left_cut2\edge_aware_plane_report.csv
-results_seed_grow\top_left_cut2\corner_report.csv
 ```
 
 Use `--save-plane-files` for per-plane PLY diagnostics, or run the helper
