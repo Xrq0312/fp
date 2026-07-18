@@ -827,10 +827,6 @@ int main(int argc, char** argv) {
 
         fs::path out_dir = cfg.output_dir / cfg.input.stem();
         fs::create_directories(out_dir);
-        std::error_code cleanup_error;
-        fs::remove(out_dir / "edge_surfels.ply", cleanup_error);
-        cleanup_error.clear();
-        fs::remove(out_dir / "feature_corners.ply", cleanup_error);
         save_plane_patches(out_dir / "edge_aware_plane_patches.ply", patches);
         save_feature_edges(out_dir / "feature_edges.ply", surfels, index_by_key, patches);
         save_corners(out_dir / "extracted_corners.ply", corners);
