@@ -147,7 +147,6 @@ static void apply_profile(Config& cfg, const std::string& profile) {
     }
     if (profile == "top-left-cut2") {
         cfg.input_scale = 1000.0f;
-        cfg.save_plane_files = true;
         return;
     }
     throw std::runtime_error("Unknown profile: " + profile + ". Use model-mm, model-m, top-down, or top-left-cut2.");
@@ -693,25 +692,6 @@ static ColorCloudPtr make_colored_patch_cloud(const std::vector<PlanePatch>& pat
     return out;
 }
 
-static ColorCloudPtr make_edge_cloud(const std::vector<Surfel>& surfels) {
-    ColorCloudPtr out(new ColorCloudT);
-    for (const auto& surfel : surfels) {
-        if (!surfel.edge_like) continue;
-        ColorPointT p;
-        p.x = surfel.centroid.x();
-        p.y = surfel.centroid.y();
-        p.z = surfel.centroid.z();
-        p.r = 255;
-        p.g = 40;
-        p.b = 40;
-        out->push_back(p);
-    }
-    out->width = static_cast<std::uint32_t>(out->size());
-    out->height = 1;
-    out->is_dense = true;
-    return out;
-}
-
 static std::vector<int> build_surfel_labels(const std::vector<PlanePatch>& patches, std::size_t surfel_count) {
     std::vector<int> labels(surfel_count, -1);
     for (std::size_t i = 0; i < patches.size(); ++i) {
@@ -727,8 +707,7 @@ static std::vector<int> build_surfel_labels(const std::vector<PlanePatch>& patch
 static ColorCloudPtr make_feature_cloud(
     const std::vector<Surfel>& surfels,
     const std::unordered_map<CellKey, int, CellKeyHash>& index_by_key,
-    const std::vector<PlanePatch>& patches,
-    bool corners) {
+    const std::vector<PlanePatch>& patches) {
     const std::vector<int> labels = build_surfel_labels(patches, surfels.size());
     ColorCloudPtr out(new ColorCloudT);
     for (std::size_t i = 0; i < surfels.size(); ++i) {
@@ -738,63 +717,15 @@ static ColorCloudPtr make_feature_cloud(
             const int label = labels[static_cast<std::size_t>(neighbor)];
             if (label >= 0) neighbor_labels.insert(label);
         }
-        const std::size_t required = corners ? 3 : 2;
-        if (neighbor_labels.size() < required) continue;
+        if (neighbor_labels.size() < 2) continue;
         ColorPointT p;
         p.x = surfels[i].centroid.x();
         p.y = surfels[i].centroid.y();
         p.z = surfels[i].centroid.z();
-        p.r = corners ? 255 : 255;
-        p.g = corners ? 255 : 160;
-        p.b = corners ? 255 : 20;
+        p.r = 255;
+        p.g = 160;
+        p.b = 20;
         out->push_back(p);
-    }
-    out->width = static_cast<std::uint32_t>(out->size());
-    out->height = 1;
-    out->is_dense = true;
-    return out;
-}
-
-static ColorCloudPtr make_plane_intersection_corners(const std::vector<PlanePatch>& patches, const Config& cfg) {
-    ColorCloudPtr out(new ColorCloudT);
-    const float det_threshold = 0.05f;
-    const float merge_distance = std::max(cfg.surfel_size * 2.0f, 0.5f);
-    const float envelope_margin = std::max(cfg.assign_margin, cfg.surfel_size * 4.0f);
-
-    auto duplicate = [&](const Eigen::Vector3f& q) {
-        for (const auto& p : out->points) {
-            const Eigen::Vector3f existing(p.x, p.y, p.z);
-            if ((existing - q).norm() <= merge_distance) return true;
-        }
-        return false;
-    };
-
-    for (std::size_t i = 0; i < patches.size(); ++i) {
-        for (std::size_t j = i + 1; j < patches.size(); ++j) {
-            for (std::size_t k = j + 1; k < patches.size(); ++k) {
-                Eigen::Matrix3f a;
-                a.row(0) = patches[i].normal.transpose();
-                a.row(1) = patches[j].normal.transpose();
-                a.row(2) = patches[k].normal.transpose();
-                const float det = std::abs(a.determinant());
-                if (det < det_threshold) continue;
-                Eigen::Vector3f b(-patches[i].d, -patches[j].d, -patches[k].d);
-                const Eigen::Vector3f q = a.colPivHouseholderQr().solve(b);
-                if (!std::isfinite(q.x()) || !std::isfinite(q.y()) || !std::isfinite(q.z())) continue;
-                if (!point_inside_patch_envelope(patches[i], q, envelope_margin)) continue;
-                if (!point_inside_patch_envelope(patches[j], q, envelope_margin)) continue;
-                if (!point_inside_patch_envelope(patches[k], q, envelope_margin)) continue;
-                if (duplicate(q)) continue;
-                ColorPointT p;
-                p.x = q.x();
-                p.y = q.y();
-                p.z = q.z();
-                p.r = 255;
-                p.g = 255;
-                p.b = 255;
-                out->push_back(p);
-            }
-        }
     }
     out->width = static_cast<std::uint32_t>(out->size());
     out->height = 1;
@@ -1103,10 +1034,12 @@ int main(int argc, char** argv) {
 
         fs::path out_dir = cfg.output_dir / cfg.input.stem();
         fs::create_directories(out_dir);
+        std::error_code cleanup_error;
+        fs::remove(out_dir / "edge_surfels.ply", cleanup_error);
+        cleanup_error.clear();
+        fs::remove(out_dir / "feature_corners.ply", cleanup_error);
         pcl::io::savePLYFileASCII((out_dir / "edge_aware_plane_patches.ply").string(), *make_colored_patch_cloud(patches));
-        pcl::io::savePLYFileASCII((out_dir / "edge_surfels.ply").string(), *make_edge_cloud(surfels));
-        save_color_ply_allow_empty(out_dir / "feature_edges.ply", *make_feature_cloud(surfels, index_by_key, patches, false));
-        save_color_ply_allow_empty(out_dir / "feature_corners.ply", *make_plane_intersection_corners(patches, cfg));
+        save_color_ply_allow_empty(out_dir / "feature_edges.ply", *make_feature_cloud(surfels, index_by_key, patches));
         save_color_ply_allow_empty(out_dir / "extracted_corners.ply", *make_corner_cloud(corners));
         save_report(out_dir / "edge_aware_plane_report.csv", patches);
         save_corner_report(out_dir / "corner_report.csv", corners);
@@ -1118,13 +1051,6 @@ int main(int argc, char** argv) {
             std::cout << "Input points: " << cloud->size() << "\n";
             std::cout << "Surfels: " << surfels.size() << "\n";
             std::cout << "Assignment margin: " << cfg.assign_margin << "\n";
-            if (assign_margin_estimate.sampled > 0) {
-                std::cout << "Assignment margin sample: " << assign_margin_estimate.sampled
-                          << ", tight=" << assign_margin_estimate.tight_assigned
-                          << ", loose=" << assign_margin_estimate.loose_assigned
-                          << ", estimated rescued=" << static_cast<std::size_t>(assign_margin_estimate.estimated_rescued_points)
-                          << "\n";
-            }
             std::cout << "Plane patches: " << patches.size() << "\n";
             std::cout << "Output points: " << output_points << "\n";
             std::cout << "Extracted corners: " << corners.size() << "\n";

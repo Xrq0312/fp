@@ -1,6 +1,7 @@
 param(
     [string]$InputPly = ".\data02\data02\top_down.ply",
-    [string]$OutputDir = ".\results_seed_grow_top_down"
+    [string]$OutputDir = ".\results_seed_grow_top_down",
+    [switch]$RenderImages
 )
 
 $ErrorActionPreference = "Stop"
@@ -21,6 +22,10 @@ $args = @(
 )
 
 & $exe @args
+
+if (-not $RenderImages) {
+    return
+}
 
 $stem = [IO.Path]::GetFileNameWithoutExtension($InputPly)
 $sampleDir = Join-Path $OutputDir $stem

@@ -1,6 +1,7 @@
 param(
     [string]$InputPly = ".\data01\data01\top_left_cut2.ply",
-    [string]$OutputDir = ".\results_seed_grow"
+    [string]$OutputDir = ".\results_seed_grow",
+    [switch]$RenderImages
 )
 
 $ErrorActionPreference = "Stop"
@@ -21,6 +22,10 @@ $args = @(
 )
 
 & $exe @args
+
+if (-not $RenderImages) {
+    return
+}
 
 $stem = [IO.Path]::GetFileNameWithoutExtension($InputPly)
 $ply = Join-Path (Join-Path $OutputDir $stem) "edge_aware_plane_patches.ply"

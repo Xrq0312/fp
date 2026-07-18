@@ -62,20 +62,21 @@ For `top_down.ply`, use:
 
 The `top_down` script selects `--profile top-down`; this keeps millimeter-scale
 input. `top_left_cut2.ply` uses `--profile top-left-cut2`, which applies
-meter-to-mm scaling and saves per-plane diagnostic files. Both profiles use the
-same automatic assignment-margin inference.
+meter-to-mm scaling. Both profiles use the same automatic assignment-margin
+inference.
 
-Current best diagnostic output:
+Current extraction output:
 
 ```text
 results_seed_grow\top_left_cut2\edge_aware_plane_patches.ply
-results_seed_grow\top_left_cut2\planes\
 results_seed_grow\top_left_cut2\feature_edges.ply
-results_seed_grow\top_left_cut2\feature_corners.ply
 results_seed_grow\top_left_cut2\extracted_corners.ply
+results_seed_grow\top_left_cut2\edge_aware_plane_report.csv
 results_seed_grow\top_left_cut2\corner_report.csv
-results_seed_grow\top_left_cut2\images\
 ```
+
+Use `--save-plane-files` for per-plane PLY diagnostics, or run the helper
+scripts with `-RenderImages` when projection images are needed.
 
 Observed on `top_left_cut2.ply`:
 
