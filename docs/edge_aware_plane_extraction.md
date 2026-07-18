@@ -73,8 +73,7 @@ results_seed_grow\top_left_cut2\feature_edges.ply
 results_seed_grow\top_left_cut2\extracted_corners.ply
 ```
 
-Use `--save-plane-files` for per-plane PLY diagnostics, or run the helper
-scripts with `-RenderImages` when projection images are needed.
+Run the helper scripts with `-RenderImages` when projection images are needed.
 
 Observed on `top_left_cut2.ply`:
 

@@ -4,13 +4,11 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
-#include <iomanip>
 #include <iostream>
 #include <limits>
 #include <numeric>
 #include <queue>
 #include <set>
-#include <sstream>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -62,7 +60,6 @@ struct Config {
     int min_corner_support = 8;
     int min_plane_local_support = 3;
     int min_corner_planes = 3;
-    bool save_plane_files = false;
     bool verbose = true;
 };
 
@@ -88,11 +85,6 @@ struct CellKeyHash {
         h ^= static_cast<std::size_t>(key.z) * 83492791u;
         return h;
     }
-};
-
-struct Accumulator {
-    Eigen::Vector3d sum{0.0, 0.0, 0.0};
-    int count = 0;
 };
 
 struct Surfel {
@@ -125,22 +117,15 @@ struct CornerCandidate {
     int support = 0;
 };
 
-static bool has_flag(const std::vector<std::string>& args, const std::string& flag) {
-    return std::find(args.begin(), args.end(), flag) != args.end();
-}
-
-static void apply_profile(Config& cfg, const std::string& profile) {
+static float scale_for_profile(const std::string& profile) {
     if (profile == "model-mm" || profile == "top-down") {
-        cfg.input_scale = 1.0f;
-        return;
+        return 1.0f;
     }
     if (profile == "model-m") {
-        cfg.input_scale = 1000.0f;
-        return;
+        return 1000.0f;
     }
     if (profile == "top-left-cut2") {
-        cfg.input_scale = 1000.0f;
-        return;
+        return 1000.0f;
     }
     throw std::runtime_error("Unknown profile: " + profile + ". Use model-mm, model-m, top-down, or top-left-cut2.");
 }
@@ -148,28 +133,28 @@ static void apply_profile(Config& cfg, const std::string& profile) {
 static Config parse_args(int argc, char** argv) {
     Config cfg;
     std::vector<std::string> args(argv + 1, argv + argc);
-    if (args.empty() || has_flag(args, "--help") || has_flag(args, "-h")) {
+    const auto has_arg = [&](const std::string& flag) {
+        return std::find(args.begin(), args.end(), flag) != args.end();
+    };
+    if (args.empty() || has_arg("--help") || has_arg("-h")) {
         std::cout
             << "Usage: edge_aware_plane_extract input.ply [options]\n"
             << "Options:\n"
             << "  --profile model-mm|model-m|top-down|top-left-cut2\n"
             << "  --output-dir DIR\n"
-            << "  --save-plane-files\n"
             << "  --quiet\n";
         std::exit(args.empty() ? 1 : 0);
     }
 
-    apply_profile(cfg, "model-mm");
+    cfg.input_scale = scale_for_profile("model-mm");
     for (std::size_t i = 0; i < args.size(); ++i) {
         const std::string& arg = args[i];
         if (arg == "--profile") {
             if (i + 1 >= args.size()) throw std::runtime_error("Missing value after --profile.");
-            apply_profile(cfg, args[++i]);
+            cfg.input_scale = scale_for_profile(args[++i]);
         } else if (arg == "--output-dir") {
             if (i + 1 >= args.size()) throw std::runtime_error("Missing value after --output-dir.");
             cfg.output_dir = args[++i];
-        } else if (arg == "--save-plane-files") {
-            cfg.save_plane_files = true;
         } else if (arg == "--quiet") {
             cfg.verbose = false;
         } else if (!arg.empty() && arg.front() == '-') {
@@ -201,12 +186,6 @@ static CloudPtr load_cloud(const fs::path& path, float scale) {
     return cloud;
 }
 
-static Bounds compute_bounds(const CloudPtr& cloud) {
-    Bounds bounds;
-    pcl::getMinMax3D(*cloud, bounds.min_pt, bounds.max_pt);
-    return bounds;
-}
-
 static CellKey point_key(const PointT& p, const Bounds& bounds, float size) {
     return {
         static_cast<int>(std::floor((p.x - bounds.min_pt.x) / size)),
@@ -221,6 +200,11 @@ static std::vector<Surfel> build_surfels(
     const Config& cfg,
     std::unordered_map<CellKey, int, CellKeyHash>& index_by_key,
     CloudPtr& surfel_cloud) {
+    struct Accumulator {
+        Eigen::Vector3d sum{0.0, 0.0, 0.0};
+        int count = 0;
+    };
+
     std::unordered_map<CellKey, Accumulator, CellKeyHash> cells;
     cells.reserve(cloud->size() / 20);
     for (const auto& p : cloud->points) {
@@ -554,20 +538,6 @@ static bool point_inside_patch_envelope(const PlanePatch& patch, const Eigen::Ve
            v >= patch.min_v - margin && v <= patch.max_v + margin;
 }
 
-static bool point_assignable_with_margin(
-    const Eigen::Vector3f& q,
-    const std::vector<PlanePatch>& patches,
-    const Config& cfg,
-    float margin) {
-    for (const auto& patch : patches) {
-        const float distance = std::abs(patch.normal.dot(q) + patch.d);
-        if (distance > cfg.assign_distance) continue;
-        if (!point_inside_patch_envelope(patch, q, margin)) continue;
-        return true;
-    }
-    return false;
-}
-
 static float estimate_assign_margin(
     const CloudPtr& cloud,
     const std::vector<PlanePatch>& patches,
@@ -581,18 +551,25 @@ static float estimate_assign_margin(
     std::size_t sampled = 0;
     std::size_t tight_assigned = 0;
     std::size_t loose_assigned = 0;
+    const auto assignable = [&](const Eigen::Vector3f& q, float margin) {
+        for (const auto& patch : patches) {
+            const float distance = std::abs(patch.normal.dot(q) + patch.d);
+            if (distance <= cfg.assign_distance && point_inside_patch_envelope(patch, q, margin)) return true;
+        }
+        return false;
+    };
 
     for (std::size_t i = 0; i < cloud->size(); i += stride) {
         const PointT& p = cloud->points[i];
         const Eigen::Vector3f q(p.x, p.y, p.z);
         ++sampled;
-        const bool tight = point_assignable_with_margin(q, patches, cfg, tight_margin);
+        const bool tight = assignable(q, tight_margin);
         if (tight) {
             ++tight_assigned;
             ++loose_assigned;
             continue;
         }
-        if (point_assignable_with_margin(q, patches, cfg, loose_margin)) {
+        if (assignable(q, loose_margin)) {
             ++loose_assigned;
         }
     }
@@ -607,14 +584,12 @@ static float estimate_assign_margin(
 
 static void assign_full_points(
     const CloudPtr& cloud,
-    const Bounds& bounds,
     std::vector<PlanePatch>& patches,
     const Config& cfg) {
     for (auto& patch : patches) patch.output.reset(new CloudT);
 
     for (const auto& p : cloud->points) {
         const Eigen::Vector3f q(p.x, p.y, p.z);
-        (void)bounds;
         int best = -1;
         float best_distance = std::numeric_limits<float>::max();
         for (std::size_t i = 0; i < patches.size(); ++i) {
@@ -675,23 +650,19 @@ static ColorCloudPtr make_colored_patch_cloud(const std::vector<PlanePatch>& pat
     return out;
 }
 
-static std::vector<int> build_surfel_labels(const std::vector<PlanePatch>& patches, std::size_t surfel_count) {
-    std::vector<int> labels(surfel_count, -1);
-    for (std::size_t i = 0; i < patches.size(); ++i) {
-        for (int surfel_id : patches[i].surfels) {
-            if (surfel_id >= 0 && static_cast<std::size_t>(surfel_id) < labels.size()) {
-                labels[static_cast<std::size_t>(surfel_id)] = static_cast<int>(i);
-            }
-        }
-    }
-    return labels;
-}
-
 static ColorCloudPtr make_feature_cloud(
     const std::vector<Surfel>& surfels,
     const std::unordered_map<CellKey, int, CellKeyHash>& index_by_key,
     const std::vector<PlanePatch>& patches) {
-    const std::vector<int> labels = build_surfel_labels(patches, surfels.size());
+    std::vector<int> labels(surfels.size(), -1);
+    for (std::size_t patch_id = 0; patch_id < patches.size(); ++patch_id) {
+        for (int surfel_id : patches[patch_id].surfels) {
+            if (surfel_id >= 0 && static_cast<std::size_t>(surfel_id) < labels.size()) {
+                labels[static_cast<std::size_t>(surfel_id)] = static_cast<int>(patch_id);
+            }
+        }
+    }
+
     ColorCloudPtr out(new ColorCloudT);
     for (std::size_t i = 0; i < surfels.size(); ++i) {
         if (labels[i] < 0) continue;
@@ -714,16 +685,6 @@ static ColorCloudPtr make_feature_cloud(
     out->height = 1;
     out->is_dense = true;
     return out;
-}
-
-static int nearby_support_count(pcl::KdTreeFLANN<PointT>& tree, const Eigen::Vector3f& p, float radius) {
-    PointT probe;
-    probe.x = p.x();
-    probe.y = p.y();
-    probe.z = p.z();
-    std::vector<int> indices;
-    std::vector<float> distances;
-    return tree.radiusSearch(probe, radius, indices, distances);
 }
 
 static int nearby_support_count_on_patch(const PlanePatch& patch, const Eigen::Vector3f& p, float radius) {
@@ -786,6 +747,15 @@ static std::vector<CornerCandidate> extract_corners_filtered(
     std::vector<CornerCandidate> candidates;
     pcl::KdTreeFLANN<PointT> support_tree;
     support_tree.setInputCloud(cloud);
+    const auto nearby_support_count = [&](const Eigen::Vector3f& p, float radius) {
+        PointT probe;
+        probe.x = p.x();
+        probe.y = p.y();
+        probe.z = p.z();
+        std::vector<int> indices;
+        std::vector<float> distances;
+        return support_tree.radiusSearch(probe, radius, indices, distances);
+    };
 
     const float support_radius = std::max(cfg.corner_support_radius_scale * cfg.surfel_size, 1e-4f);
     const float merge_radius = std::max(cfg.intersection_merge_scale * cfg.surfel_size, 1e-4f);
@@ -810,7 +780,7 @@ static std::vector<CornerCandidate> extract_corners_filtered(
                 if (std::abs(patches[j].normal.dot(p) + patches[j].d) > plane_distance_threshold) continue;
                 if (std::abs(patches[k].normal.dot(p) + patches[k].d) > plane_distance_threshold) continue;
 
-                const int support = nearby_support_count(support_tree, p, support_radius);
+                const int support = nearby_support_count(p, support_radius);
                 if (support < cfg.min_corner_support) continue;
                 if (nearby_support_count_on_patch(patches[i], p, support_radius) < cfg.min_plane_local_support) continue;
                 if (nearby_support_count_on_patch(patches[j], p, support_radius) < cfg.min_plane_local_support) continue;
@@ -871,39 +841,12 @@ static void save_color_ply(const fs::path& path, const ColorCloudT& cloud) {
     }
 }
 
-static void save_xyz_ply(const fs::path& path, const CloudT& cloud) {
-    std::ofstream out(path);
-    if (!out) throw std::runtime_error("Failed to write PLY: " + path.string());
-    out << "ply\n"
-        << "format ascii 1.0\n"
-        << "element vertex " << cloud.size() << "\n"
-        << "property float x\n"
-        << "property float y\n"
-        << "property float z\n"
-        << "end_header\n";
-    out.setf(std::ios::fixed, std::ios::floatfield);
-    out.precision(6);
-    for (const auto& p : cloud.points) {
-        out << p.x << ' ' << p.y << ' ' << p.z << '\n';
-    }
-}
-
-static void save_plane_files(const fs::path& out_dir, const std::vector<PlanePatch>& patches) {
-    const fs::path plane_dir = out_dir / "planes";
-    fs::create_directories(plane_dir);
-    for (std::size_t i = 0; i < patches.size(); ++i) {
-        std::ostringstream name;
-        name << "plane_" << std::setw(3) << std::setfill('0') << i << "_"
-             << patches[i].output->size() << "pts.ply";
-        save_xyz_ply(plane_dir / name.str(), *patches[i].output);
-    }
-}
-
 int main(int argc, char** argv) {
     try {
         Config cfg = parse_args(argc, argv);
         CloudPtr cloud = load_cloud(cfg.input, cfg.input_scale);
-        const Bounds bounds = compute_bounds(cloud);
+        Bounds bounds;
+        pcl::getMinMax3D(*cloud, bounds.min_pt, bounds.max_pt);
 
         std::unordered_map<CellKey, int, CellKeyHash> index_by_key;
         CloudPtr surfel_cloud;
@@ -913,7 +856,7 @@ int main(int argc, char** argv) {
         std::vector<PlanePatch> patches = extract_seed_grown_patches(surfels, index_by_key, cfg);
         merge_patches(patches, surfels, cfg);
         cfg.assign_margin = estimate_assign_margin(cloud, patches, cfg);
-        assign_full_points(cloud, bounds, patches, cfg);
+        assign_full_points(cloud, patches, cfg);
         const std::vector<CornerCandidate> corners = extract_corners_filtered(cloud, patches, bounds, cfg);
 
         fs::path out_dir = cfg.output_dir / cfg.input.stem();
@@ -925,7 +868,6 @@ int main(int argc, char** argv) {
         save_color_ply(out_dir / "edge_aware_plane_patches.ply", *make_colored_patch_cloud(patches));
         save_color_ply(out_dir / "feature_edges.ply", *make_feature_cloud(surfels, index_by_key, patches));
         save_color_ply(out_dir / "extracted_corners.ply", *make_corner_cloud(corners));
-        if (cfg.save_plane_files) save_plane_files(out_dir, patches);
 
         if (cfg.verbose) {
             std::size_t output_points = 0;
