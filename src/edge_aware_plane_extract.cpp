@@ -39,7 +39,6 @@ using ColorCloudPtr = ColorCloudT::Ptr;
 struct Config {
     fs::path input;
     fs::path output_dir = "results_edge_aware";
-    std::string profile = "model-mm";
     float input_scale = 1.0f;
     float surfel_size = 0.50f;
     int normal_k = 18;
@@ -63,11 +62,6 @@ struct Config {
     int min_corner_support = 8;
     int min_plane_local_support = 3;
     int min_corner_planes = 3;
-    float corner_edge_radius_scale = 3.5f;
-    std::vector<float> corner_edge_multi_scales{2.5f, 4.5f, 7.0f};
-    int corner_edge_sample_limit = 40000;
-    float max_corner_edge_score = 0.0f;
-    float max_corner_edge_growth_ratio = 0.0f;
     bool save_plane_files = false;
     bool verbose = true;
 };
@@ -136,7 +130,6 @@ static bool has_flag(const std::vector<std::string>& args, const std::string& fl
 }
 
 static void apply_profile(Config& cfg, const std::string& profile) {
-    cfg.profile = profile;
     if (profile == "model-mm" || profile == "top-down") {
         cfg.input_scale = 1.0f;
         return;
@@ -166,7 +159,7 @@ static Config parse_args(int argc, char** argv) {
         std::exit(args.empty() ? 1 : 0);
     }
 
-    apply_profile(cfg, cfg.profile);
+    apply_profile(cfg, "model-mm");
     for (std::size_t i = 0; i < args.size(); ++i) {
         const std::string& arg = args[i];
         if (arg == "--profile") {
@@ -561,14 +554,6 @@ static bool point_inside_patch_envelope(const PlanePatch& patch, const Eigen::Ve
            v >= patch.min_v - margin && v <= patch.max_v + margin;
 }
 
-struct AssignMarginEstimate {
-    float margin = 2.0f;
-    std::size_t sampled = 0;
-    std::size_t tight_assigned = 0;
-    std::size_t loose_assigned = 0;
-    double estimated_rescued_points = 0.0;
-};
-
 static bool point_assignable_with_margin(
     const Eigen::Vector3f& q,
     const std::vector<PlanePatch>& patches,
@@ -583,43 +568,41 @@ static bool point_assignable_with_margin(
     return false;
 }
 
-static AssignMarginEstimate estimate_assign_margin(
+static float estimate_assign_margin(
     const CloudPtr& cloud,
     const std::vector<PlanePatch>& patches,
     const Config& cfg) {
-    AssignMarginEstimate estimate;
     const float tight_margin = std::max(4.0f * cfg.surfel_size, 2.0f);
     const float loose_margin = std::max(24.0f * cfg.surfel_size, tight_margin);
-    estimate.margin = tight_margin;
-    if (cloud->empty() || patches.empty()) return estimate;
+    if (cloud->empty() || patches.empty()) return tight_margin;
 
     const std::size_t sample_limit = 200000;
     const std::size_t stride = std::max<std::size_t>(1, cloud->size() / sample_limit);
+    std::size_t sampled = 0;
+    std::size_t tight_assigned = 0;
+    std::size_t loose_assigned = 0;
 
     for (std::size_t i = 0; i < cloud->size(); i += stride) {
         const PointT& p = cloud->points[i];
         const Eigen::Vector3f q(p.x, p.y, p.z);
-        ++estimate.sampled;
+        ++sampled;
         const bool tight = point_assignable_with_margin(q, patches, cfg, tight_margin);
         if (tight) {
-            ++estimate.tight_assigned;
-            ++estimate.loose_assigned;
+            ++tight_assigned;
+            ++loose_assigned;
             continue;
         }
         if (point_assignable_with_margin(q, patches, cfg, loose_margin)) {
-            ++estimate.loose_assigned;
+            ++loose_assigned;
         }
     }
 
-    const std::size_t rescued = estimate.loose_assigned - estimate.tight_assigned;
-    if (estimate.sampled == 0 || rescued == 0) return estimate;
+    const std::size_t rescued = loose_assigned - tight_assigned;
+    if (sampled == 0 || rescued == 0) return tight_margin;
 
-    const double rescued_rate = static_cast<double>(rescued) / static_cast<double>(estimate.sampled);
-    estimate.estimated_rescued_points = rescued_rate * static_cast<double>(cloud->size());
-    if (rescued_rate >= 0.003 || estimate.estimated_rescued_points >= 20000.0) {
-        estimate.margin = loose_margin;
-    }
-    return estimate;
+    const double rescued_rate = static_cast<double>(rescued) / static_cast<double>(sampled);
+    const double estimated_rescued_points = rescued_rate * static_cast<double>(cloud->size());
+    return (rescued_rate >= 0.003 || estimated_rescued_points >= 20000.0) ? loose_margin : tight_margin;
 }
 
 static void assign_full_points(
@@ -771,82 +754,6 @@ static bool within_bounds(const Eigen::Vector3f& p, const Bounds& bounds, float 
            p.z() >= bounds.min_pt.z - margin && p.z() <= bounds.max_pt.z + margin;
 }
 
-class CornerEdgeScorer {
-public:
-    CornerEdgeScorer(pcl::KdTreeFLANN<PointT>& tree, CloudPtr cloud, float resolution, const Config& cfg)
-        : tree_(tree), cloud_(std::move(cloud)), resolution_(resolution), cfg_(cfg) {}
-
-    bool passes_filter(const CornerCandidate& candidate) const {
-        const float edge_score = score_at_scale(candidate.position, cfg_.corner_edge_radius_scale);
-        if (cfg_.max_corner_edge_score > 0.0f && edge_score > cfg_.max_corner_edge_score) return false;
-        if (cfg_.max_corner_edge_growth_ratio > 0.0f) {
-            const float mid = std::max(score_at_scale(candidate.position, edge_scale(1)), 1e-6f);
-            const float large = score_at_scale(candidate.position, edge_scale(2));
-            if (large / mid > cfg_.max_corner_edge_growth_ratio) return false;
-        }
-        return true;
-    }
-
-private:
-    float edge_scale(std::size_t index) const {
-        if (cfg_.corner_edge_multi_scales.empty()) return cfg_.corner_edge_radius_scale;
-        return cfg_.corner_edge_multi_scales[std::min(index, cfg_.corner_edge_multi_scales.size() - 1)];
-    }
-
-    float score_at_scale(const Eigen::Vector3f& p, float scale) const {
-        return local_covariance_score(p, std::max(scale * resolution_, 1e-4f));
-    }
-
-    float local_covariance_score(const Eigen::Vector3f& p, float radius) const {
-        PointT probe;
-        probe.x = p.x();
-        probe.y = p.y();
-        probe.z = p.z();
-        std::vector<int> indices;
-        std::vector<float> distances;
-        const int found = tree_.radiusSearch(probe, radius, indices, distances);
-        if (found < 6) return 0.0f;
-
-        const std::size_t limit = cfg_.corner_edge_sample_limit > 0
-            ? static_cast<std::size_t>(cfg_.corner_edge_sample_limit)
-            : std::numeric_limits<std::size_t>::max();
-        const std::size_t step = indices.size() > limit
-            ? static_cast<std::size_t>(std::ceil(static_cast<double>(indices.size()) / static_cast<double>(limit)))
-            : 1;
-
-        Eigen::Vector3f mean = Eigen::Vector3f::Zero();
-        std::size_t used = 0;
-        for (std::size_t i = 0; i < indices.size() && used < limit; i += step) {
-            const auto& q = cloud_->points[static_cast<std::size_t>(indices[i])];
-            mean += Eigen::Vector3f(q.x, q.y, q.z);
-            ++used;
-        }
-        if (used < 6) return 0.0f;
-        mean /= static_cast<float>(used);
-
-        Eigen::Matrix3f covariance = Eigen::Matrix3f::Zero();
-        std::size_t used_cov = 0;
-        for (std::size_t i = 0; i < indices.size() && used_cov < limit; i += step) {
-            const auto& q = cloud_->points[static_cast<std::size_t>(indices[i])];
-            const Eigen::Vector3f centered = Eigen::Vector3f(q.x, q.y, q.z) - mean;
-            covariance += centered * centered.transpose();
-            ++used_cov;
-        }
-        covariance /= static_cast<float>(std::max<std::size_t>(used_cov, 1));
-
-        Eigen::SelfAdjointEigenSolver<Eigen::Matrix3f> solver(covariance);
-        if (solver.info() != Eigen::Success) return 0.0f;
-        const Eigen::Vector3f eigenvalues = solver.eigenvalues().cwiseMax(0.0f);
-        const float sum = eigenvalues.sum();
-        return sum > 1e-12f ? eigenvalues.x() / sum : 0.0f;
-    }
-
-    pcl::KdTreeFLANN<PointT>& tree_;
-    CloudPtr cloud_;
-    float resolution_ = 0.0f;
-    const Config& cfg_;
-};
-
 static std::vector<CornerCandidate> merge_corner_candidates(std::vector<CornerCandidate> candidates, float merge_radius) {
     std::vector<CornerCandidate> merged;
     const float merge_sq = merge_radius * merge_radius;
@@ -914,12 +821,10 @@ static std::vector<CornerCandidate> extract_corners_filtered(
     }
 
     auto merged = merge_corner_candidates(std::move(candidates), merge_radius);
-    const CornerEdgeScorer edge_scorer(support_tree, cloud, cfg.surfel_size, cfg);
     const std::size_t min_planes = static_cast<std::size_t>(std::max(cfg.min_corner_planes, 1));
     merged.erase(
         std::remove_if(merged.begin(), merged.end(), [&](const CornerCandidate& candidate) {
-            if (candidate.plane_ids.size() < min_planes) return true;
-            return !edge_scorer.passes_filter(candidate);
+            return candidate.plane_ids.size() < min_planes;
         }),
         merged.end());
     return merged;
@@ -1007,8 +912,7 @@ int main(int argc, char** argv) {
         mark_edge_surfels(surfels, index_by_key, cfg);
         std::vector<PlanePatch> patches = extract_seed_grown_patches(surfels, index_by_key, cfg);
         merge_patches(patches, surfels, cfg);
-        const AssignMarginEstimate assign_margin_estimate = estimate_assign_margin(cloud, patches, cfg);
-        cfg.assign_margin = assign_margin_estimate.margin;
+        cfg.assign_margin = estimate_assign_margin(cloud, patches, cfg);
         assign_full_points(cloud, bounds, patches, cfg);
         const std::vector<CornerCandidate> corners = extract_corners_filtered(cloud, patches, bounds, cfg);
 
@@ -1018,10 +922,6 @@ int main(int argc, char** argv) {
         fs::remove(out_dir / "edge_surfels.ply", cleanup_error);
         cleanup_error.clear();
         fs::remove(out_dir / "feature_corners.ply", cleanup_error);
-        cleanup_error.clear();
-        fs::remove(out_dir / "edge_aware_plane_report.csv", cleanup_error);
-        cleanup_error.clear();
-        fs::remove(out_dir / "corner_report.csv", cleanup_error);
         save_color_ply(out_dir / "edge_aware_plane_patches.ply", *make_colored_patch_cloud(patches));
         save_color_ply(out_dir / "feature_edges.ply", *make_feature_cloud(surfels, index_by_key, patches));
         save_color_ply(out_dir / "extracted_corners.ply", *make_corner_cloud(corners));
