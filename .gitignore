@@ -20,6 +20,7 @@
 /phase_unwrap_task/results*/
 /delivery/pointcloud_corner_delivery/results/
 /delivery/pointcloud_corner_delivery/run_results/
+/delivery/edge_aware_plane_extract_delivery/
 
 # Large source data and packaged artifacts
 /PMD_DATA/
