@@ -1271,13 +1271,17 @@ void processOne(const fs::path& phase_path, const fs::path& raw_dir, const fs::p
     cv::Mat1f phase_relief = cfg.relief_smooth_radius > 0
         ? localMean(phase_residual, output_valid, cfg.relief_smooth_radius)
         : phase_residual;
-    cv::Mat1f phase_unwrapped_detrended = planeDetrended(
-        unwrapped,
-        phase,
-        output_valid,
-        cfg.trend_fit_phase_threshold);
+    cv::Mat1f phase_unwrapped_detrended = absolute_k
+        ? absolute_k->residual
+        : planeDetrended(
+            unwrapped,
+            phase,
+            output_valid,
+            cfg.trend_fit_phase_threshold);
 
-    cv::Mat1b phase_unwrapped_visual = normalizeVisual(phase_unwrapped_detrended, output_valid);
+    cv::Mat1b phase_unwrapped_visual = absolute_k
+        ? deltaVisual(absolute_k->residual, output_valid, true)
+        : normalizeVisual(phase_unwrapped_detrended, output_valid);
     cv::Mat1b phase_wrapped_visual = wrappedPhaseVisual(phase);
     cv::Mat1b defect_delta_raw_visual = deltaVisual(delta, output_valid, true);
     cv::Mat1b defect_delta_visual = deltaVisual(display_delta, output_valid, true);
