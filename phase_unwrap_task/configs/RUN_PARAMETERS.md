@@ -23,8 +23,8 @@ The two aluminum rerun configs are the same as `aluminum_x.cfg` / `aluminum_y.cf
 | --- | --- |
 | `raw_phase_start` | `1` |
 | `modulation_abs_floor` | `4.0` |
-| `modulation_min_weak_ratio_for_otsu` | `0.2` |
-| `modulation_otsu_cap_pct` | `25.0` |
+| `modulation_min_weak_ratio_for_otsu` | `0.0` for data2; otherwise `0.2` | Forces Otsu segmentation for data2. |
+| `modulation_otsu_cap_pct` | `100.0` for data2; otherwise `25.0` | Leaves the data2 Otsu threshold uncapped. |
 | `modulation_erode_size` | `0` |
 | `trend_fit_phase_threshold` | `0.6` for data2; default `0.6` | Excludes wrapped samples near +/-pi from normalized SVD trend fitting. |
 

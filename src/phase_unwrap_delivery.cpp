@@ -490,6 +490,10 @@ cv::Mat1b buildModulationMask(const std::array<cv::Mat1f, 4>& frames, const Conf
         int erode_size = std::max(1, cfg.modulation_erode_size);
         cv::erode(mask, mask, cv::getStructuringElement(cv::MORPH_RECT, cv::Size(erode_size, erode_size)));
     }
+    const double foreground_ratio = static_cast<double>(cv::countNonZero(mask)) /
+        static_cast<double>(size.width * size.height);
+    std::cout << "  segment: modulation Otsu threshold=" << threshold
+              << ", foreground=" << foreground_ratio * 100.0 << "%\n";
     return mask;
 }
 
