@@ -55,6 +55,7 @@ struct Config {
     bool use_modulation_mask = true;
     bool absolute_k_enabled = false;
     std::vector<PhaseAnchorROI> absolute_k_rois;
+    std::optional<cv::Rect> integration_roi;
     float min_amplitude = 4.0f;
     float good_amplitude = 20.0f;
     float residual_scale = 0.35f;
@@ -714,6 +715,7 @@ struct AbsoluteKResult {
 
 std::optional<AbsoluteKResult> unwrapWithAbsoluteKPlane(
     const cv::Mat1f& wrapped,
+    const cv::Mat1f& integrated_unwrapped,
     const cv::Mat1b& valid,
     const std::vector<PhaseAnchorROI>& anchors,
     float phase_fit_threshold) {
@@ -768,8 +770,12 @@ std::optional<AbsoluteKResult> unwrapWithAbsoluteKPlane(
         cv::Mat1f(wrapped.size(), nan),
         cv::Mat1f(wrapped.size(), nan),
         cv::Mat1f(wrapped.size(), nan)};
+    long long integrated_count = 0;
+    long long fallback_count = 0;
     for (int y = 0; y < wrapped.rows; ++y) {
         const float* phase_row = wrapped.ptr<float>(y);
+        const float* integrated_row = integrated_unwrapped.ptr<float>(y);
+        const uchar* valid_row = valid.ptr<uchar>(y);
         float* unwrapped_row = result.unwrapped.ptr<float>(y);
         float* carrier_row = result.carrier.ptr<float>(y);
         float* residual_row = result.residual.ptr<float>(y);
@@ -784,14 +790,27 @@ std::optional<AbsoluteKResult> unwrapWithAbsoluteKPlane(
             }
             const double xn = (static_cast<double>(x) - cx) / coordinate_scale;
             const double carrier = coeff[0] * xn + coeff[1] * yn + coeff[2];
-            const int k = static_cast<int>(std::lround((carrier - phase_row[x]) / kTwoPi));
-            const double absolute_phase = phase_row[x] + static_cast<double>(k) * kTwoPi;
+            double absolute_phase = 0.0;
+            if (valid_row[x] != 0 && std::isfinite(integrated_row[x])) {
+                const int component_offset = static_cast<int>(
+                    std::lround((carrier - integrated_row[x]) / kTwoPi));
+                absolute_phase = integrated_row[x] + static_cast<double>(component_offset) * kTwoPi;
+                ++integrated_count;
+            } else {
+                const int inferred_k = static_cast<int>(
+                    std::lround((carrier - phase_row[x]) / kTwoPi));
+                absolute_phase = phase_row[x] + static_cast<double>(inferred_k) * kTwoPi;
+                ++fallback_count;
+            }
+            const int k = static_cast<int>(std::lround((absolute_phase - phase_row[x]) / kTwoPi));
             carrier_row[x] = static_cast<float>(carrier);
             k_row[x] = static_cast<float>(k);
             unwrapped_row[x] = static_cast<float>(absolute_phase);
             residual_row[x] = static_cast<float>(absolute_phase - carrier);
         }
     }
+    std::cout << "  absolute K merge: integrated=" << integrated_count
+              << ", wrapped-phase fallback=" << fallback_count << "\n";
     return result;
 }
 
@@ -1201,6 +1220,17 @@ void processOne(const fs::path& phase_path, const fs::path& raw_dir, const fs::p
         std::cout << "  mask: phase-only confidence\n";
     }
     cv::Mat1b valid = modulation_mask ? modulation_mask->clone() : quality.valid;
+    if (cfg.integration_roi) {
+        cv::Mat1b roi_mask(phase.size(), uchar(0));
+        const cv::Rect clipped = *cfg.integration_roi & cv::Rect(0, 0, phase.cols, phase.rows);
+        if (clipped.empty()) {
+            throw std::runtime_error("integration_roi does not intersect the phase image");
+        }
+        roi_mask(clipped).setTo(uchar(255));
+        cv::bitwise_and(valid, roi_mask, valid);
+        std::cout << "  integration ROI: x=" << clipped.x << ".." << clipped.x + clipped.width - 1
+                  << ", y=" << clipped.y << ".." << clipped.y + clipped.height - 1 << "\n";
+    }
     const double valid_ratio = static_cast<double>(cv::countNonZero(valid)) /
         static_cast<double>(valid.rows * valid.cols);
     std::cout << "  integration mask: "
@@ -1215,6 +1245,7 @@ void processOne(const fs::path& phase_path, const fs::path& raw_dir, const fs::p
     if (cfg.absolute_k_enabled) {
         absolute_k = unwrapWithAbsoluteKPlane(
             phase,
+            unwrapped,
             valid,
             cfg.absolute_k_rois,
             cfg.trend_fit_phase_threshold);
@@ -1357,6 +1388,19 @@ PhaseAnchorROI parsePhaseAnchorROI(std::string text) {
     return PhaseAnchorROI{cv::Rect(x, y, width, height), k};
 }
 
+cv::Rect parseRect(std::string text, const char* key) {
+    std::replace(text.begin(), text.end(), ',', ' ');
+    std::istringstream input(text);
+    int x = 0;
+    int y = 0;
+    int width = 0;
+    int height = 0;
+    if (!(input >> x >> y >> width >> height) || width <= 0 || height <= 0) {
+        throw std::runtime_error(std::string(key) + " must be x,y,width,height");
+    }
+    return cv::Rect(x, y, width, height);
+}
+
 void applyConfigValue(Config& cfg, const std::string& key, const std::string& value) {
     if (key == "phase" || key == "phase_path") {
         cfg.phase_path = parsePathValue(value);
@@ -1396,6 +1440,8 @@ void applyConfigValue(Config& cfg, const std::string& key, const std::string& va
         cfg.absolute_k_enabled = parseBoolValue(value);
     } else if (key == "absolute_k_roi") {
         cfg.absolute_k_rois.push_back(parsePhaseAnchorROI(value));
+    } else if (key == "integration_roi") {
+        cfg.integration_roi = parseRect(value, "integration_roi");
     } else if (key == "min_amplitude") {
         cfg.min_amplitude = std::stof(value);
     } else if (key == "good_amplitude") {
