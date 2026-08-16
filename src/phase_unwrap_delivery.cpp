@@ -797,9 +797,10 @@ std::optional<AbsoluteKResult> unwrapWithAbsoluteKPlane(
                 absolute_phase = integrated_row[x] + static_cast<double>(component_offset) * kTwoPi;
                 ++integrated_count;
             } else {
-                const int inferred_k = static_cast<int>(
-                    std::lround((carrier - phase_row[x]) / kTwoPi));
-                absolute_phase = phase_row[x] + static_cast<double>(inferred_k) * kTwoPi;
+                // Rejected samples must retain the original wrapped phase.
+                // They deliberately receive no inferred fringe order before
+                // the common carrier K is subtracted below.
+                absolute_phase = phase_row[x];
                 ++fallback_count;
             }
             const int k = static_cast<int>(std::lround((absolute_phase - phase_row[x]) / kTwoPi));
@@ -1255,7 +1256,7 @@ void processOne(const fs::path& phase_path, const fs::path& raw_dir, const fs::p
         unwrapped = absolute_k->unwrapped;
         output_valid = cv::Mat1b(phase.size(), uchar(255));
         std::cout << "  unwrap: absolute K anchored by carrier plane\n";
-        std::cout << "  output coverage: full phase image; rejected integration samples use wrapped phase + inferred K\n";
+        std::cout << "  output coverage: full phase image; rejected integration samples use original wrapped phase minus carrier K\n";
     }
     cv::Mat1f delta = circularLocalResidual(phase, output_valid, cfg.residual_radius);
     cv::Mat1f display_delta = subtractLocalBias(delta, output_valid, std::max(181, cfg.residual_radius * 3));
