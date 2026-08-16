@@ -24,6 +24,8 @@ The two aluminum rerun configs are the same as `aluminum_x.cfg` / `aluminum_y.cf
 | `raw_phase_start` | `1` |
 | `modulation_abs_floor` | `4.0` |
 | `use_modulation_mask` | `false` for data2; default `true` | Data2 integrates across the image using per-pixel quality confidence instead of hard Otsu segmentation. |
+| `raw_phase_offset` | `pi/2` for data2; default `0` | With `invert_phase=true`, aligns RAW decoding to the phase convention used by the supplied absolute-K anchors. |
+| `absolute_k_enabled` | `true` for data2; default `false` | Fits a normalized SVD carrier from repeated `absolute_k_roi=x,y,w,h,K` anchors and subtracts it. |
 | `modulation_min_weak_ratio_for_otsu` | `0.2` | Used only when `use_modulation_mask=true`. |
 | `modulation_otsu_cap_pct` | `25.0` | Used only when `use_modulation_mask=true`. |
 | `modulation_erode_size` | `0` |
@@ -64,3 +66,6 @@ phase_unwrapped_with_background.png
 phase_unwrapped_with_background_detail.png
 phase_wrapped.png
 ```
+
+When `absolute_k_enabled=true`, the run additionally writes 8-bit previews and
+32-bit float TIFF data for `phase_absolute_k` and `phase_absolute_k_removed`.

@@ -11,6 +11,7 @@
 #include <limits>
 #include <numeric>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -28,6 +29,11 @@ namespace fs = std::filesystem;
 constexpr float kPi = 3.14159265358979323846f;
 constexpr float kTwoPi = 2.0f * kPi;
 
+struct PhaseAnchorROI {
+    cv::Rect rect;
+    int k_order = 0;
+};
+
 struct Config {
     fs::path config_path;
     fs::path phase_path;
@@ -37,6 +43,7 @@ struct Config {
     bool batch = false;
     fs::path batch_root = "PMD_DATA";
     bool invert_phase = false;
+    float raw_phase_offset = 0.0f;
     bool decode_raw_phase = false;
     int raw_phase_start = 1;
     std::wstring raw_phase_series;
@@ -46,6 +53,8 @@ struct Config {
     float modulation_otsu_cap_pct = 25.0f;
     int modulation_erode_size = 0;
     bool use_modulation_mask = true;
+    bool absolute_k_enabled = false;
+    std::vector<PhaseAnchorROI> absolute_k_rois;
     float min_amplitude = 4.0f;
     float good_amplitude = 20.0f;
     float residual_scale = 0.35f;
@@ -354,6 +363,7 @@ std::optional<DecodedPhase> decodeFourStepPhase(
     int start_index,
     cv::Size expected_size,
     bool invert_phase,
+    float phase_offset,
     const std::wstring& series = L"") {
     auto images = loadFourStepFrames(raw_dir, start_index, expected_size, series);
     if (!images) {
@@ -375,6 +385,7 @@ std::optional<DecodedPhase> decodeFourStepPhase(
             float c = (i1[x] - i3[x]) * 0.5f;
             float s = (i2[x] - i4[x]) * 0.5f;
             ph[x] = sign * std::atan2(s, c);
+            ph[x] = wrapPi(ph[x] + phase_offset);
             mod[x] = 0.5f * std::sqrt(c * c + s * s);
         }
     }
@@ -692,6 +703,94 @@ cv::Mat1f unwrapQualityGuided(const cv::Mat1f& phase, const cv::Mat1b& valid, co
         }
     }
     return unwrapped;
+}
+
+struct AbsoluteKResult {
+    cv::Mat1f unwrapped;
+    cv::Mat1f carrier;
+    cv::Mat1f residual;
+    cv::Mat1f k_order;
+};
+
+std::optional<AbsoluteKResult> unwrapWithAbsoluteKPlane(
+    const cv::Mat1f& wrapped,
+    const cv::Mat1b& valid,
+    const std::vector<PhaseAnchorROI>& anchors,
+    float phase_fit_threshold) {
+
+    if (anchors.empty()) {
+        return std::nullopt;
+    }
+    const double cx = (wrapped.cols - 1) * 0.5;
+    const double cy = (wrapped.rows - 1) * 0.5;
+    const double coordinate_scale = static_cast<double>(std::max(wrapped.cols, wrapped.rows));
+    const double phase_limit = std::clamp(static_cast<double>(phase_fit_threshold), 0.0, 1.0) * kPi;
+    cv::Matx33d lhs = cv::Matx33d::zeros();
+    cv::Vec3d rhs(0.0, 0.0, 0.0);
+    long long sample_count = 0;
+
+    const cv::Rect image_rect(0, 0, wrapped.cols, wrapped.rows);
+    for (const PhaseAnchorROI& anchor : anchors) {
+        const cv::Rect roi = anchor.rect & image_rect;
+        for (int y = roi.y; y < roi.y + roi.height; ++y) {
+            const float* phase_row = wrapped.ptr<float>(y);
+            const uchar* valid_row = valid.ptr<uchar>(y);
+            for (int x = roi.x; x < roi.x + roi.width; ++x) {
+                const double phi = phase_row[x];
+                if (valid_row[x] == 0 || !std::isfinite(phi) || std::abs(phi) >= phase_limit) {
+                    continue;
+                }
+                const double xn = (static_cast<double>(x) - cx) / coordinate_scale;
+                const double yn = (static_cast<double>(y) - cy) / coordinate_scale;
+                const cv::Vec3d basis(xn, yn, 1.0);
+                const double absolute_phase = phi + static_cast<double>(anchor.k_order) * kTwoPi;
+                lhs += basis * basis.t();
+                rhs += basis * absolute_phase;
+                ++sample_count;
+            }
+        }
+    }
+    if (sample_count < 3) {
+        throw std::runtime_error("absolute-K plane has fewer than three stable anchor samples");
+    }
+
+    cv::Vec3d coeff;
+    if (!cv::solve(lhs, rhs, coeff, cv::DECOMP_SVD)) {
+        throw std::runtime_error("failed to fit absolute-K carrier plane");
+    }
+    std::cout << "  absolute K: normalized SVD carrier, anchors=" << anchors.size()
+              << ", samples=" << sample_count
+              << ", coeff=[" << coeff[0] << ", " << coeff[1] << ", " << coeff[2] << "]\n";
+
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    AbsoluteKResult result{
+        cv::Mat1f(wrapped.size(), nan),
+        cv::Mat1f(wrapped.size(), nan),
+        cv::Mat1f(wrapped.size(), nan),
+        cv::Mat1f(wrapped.size(), nan)};
+    for (int y = 0; y < wrapped.rows; ++y) {
+        const float* phase_row = wrapped.ptr<float>(y);
+        const uchar* valid_row = valid.ptr<uchar>(y);
+        float* unwrapped_row = result.unwrapped.ptr<float>(y);
+        float* carrier_row = result.carrier.ptr<float>(y);
+        float* residual_row = result.residual.ptr<float>(y);
+        float* k_row = result.k_order.ptr<float>(y);
+        const double yn = (static_cast<double>(y) - cy) / coordinate_scale;
+        for (int x = 0; x < wrapped.cols; ++x) {
+            if (valid_row[x] == 0 || !std::isfinite(phase_row[x])) {
+                continue;
+            }
+            const double xn = (static_cast<double>(x) - cx) / coordinate_scale;
+            const double carrier = coeff[0] * xn + coeff[1] * yn + coeff[2];
+            const int k = static_cast<int>(std::lround((carrier - phase_row[x]) / kTwoPi));
+            const double absolute_phase = phase_row[x] + static_cast<double>(k) * kTwoPi;
+            carrier_row[x] = static_cast<float>(carrier);
+            k_row[x] = static_cast<float>(k);
+            unwrapped_row[x] = static_cast<float>(absolute_phase);
+            residual_row[x] = static_cast<float>(absolute_phase - carrier);
+        }
+    }
+    return result;
 }
 
 std::vector<float> collectValid(const cv::Mat1f& values, const cv::Mat1b& valid, bool absolute_value = false) {
@@ -1050,7 +1149,13 @@ void processOne(const fs::path& phase_path, const fs::path& raw_dir, const fs::p
     cv::Mat1f modulation;
     std::optional<std::array<cv::Mat1f, 4>> raw_frames;
     if (cfg.decode_raw_phase) {
-        auto decoded = decodeFourStepPhase(raw_dir, cfg.raw_phase_start, cv::Size(), cfg.invert_phase, cfg.raw_phase_series);
+        auto decoded = decodeFourStepPhase(
+            raw_dir,
+            cfg.raw_phase_start,
+            cv::Size(),
+            cfg.invert_phase,
+            cfg.raw_phase_offset,
+            cfg.raw_phase_series);
         if (!decoded) {
             throw std::runtime_error("failed to decode four-step RAW phase: " + narrowAscii(raw_dir));
         }
@@ -1103,15 +1208,30 @@ void processOne(const fs::path& phase_path, const fs::path& raw_dir, const fs::p
     cv::Mat1f reliability = computeReliability(phase, valid);
     cv::Mat1f unwrapped = unwrapQualityGuided(phase, valid, reliability, &quality.confidence);
     std::cout << "  unwrap: reliability-guided union-find\n";
+    std::optional<AbsoluteKResult> absolute_k;
+    if (cfg.absolute_k_enabled) {
+        absolute_k = unwrapWithAbsoluteKPlane(
+            phase,
+            valid,
+            cfg.absolute_k_rois,
+            cfg.trend_fit_phase_threshold);
+        if (!absolute_k) {
+            throw std::runtime_error("absolute_k_enabled requires at least one absolute_k_roi");
+        }
+        unwrapped = absolute_k->unwrapped;
+        std::cout << "  unwrap: absolute K anchored by carrier plane\n";
+    }
     cv::Mat1f delta = circularLocalResidual(phase, valid, cfg.residual_radius);
     cv::Mat1f display_delta = subtractLocalBias(delta, valid, std::max(181, cfg.residual_radius * 3));
-    cv::Mat1f phase_background = robustLocalBackground(
-        unwrapped,
-        valid,
-        cfg.background_radius,
-        cfg.background_iterations,
-        cfg.background_outlier_scale);
-    cv::Mat1f phase_residual = unwrapped - phase_background;
+    cv::Mat1f phase_background = absolute_k
+        ? absolute_k->carrier
+        : robustLocalBackground(
+            unwrapped,
+            valid,
+            cfg.background_radius,
+            cfg.background_iterations,
+            cfg.background_outlier_scale);
+    cv::Mat1f phase_residual = absolute_k ? absolute_k->residual : unwrapped - phase_background;
     cv::Mat1f phase_relief = cfg.relief_smooth_radius > 0
         ? localMean(phase_residual, valid, cfg.relief_smooth_radius)
         : phase_residual;
@@ -1133,6 +1253,12 @@ void processOne(const fs::path& phase_path, const fs::path& raw_dir, const fs::p
     saveImage(sample_dir / L"phase_unwrapped.png", phase_unwrapped_visual);
     saveImage(sample_dir / L"phase_unwrapped_with_background.png", phase_unwrapped_with_background);
     saveImage(sample_dir / L"phase_wrapped.png", phase_wrapped_visual);
+    if (absolute_k) {
+        saveImage(sample_dir / L"phase_absolute_k.png", normalizeVisual(absolute_k->k_order, valid));
+        saveImage(sample_dir / L"phase_absolute_k_removed.png", deltaVisual(absolute_k->residual, valid, true));
+        saveImage(sample_dir / L"phase_absolute_k.tiff", absolute_k->k_order);
+        saveImage(sample_dir / L"phase_absolute_k_removed.tiff", absolute_k->residual);
+    }
     saveImage(sample_dir / L"phase_unwrapped_with_background_detail.png", overlaySignedDetailByThreshold(
         phase_unwrapped_with_background,
         defect_delta_visual,
@@ -1212,6 +1338,20 @@ std::wstring parseWideValue(const std::string& text) {
     return utf8ToWide(trimAscii(text));
 }
 
+PhaseAnchorROI parsePhaseAnchorROI(std::string text) {
+    std::replace(text.begin(), text.end(), ',', ' ');
+    std::istringstream input(text);
+    int x = 0;
+    int y = 0;
+    int width = 0;
+    int height = 0;
+    int k = 0;
+    if (!(input >> x >> y >> width >> height >> k) || width <= 0 || height <= 0) {
+        throw std::runtime_error("absolute_k_roi must be x,y,width,height,k");
+    }
+    return PhaseAnchorROI{cv::Rect(x, y, width, height), k};
+}
+
 void applyConfigValue(Config& cfg, const std::string& key, const std::string& value) {
     if (key == "phase" || key == "phase_path") {
         cfg.phase_path = parsePathValue(value);
@@ -1227,6 +1367,8 @@ void applyConfigValue(Config& cfg, const std::string& key, const std::string& va
         cfg.batch_root = parsePathValue(value);
     } else if (key == "invert_phase") {
         cfg.invert_phase = parseBoolValue(value);
+    } else if (key == "raw_phase_offset") {
+        cfg.raw_phase_offset = std::stof(value);
     } else if (key == "decode_raw_phase") {
         cfg.decode_raw_phase = parseBoolValue(value);
     } else if (key == "raw_phase_start") {
@@ -1245,6 +1387,10 @@ void applyConfigValue(Config& cfg, const std::string& key, const std::string& va
         cfg.modulation_erode_size = std::stoi(value);
     } else if (key == "use_modulation_mask") {
         cfg.use_modulation_mask = parseBoolValue(value);
+    } else if (key == "absolute_k_enabled") {
+        cfg.absolute_k_enabled = parseBoolValue(value);
+    } else if (key == "absolute_k_roi") {
+        cfg.absolute_k_rois.push_back(parsePhaseAnchorROI(value));
     } else if (key == "min_amplitude") {
         cfg.min_amplitude = std::stof(value);
     } else if (key == "good_amplitude") {
