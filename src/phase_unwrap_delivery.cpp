@@ -770,14 +770,16 @@ std::optional<AbsoluteKResult> unwrapWithAbsoluteKPlane(
         cv::Mat1f(wrapped.size(), nan)};
     for (int y = 0; y < wrapped.rows; ++y) {
         const float* phase_row = wrapped.ptr<float>(y);
-        const uchar* valid_row = valid.ptr<uchar>(y);
         float* unwrapped_row = result.unwrapped.ptr<float>(y);
         float* carrier_row = result.carrier.ptr<float>(y);
         float* residual_row = result.residual.ptr<float>(y);
         float* k_row = result.k_order.ptr<float>(y);
         const double yn = (static_cast<double>(y) - cy) / coordinate_scale;
         for (int x = 0; x < wrapped.cols; ++x) {
-            if (valid_row[x] == 0 || !std::isfinite(phase_row[x])) {
+            // The confidence mask controls carrier fitting, not output coverage.
+            // For rejected samples, retain the original wrapped phase and use
+            // the fitted carrier to infer K before subtracting the carrier.
+            if (!std::isfinite(phase_row[x])) {
                 continue;
             }
             const double xn = (static_cast<double>(x) - cx) / coordinate_scale;
@@ -1209,6 +1211,7 @@ void processOne(const fs::path& phase_path, const fs::path& raw_dir, const fs::p
     cv::Mat1f unwrapped = unwrapQualityGuided(phase, valid, reliability, &quality.confidence);
     std::cout << "  unwrap: reliability-guided union-find\n";
     std::optional<AbsoluteKResult> absolute_k;
+    cv::Mat1b output_valid = valid.clone();
     if (cfg.absolute_k_enabled) {
         absolute_k = unwrapWithAbsoluteKPlane(
             phase,
@@ -1219,50 +1222,52 @@ void processOne(const fs::path& phase_path, const fs::path& raw_dir, const fs::p
             throw std::runtime_error("absolute_k_enabled requires at least one absolute_k_roi");
         }
         unwrapped = absolute_k->unwrapped;
+        output_valid = cv::Mat1b(phase.size(), uchar(255));
         std::cout << "  unwrap: absolute K anchored by carrier plane\n";
+        std::cout << "  output coverage: full phase image; rejected integration samples use wrapped phase + inferred K\n";
     }
-    cv::Mat1f delta = circularLocalResidual(phase, valid, cfg.residual_radius);
-    cv::Mat1f display_delta = subtractLocalBias(delta, valid, std::max(181, cfg.residual_radius * 3));
+    cv::Mat1f delta = circularLocalResidual(phase, output_valid, cfg.residual_radius);
+    cv::Mat1f display_delta = subtractLocalBias(delta, output_valid, std::max(181, cfg.residual_radius * 3));
     cv::Mat1f phase_background = absolute_k
         ? absolute_k->carrier
         : robustLocalBackground(
             unwrapped,
-            valid,
+            output_valid,
             cfg.background_radius,
             cfg.background_iterations,
             cfg.background_outlier_scale);
     cv::Mat1f phase_residual = absolute_k ? absolute_k->residual : unwrapped - phase_background;
     cv::Mat1f phase_relief = cfg.relief_smooth_radius > 0
-        ? localMean(phase_residual, valid, cfg.relief_smooth_radius)
+        ? localMean(phase_residual, output_valid, cfg.relief_smooth_radius)
         : phase_residual;
     cv::Mat1f phase_unwrapped_detrended = planeDetrended(
         unwrapped,
         phase,
-        valid,
+        output_valid,
         cfg.trend_fit_phase_threshold);
 
-    cv::Mat1b phase_unwrapped_visual = normalizeVisual(phase_unwrapped_detrended, valid);
+    cv::Mat1b phase_unwrapped_visual = normalizeVisual(phase_unwrapped_detrended, output_valid);
     cv::Mat1b phase_wrapped_visual = wrappedPhaseVisual(phase);
-    cv::Mat1b defect_delta_raw_visual = deltaVisual(delta, valid, true);
-    cv::Mat1b defect_delta_visual = deltaVisual(display_delta, valid, true);
-    cv::Mat1b phase_unwrapped_with_background = compositeWithBackground(phase_unwrapped_visual, phase_wrapped_visual, valid);
+    cv::Mat1b defect_delta_raw_visual = deltaVisual(delta, output_valid, true);
+    cv::Mat1b defect_delta_visual = deltaVisual(display_delta, output_valid, true);
+    cv::Mat1b phase_unwrapped_with_background = compositeWithBackground(phase_unwrapped_visual, phase_wrapped_visual, output_valid);
 
     saveImage(sample_dir / L"defect_delta.png", defect_delta_visual);
     saveImage(sample_dir / L"defect_delta_raw.png", defect_delta_raw_visual);
-    saveImage(sample_dir / L"phase_relief.png", deltaVisual(phase_relief, valid, true));
+    saveImage(sample_dir / L"phase_relief.png", deltaVisual(phase_relief, output_valid, true));
     saveImage(sample_dir / L"phase_unwrapped.png", phase_unwrapped_visual);
     saveImage(sample_dir / L"phase_unwrapped_with_background.png", phase_unwrapped_with_background);
     saveImage(sample_dir / L"phase_wrapped.png", phase_wrapped_visual);
     if (absolute_k) {
-        saveImage(sample_dir / L"phase_absolute_k.png", normalizeVisual(absolute_k->k_order, valid));
-        saveImage(sample_dir / L"phase_absolute_k_removed.png", deltaVisual(absolute_k->residual, valid, true));
+        saveImage(sample_dir / L"phase_absolute_k.png", normalizeVisual(absolute_k->k_order, output_valid));
+        saveImage(sample_dir / L"phase_absolute_k_removed.png", deltaVisual(absolute_k->residual, output_valid, true));
         saveImage(sample_dir / L"phase_absolute_k.tiff", absolute_k->k_order);
         saveImage(sample_dir / L"phase_absolute_k_removed.tiff", absolute_k->residual);
     }
     saveImage(sample_dir / L"phase_unwrapped_with_background_detail.png", overlaySignedDetailByThreshold(
         phase_unwrapped_with_background,
         defect_delta_visual,
-        valid,
+        output_valid,
         cfg.detail_overlay_threshold));
 }
 

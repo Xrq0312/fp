@@ -69,3 +69,6 @@ phase_wrapped.png
 
 When `absolute_k_enabled=true`, the run additionally writes 8-bit previews and
 32-bit float TIFF data for `phase_absolute_k` and `phase_absolute_k_removed`.
+The quality mask controls fitting/integration only; rejected integration pixels
+retain their wrapped phase and use the fitted carrier to infer K, so absolute-K
+outputs cover the full phase image rather than storing NaN gaps.
