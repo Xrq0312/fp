@@ -45,6 +45,7 @@ struct Config {
     float modulation_min_weak_ratio_for_otsu = 0.20f;
     float modulation_otsu_cap_pct = 25.0f;
     int modulation_erode_size = 0;
+    bool use_modulation_mask = true;
     float min_amplitude = 4.0f;
     float good_amplitude = 20.0f;
     float residual_scale = 0.35f;
@@ -1078,7 +1079,7 @@ void processOne(const fs::path& phase_path, const fs::path& raw_dir, const fs::p
     }
 
     std::optional<cv::Mat1b> modulation_mask;
-    if (raw_frames) {
+    if (raw_frames && cfg.use_modulation_mask) {
         modulation_mask = buildModulationMask(*raw_frames, cfg);
     }
     PixelQuality quality;
@@ -1093,6 +1094,11 @@ void processOne(const fs::path& phase_path, const fs::path& raw_dir, const fs::p
         std::cout << "  mask: phase-only confidence\n";
     }
     cv::Mat1b valid = modulation_mask ? modulation_mask->clone() : quality.valid;
+    const double valid_ratio = static_cast<double>(cv::countNonZero(valid)) /
+        static_cast<double>(valid.rows * valid.cols);
+    std::cout << "  integration mask: "
+              << (modulation_mask ? "Otsu modulation" : "per-pixel quality confidence")
+              << ", valid=" << valid_ratio * 100.0 << "%\n";
 
     cv::Mat1f reliability = computeReliability(phase, valid);
     cv::Mat1f unwrapped = unwrapQualityGuided(phase, valid, reliability, &quality.confidence);
@@ -1237,6 +1243,8 @@ void applyConfigValue(Config& cfg, const std::string& key, const std::string& va
         cfg.modulation_otsu_cap_pct = std::stof(value);
     } else if (key == "modulation_erode_size") {
         cfg.modulation_erode_size = std::stoi(value);
+    } else if (key == "use_modulation_mask") {
+        cfg.use_modulation_mask = parseBoolValue(value);
     } else if (key == "min_amplitude") {
         cfg.min_amplitude = std::stof(value);
     } else if (key == "good_amplitude") {
