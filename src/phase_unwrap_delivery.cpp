@@ -1287,6 +1287,8 @@ void processOne(const fs::path& phase_path, const fs::path& raw_dir, const fs::p
     saveImage(sample_dir / L"defect_delta_raw.png", defect_delta_raw_visual);
     saveImage(sample_dir / L"phase_relief.png", deltaVisual(phase_relief, output_valid, true));
     saveImage(sample_dir / L"phase_unwrapped.png", phase_unwrapped_visual);
+    saveImage(sample_dir / L"phase_unwrapped.tiff", unwrapped);
+    saveImage(sample_dir / L"phase_unwrapped_detrended.tiff", phase_unwrapped_detrended);
     saveImage(sample_dir / L"phase_unwrapped_with_background.png", phase_unwrapped_with_background);
     saveImage(sample_dir / L"phase_wrapped.png", phase_wrapped_visual);
     if (absolute_k) {
