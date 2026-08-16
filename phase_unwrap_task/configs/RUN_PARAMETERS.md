@@ -8,7 +8,7 @@ This file summarizes the current per-sample config files and the shared defaults
 | Sample | Config | Phase input | RAW input | Output dir | Prefix | Decode RAW phase | RAW series |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | data1 | `data1.cfg` | `PMD_DATA/数据1 - 存在噪声/PHASEX.bmp` | `PMD_DATA/数据1 - 存在噪声/RAW` | `phase_unwrap_task/results_rerun_cfg` | `data1_phasex` | `false` | empty |
-| data2 | `data2.cfg` | `PMD_DATA/数据2 - 存在背景区域/PHASEX.bmp` | `PMD_DATA/数据2 - 存在背景区域/RAW` | `phase_unwrap_task/results_rerun_cfg` | `data2_phasex` | `false` | empty |
+| data2 | `data2.cfg` | unused | `data_phase_unwrap/data2/RAW` | `phase_unwrap_task/results_delivery` | `data2_raw` | `true` | empty |
 | aluminum_x | `aluminum_x.cfg` | `PMD_DATA/铝壳single/MP.X1.bmp` | `PMD_DATA/铝壳single` | `phase_unwrap_task/results_aluminum_cfg` | `aluminum_x` | `true` | `X` |
 | aluminum_y | `aluminum_y.cfg` | `PMD_DATA/铝壳single/MP.Y1.bmp` | `PMD_DATA/铝壳single` | `phase_unwrap_task/results_aluminum_cfg` | `aluminum_y` | `true` | `Y` |
 | aluminum_x rerun | `aluminum_x_rerun.cfg` | `PMD_DATA/铝壳single/MP.X1.bmp` | `PMD_DATA/铝壳single` | `phase_unwrap_task/results_rerun_cfg` | `aluminum_x` | `true` | `X` |
@@ -26,6 +26,7 @@ The two aluminum rerun configs are the same as `aluminum_x.cfg` / `aluminum_y.cf
 | `modulation_min_weak_ratio_for_otsu` | `0.2` |
 | `modulation_otsu_cap_pct` | `25.0` |
 | `modulation_erode_size` | `0` |
+| `trend_fit_phase_threshold` | `0.6` for data2; default `0.6` | Excludes wrapped samples near +/-pi from normalized SVD trend fitting. |
 
 ## Shared Defaults
 
@@ -62,4 +63,3 @@ phase_unwrapped_with_background.png
 phase_unwrapped_with_background_detail.png
 phase_wrapped.png
 ```
-

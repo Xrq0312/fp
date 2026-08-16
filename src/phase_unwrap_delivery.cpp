@@ -63,6 +63,7 @@ struct Config {
     float phase_display_high_pct = 99.5f;
     float competitor_absolute_low_pct = 0.5f;
     float competitor_absolute_high_pct = 99.5f;
+    float trend_fit_phase_threshold = 0.6f;
 };
 
 struct Edge {
@@ -336,6 +337,9 @@ std::optional<std::array<cv::Mat1f, 4>> loadFourStepFrames(
             return std::nullopt;
         }
         cv::Mat gray = loadGray(path);
+        if (i == 0 && expected_size.empty()) {
+            expected_size = gray.size();
+        }
         if (gray.size() != expected_size) {
             return std::nullopt;
         }
@@ -355,6 +359,7 @@ std::optional<DecodedPhase> decodeFourStepPhase(
         return std::nullopt;
     }
 
+    expected_size = (*images)[0].size();
     cv::Mat1f phase(expected_size, 0.0f);
     cv::Mat1f modulation(expected_size, 0.0f);
     const float sign = invert_phase ? -1.0f : 1.0f;
@@ -792,35 +797,38 @@ cv::Mat1b overlaySignedDetailByThreshold(
 cv::Mat1f localWeightedMean(const cv::Mat1f& values, const cv::Mat1f& weights, int radius);
 cv::Mat1f validToWeights(const cv::Mat1f& values, const cv::Mat1b& valid);
 
-cv::Mat1f planeDetrended(const cv::Mat1f& values, const cv::Mat1b& valid) {
-    double sx = 0.0;
-    double sy = 0.0;
-    double sz = 0.0;
-    double sxx = 0.0;
-    double sxy = 0.0;
-    double syy = 0.0;
-    double sxz = 0.0;
-    double syz = 0.0;
+cv::Mat1f planeDetrended(
+    const cv::Mat1f& values,
+    const cv::Mat1f& wrapped_phase,
+    const cv::Mat1b& valid,
+    float phase_fit_threshold) {
+
+    // Centered, normalized coordinates keep the least-squares system well
+    // conditioned on multi-megapixel images. Wrapped samples near +/-pi are
+    // excluded because four-step decoding is least stable at the branch cut.
+    const double cx = (values.cols - 1) * 0.5;
+    const double cy = (values.rows - 1) * 0.5;
+    const double coordinate_scale = static_cast<double>(std::max(values.cols, values.rows));
+    const double phase_limit = std::clamp(static_cast<double>(phase_fit_threshold), 0.0, 1.0) * kPi;
+    cv::Matx33d lhs = cv::Matx33d::zeros();
+    cv::Vec3d rhs(0.0, 0.0, 0.0);
     double n = 0.0;
 
     for (int y = 0; y < values.rows; ++y) {
         const float* row = values.ptr<float>(y);
+        const float* phase_row = wrapped_phase.ptr<float>(y);
         const uchar* vm = valid.ptr<uchar>(y);
         for (int x = 0; x < values.cols; ++x) {
-            if (vm[x] == 0 || !std::isfinite(row[x])) {
+            if (vm[x] == 0 || !std::isfinite(row[x]) || !std::isfinite(phase_row[x]) ||
+                std::abs(phase_row[x]) >= phase_limit) {
                 continue;
             }
-            const double xd = static_cast<double>(x);
-            const double yd = static_cast<double>(y);
+            const double xd = (static_cast<double>(x) - cx) / coordinate_scale;
+            const double yd = (static_cast<double>(y) - cy) / coordinate_scale;
             const double zd = static_cast<double>(row[x]);
-            sx += xd;
-            sy += yd;
-            sz += zd;
-            sxx += xd * xd;
-            sxy += xd * yd;
-            syy += yd * yd;
-            sxz += xd * zd;
-            syz += yd * zd;
+            const cv::Vec3d basis(xd, yd, 1.0);
+            lhs += basis * basis.t();
+            rhs += basis * zd;
             n += 1.0;
         }
     }
@@ -829,12 +837,13 @@ cv::Mat1f planeDetrended(const cv::Mat1f& values, const cv::Mat1b& valid) {
         return values.clone();
     }
 
-    cv::Matx33d lhs(sxx, sxy, sx, sxy, syy, sy, sx, sy, n);
-    cv::Vec3d rhs(sxz, syz, sz);
     cv::Vec3d coeff;
-    if (!cv::solve(lhs, rhs, coeff, cv::DECOMP_CHOLESKY)) {
+    if (!cv::solve(lhs, rhs, coeff, cv::DECOMP_SVD)) {
         return values.clone();
     }
+    std::cout << "  trend: normalized SVD plane, stable samples="
+              << static_cast<long long>(n)
+              << ", coeff=[" << coeff[0] << ", " << coeff[1] << ", " << coeff[2] << "]\n";
 
     float center = percentile(collectValid(values, valid), 50.0);
     cv::Mat1f out(values.rows, values.cols, std::numeric_limits<float>::quiet_NaN());
@@ -846,7 +855,9 @@ cv::Mat1f planeDetrended(const cv::Mat1f& values, const cv::Mat1b& valid) {
             if (vm[x] == 0 || !std::isfinite(src[x])) {
                 continue;
             }
-            double plane = coeff[0] * static_cast<double>(x) + coeff[1] * static_cast<double>(y) + coeff[2];
+            const double xn = (static_cast<double>(x) - cx) / coordinate_scale;
+            const double yn = (static_cast<double>(y) - cy) / coordinate_scale;
+            double plane = coeff[0] * xn + coeff[1] * yn + coeff[2];
             dst[x] = static_cast<float>(static_cast<double>(src[x]) - plane + center);
         }
     }
@@ -1028,24 +1039,24 @@ cv::Mat1b deltaVisual(const cv::Mat1f& delta, const cv::Mat1b& valid, bool signe
 }
 
 void processOne(const fs::path& phase_path, const fs::path& raw_dir, const fs::path& out_dir, const std::wstring& prefix, const Config& cfg) {
-    std::wcout << L"[phase_unwrap] " << phase_path.wstring() << L"\n";
-    cv::Mat gray = loadGray(phase_path);
+    std::wcout << L"[phase_unwrap] " << (cfg.decode_raw_phase ? raw_dir.wstring() : phase_path.wstring()) << L"\n";
+    cv::Mat gray;
     cv::Mat1f phase;
     cv::Mat1f modulation;
     std::optional<std::array<cv::Mat1f, 4>> raw_frames;
     if (cfg.decode_raw_phase) {
-        auto decoded = decodeFourStepPhase(raw_dir, cfg.raw_phase_start, gray.size(), cfg.invert_phase, cfg.raw_phase_series);
-        if (decoded) {
-            phase = decoded->phase;
-            modulation = decoded->modulation;
-            raw_frames = decoded->frames;
-            std::cout << "  phase: four-step RAW decode\n";
-        } else {
-            std::cout << "  phase: RAW decode unavailable, using phase image\n";
+        auto decoded = decodeFourStepPhase(raw_dir, cfg.raw_phase_start, cv::Size(), cfg.invert_phase, cfg.raw_phase_series);
+        if (!decoded) {
+            throw std::runtime_error("failed to decode four-step RAW phase: " + narrowAscii(raw_dir));
         }
-    }
-    if (phase.empty()) {
+        phase = decoded->phase;
+        modulation = decoded->modulation;
+        raw_frames = decoded->frames;
+        std::cout << "  phase: four-step RAW decode (no phase-image fallback)\n";
+    } else {
+        gray = loadGray(phase_path);
         phase = grayToPhase(gray, cfg.invert_phase);
+        std::cout << "  phase: encoded phase image\n";
     }
 
     fs::create_directories(out_dir);
@@ -1059,7 +1070,7 @@ void processOne(const fs::path& phase_path, const fs::path& raw_dir, const fs::p
     }
 
     if (!raw_frames) {
-        raw_frames = loadFourStepFrames(raw_dir, cfg.raw_phase_start, gray.size(), cfg.raw_phase_series);
+        raw_frames = loadFourStepFrames(raw_dir, cfg.raw_phase_start, phase.size(), cfg.raw_phase_series);
     }
 
     std::optional<cv::Mat1b> modulation_mask;
@@ -1094,7 +1105,11 @@ void processOne(const fs::path& phase_path, const fs::path& raw_dir, const fs::p
     cv::Mat1f phase_relief = cfg.relief_smooth_radius > 0
         ? localMean(phase_residual, valid, cfg.relief_smooth_radius)
         : phase_residual;
-    cv::Mat1f phase_unwrapped_detrended = planeDetrended(unwrapped, valid);
+    cv::Mat1f phase_unwrapped_detrended = planeDetrended(
+        unwrapped,
+        phase,
+        valid,
+        cfg.trend_fit_phase_threshold);
 
     cv::Mat1b phase_unwrapped_visual = normalizeVisual(phase_unwrapped_detrended, valid);
     cv::Mat1b phase_wrapped_visual = wrappedPhaseVisual(phase);
@@ -1254,6 +1269,8 @@ void applyConfigValue(Config& cfg, const std::string& key, const std::string& va
         cfg.competitor_absolute_low_pct = std::stof(value);
     } else if (key == "competitor_absolute_high_pct") {
         cfg.competitor_absolute_high_pct = std::stof(value);
+    } else if (key == "trend_fit_phase_threshold") {
+        cfg.trend_fit_phase_threshold = std::stof(value);
     } else {
         throw std::runtime_error("unknown config key: " + key);
     }
@@ -1347,8 +1364,12 @@ int wmain(int argc, wchar_t** argv) {
             return 0;
         }
 
-        if (cfg.phase_path.empty()) {
-            std::cerr << "error: phase_path is required when batch=false\n";
+        if (cfg.decode_raw_phase && cfg.raw_dir.empty()) {
+            std::cerr << "error: raw_dir is required when decode_raw_phase=true\n";
+            return 2;
+        }
+        if (!cfg.decode_raw_phase && cfg.phase_path.empty()) {
+            std::cerr << "error: phase_path is required when decode_raw_phase=false\n";
             return 2;
         }
         processOne(cfg.phase_path, cfg.raw_dir, cfg.out_dir, cfg.prefix, cfg);
