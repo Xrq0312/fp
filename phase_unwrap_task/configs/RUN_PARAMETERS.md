@@ -25,8 +25,8 @@ The two aluminum rerun configs are the same as `aluminum_x.cfg` / `aluminum_y.cf
 | `modulation_abs_floor` | `4.0` |
 | `use_modulation_mask` | `false` for data2; default `true` | Data2 integrates across the image using per-pixel quality confidence instead of hard Otsu segmentation. |
 | `raw_phase_offset` | `pi/2` for data2; default `0` | With `invert_phase=true`, aligns RAW decoding to the phase convention used by the supplied absolute-K anchors. |
-| `absolute_k_enabled` | `true` for data2; default `false` | Fits a normalized SVD carrier from repeated `absolute_k_roi=x,y,w,h,K` anchors and subtracts it. |
-| `integration_roi` | `100,1200,4701,2401` for data2 | Only x=100..4800 and y=1200..3600 participate in integration/fitting; outside pixels retain wrapped phase and use inferred K. |
+| `absolute_k_enabled` | `true` for data2; default `false` | Fits a normalized SVD carrier from repeated `absolute_k_roi=x,y,w,h,K` anchors; each connected integration region receives one integer K offset so the correction cannot create pixelwise 2-pi seams. |
+| `integration_roi` | `100,1200,4701,2401` for data2 | Only the selected `x,y,width,height` rectangle participates in integration; outside pixels retain the original wrapped phase and directly subtract the fitted carrier K. |
 | `modulation_min_weak_ratio_for_otsu` | `0.2` | Used only when `use_modulation_mask=true`. |
 | `modulation_otsu_cap_pct` | `25.0` | Used only when `use_modulation_mask=true`. |
 | `modulation_erode_size` | `0` |

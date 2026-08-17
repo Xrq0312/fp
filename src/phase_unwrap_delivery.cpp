@@ -770,12 +770,49 @@ std::optional<AbsoluteKResult> unwrapWithAbsoluteKPlane(
         cv::Mat1f(wrapped.size(), nan),
         cv::Mat1f(wrapped.size(), nan),
         cv::Mat1f(wrapped.size(), nan)};
+
+    // The quality-guided integration has already established the relative
+    // fringe orders inside each 4-connected valid region.  Align an entire
+    // region to the carrier with one integer offset; choosing K independently
+    // at every pixel can otherwise reintroduce artificial +/-2*pi seams.
+    cv::Mat1i component_labels;
+    const int component_count = cv::connectedComponents(valid, component_labels, 4, CV_32S);
+    std::vector<double> offset_sum(static_cast<size_t>(component_count), 0.0);
+    std::vector<long long> offset_count(static_cast<size_t>(component_count), 0);
+    for (int y = 0; y < wrapped.rows; ++y) {
+        const float* integrated_row = integrated_unwrapped.ptr<float>(y);
+        const uchar* valid_row = valid.ptr<uchar>(y);
+        const int* label_row = component_labels.ptr<int>(y);
+        const double yn = (static_cast<double>(y) - cy) / coordinate_scale;
+        for (int x = 0; x < wrapped.cols; ++x) {
+            if (valid_row[x] == 0 || !std::isfinite(integrated_row[x])) {
+                continue;
+            }
+            const double xn = (static_cast<double>(x) - cx) / coordinate_scale;
+            const double carrier = coeff[0] * xn + coeff[1] * yn + coeff[2];
+            const int candidate_offset = static_cast<int>(
+                std::lround((carrier - integrated_row[x]) / kTwoPi));
+            const int label = label_row[x];
+            offset_sum[static_cast<size_t>(label)] += candidate_offset;
+            ++offset_count[static_cast<size_t>(label)];
+        }
+    }
+    std::vector<int> component_offsets(static_cast<size_t>(component_count), 0);
+    for (int label = 1; label < component_count; ++label) {
+        const long long count = offset_count[static_cast<size_t>(label)];
+        if (count != 0) {
+            component_offsets[static_cast<size_t>(label)] = static_cast<int>(
+                std::lround(offset_sum[static_cast<size_t>(label)] / static_cast<double>(count)));
+        }
+    }
+
     long long integrated_count = 0;
     long long fallback_count = 0;
     for (int y = 0; y < wrapped.rows; ++y) {
         const float* phase_row = wrapped.ptr<float>(y);
         const float* integrated_row = integrated_unwrapped.ptr<float>(y);
         const uchar* valid_row = valid.ptr<uchar>(y);
+        const int* label_row = component_labels.ptr<int>(y);
         float* unwrapped_row = result.unwrapped.ptr<float>(y);
         float* carrier_row = result.carrier.ptr<float>(y);
         float* residual_row = result.residual.ptr<float>(y);
@@ -792,8 +829,7 @@ std::optional<AbsoluteKResult> unwrapWithAbsoluteKPlane(
             const double carrier = coeff[0] * xn + coeff[1] * yn + coeff[2];
             double absolute_phase = 0.0;
             if (valid_row[x] != 0 && std::isfinite(integrated_row[x])) {
-                const int component_offset = static_cast<int>(
-                    std::lround((carrier - integrated_row[x]) / kTwoPi));
+                const int component_offset = component_offsets[static_cast<size_t>(label_row[x])];
                 absolute_phase = integrated_row[x] + static_cast<double>(component_offset) * kTwoPi;
                 ++integrated_count;
             } else {
@@ -810,7 +846,8 @@ std::optional<AbsoluteKResult> unwrapWithAbsoluteKPlane(
             residual_row[x] = static_cast<float>(absolute_phase - carrier);
         }
     }
-    std::cout << "  absolute K merge: integrated=" << integrated_count
+    std::cout << "  absolute K merge: connected regions=" << component_count - 1
+              << ", integrated=" << integrated_count
               << ", wrapped-phase fallback=" << fallback_count << "\n";
     return result;
 }
@@ -1290,6 +1327,7 @@ void processOne(const fs::path& phase_path, const fs::path& raw_dir, const fs::p
 
     saveImage(sample_dir / L"defect_delta.png", defect_delta_visual);
     saveImage(sample_dir / L"defect_delta_raw.png", defect_delta_raw_visual);
+    saveImage(sample_dir / L"integration_mask.png", valid);
     saveImage(sample_dir / L"phase_relief.png", deltaVisual(phase_relief, output_valid, true));
     saveImage(sample_dir / L"phase_unwrapped.png", phase_unwrapped_visual);
     saveImage(sample_dir / L"phase_unwrapped.tiff", unwrapped);
