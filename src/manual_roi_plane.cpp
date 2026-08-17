@@ -494,31 +494,13 @@ bool unwrapPhaseWithROIPlane(
         }
     });
 
-    const PeriodicCalibration calibration = fitPeriodicCalibration(phase64, plane_coeffs);
+    // Keep the measured phase unchanged.  A periodic response curve cannot be
+    // identified from this object measurement alone: the fitted curve also
+    // absorbs real, spatially non-linear phase.  Applying it once per 2*pi
+    // period creates carrier-aligned bands in the residual image.
     periodic_correction_lut = cv::Mat1f(1, 256, 0.0f);
-    for (int code = 0; code < 256; ++code) {
-        const double phase = code * (2.0 * CV_PI / 255.0) - CV_PI;
-        periodic_correction_lut(0, code) = calibration.applied
-            ? static_cast<float>(periodicError(calibration.harmonic, phase))
-            : 0.0f;
-    }
-    if (calibration.applied) {
-        cv::parallel_for_(cv::Range(0, height), [&](const cv::Range& range) {
-            for (int y = range.start; y < range.end; ++y) {
-                double* row = phase64.ptr<double>(y);
-                for (int x = 0; x < width; ++x) {
-                    row[x] = wrapPi(row[x] - periodicError(calibration.harmonic, row[x]));
-                }
-            }
-        });
-        if (!fitCarrierPlane(phase64, rois, plane_coeffs, row_index)) {
-            return false;
-        }
-    }
     corrected_phase = phase64.clone();
-    std::cout << "periodic calibration: p2p=" << calibration.peak_to_peak
-              << " rad, minimum derivative=" << calibration.minimum_derivative
-              << ", applied=" << (calibration.applied ? "yes" : "no") << "\n";
+    std::cout << "periodic calibration: disabled; original measured phase preserved\n";
 
     unwrapped.create(height, width, CV_64FC1);
     residual.create(height, width, CV_64FC1);
@@ -593,6 +575,40 @@ void saveNormalized(const fs::path& path, const cv::Mat& source) {
     cv::Mat out;
     cv::normalize(source, out, 0, 255, cv::NORM_MINMAX, CV_8UC1);
     if (!cv::imwrite(path.string(), out)) {
+        throw std::runtime_error("failed to write " + path.string());
+    }
+}
+
+void saveQuantizationAwarePreview(
+    const fs::path& path,
+    const cv::Mat& source,
+    double gain,
+    double bias) {
+    CV_Assert(source.type() == CV_64FC1);
+    cv::Mat1b preview(source.size());
+    const double amplified_input_quantum = std::abs(gain) * (2.0 * CV_PI / 255.0);
+    cv::parallel_for_(cv::Range(0, source.rows), [&](const cv::Range& range) {
+        for (int y = range.start; y < range.end; ++y) {
+            const double* source_row = source.ptr<double>(y);
+            uchar* preview_row = preview.ptr<uchar>(y);
+            for (int x = 0; x < source.cols; ++x) {
+                // The source phase is an 8-bit BMP.  At gain=-200 one source
+                // code becomes a 4.93-level display step, which otherwise
+                // forms false contour lines.  Deterministic zero-mean dither
+                // represents that unavoidable quantization uncertainty in the
+                // preview only; the float TIFF remains untouched.
+                uint32_t hash = static_cast<uint32_t>(x) * 0x9e3779b9U ^
+                    static_cast<uint32_t>(y) * 0x85ebca6bU;
+                hash ^= hash >> 16U;
+                hash *= 0x7feb352dU;
+                hash ^= hash >> 15U;
+                const double unit = static_cast<double>(hash & 0xffffU) / 65535.0 - 0.5;
+                const double value = source_row[x] * gain + bias + unit * amplified_input_quantum;
+                preview_row[x] = cv::saturate_cast<uchar>(value);
+            }
+        }
+    });
+    if (!cv::imwrite(path.string(), preview)) {
         throw std::runtime_error("failed to write " + path.string());
     }
 }
@@ -695,15 +711,26 @@ int main(int argc, char** argv) {
 
         cv::Mat residual_kb;
         residual.convertTo(residual_kb, CV_8UC1, -200.0, 128.0);
-        cv::imwrite((output / "residualPhase_k-200_b128.png").string(), residual_kb);
+        cv::imwrite((output / "residualPhase_k-200_b128_quantized.png").string(), residual_kb);
+        saveQuantizationAwarePreview(output / "residualPhase_k-200_b128.png", residual, -200.0, 128.0);
 
         cv::Mat simple_residual_kb;
         wrapped_residual.convertTo(simple_residual_kb, CV_8UC1, -200.0, 128.0);
-        cv::imwrite((output / "residualPhase_simple_detail_k-200_b128.png").string(), simple_residual_kb);
+        cv::imwrite((output / "residualPhase_simple_detail_k-200_b128_quantized.png").string(), simple_residual_kb);
+        saveQuantizationAwarePreview(
+            output / "residualPhase_simple_detail_k-200_b128.png",
+            wrapped_residual,
+            -200.0,
+            128.0);
 
         cv::Mat uncalibrated_kb;
         uncalibrated_residual.convertTo(uncalibrated_kb, CV_8UC1, -200.0, 128.0);
-        cv::imwrite((output / "residualPhase_uncalibrated_k-200_b128.png").string(), uncalibrated_kb);
+        cv::imwrite((output / "residualPhase_uncalibrated_k-200_b128_quantized.png").string(), uncalibrated_kb);
+        saveQuantizationAwarePreview(
+            output / "residualPhase_uncalibrated_k-200_b128.png",
+            uncalibrated_residual,
+            -200.0,
+            128.0);
 
         cv::Mat roi_visual;
         cv::cvtColor(phase, roi_visual, cv::COLOR_GRAY2BGR);
