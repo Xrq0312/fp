@@ -1,8 +1,10 @@
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
 #include <iostream>
+#include <limits>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -291,13 +293,168 @@ std::vector<PhaseROI> roisForAxis(const std::string& axis, int set_index) {
     throw std::runtime_error("axis must be x or y");
 }
 
+bool fitCarrierPlane(
+    const cv::Mat& phase64,
+    const std::vector<PhaseROI>& rois,
+    cv::Vec3d& coefficients,
+    int& sample_count) {
+    const int width = phase64.cols;
+    const int height = phase64.rows;
+    const double cx = width / 2.0;
+    const double cy = height / 2.0;
+    const double inv_scale = 1.0 / static_cast<double>(std::max(width, height));
+    int capacity = 0;
+    for (const auto& roi : rois) {
+        capacity += (roi.rect & cv::Rect(0, 0, width, height)).area();
+    }
+    cv::Mat design(capacity, 3, CV_64FC1);
+    cv::Mat target(capacity, 1, CV_64FC1);
+    sample_count = 0;
+    for (const auto& roi : rois) {
+        const cv::Rect clipped = roi.rect & cv::Rect(0, 0, width, height);
+        for (int y = clipped.y; y < clipped.y + clipped.height; ++y) {
+            const double yn = (static_cast<double>(y) - cy) * inv_scale;
+            const double* phase_row = phase64.ptr<double>(y);
+            for (int x = clipped.x; x < clipped.x + clipped.width; ++x) {
+                const double wrapped = phase_row[x];
+                if (std::abs(wrapped) >= kPhaseFitThreshold * CV_PI) {
+                    continue;
+                }
+                design.at<double>(sample_count, 0) = (static_cast<double>(x) - cx) * inv_scale;
+                design.at<double>(sample_count, 1) = yn;
+                design.at<double>(sample_count, 2) = 1.0;
+                target.at<double>(sample_count, 0) = wrapped + roi.k_order * 2.0 * CV_PI;
+                ++sample_count;
+            }
+        }
+    }
+    if (sample_count < 3) {
+        return false;
+    }
+    cv::Mat solved;
+    if (!cv::solve(
+            design.rowRange(0, sample_count),
+            target.rowRange(0, sample_count),
+            solved,
+            cv::DECOMP_SVD)) {
+        return false;
+    }
+    coefficients = cv::Vec3d(
+        solved.at<double>(0, 0),
+        solved.at<double>(1, 0),
+        solved.at<double>(2, 0));
+    return true;
+}
+
+struct PeriodicCalibration {
+    std::array<double, 8> harmonic{};
+    double peak_to_peak = 0.0;
+    double minimum_derivative = 1.0;
+    bool applied = false;
+};
+
+double periodicError(const std::array<double, 8>& harmonic, double phase) {
+    double value = 0.0;
+    for (int order = 1; order <= 4; ++order) {
+        value += harmonic[static_cast<size_t>((order - 1) * 2)] * std::sin(order * phase);
+        value += harmonic[static_cast<size_t>((order - 1) * 2 + 1)] * std::cos(order * phase);
+    }
+    return value;
+}
+
+PeriodicCalibration fitPeriodicCalibration(const cv::Mat& phase64, const cv::Vec3d& plane) {
+    constexpr int feature_count = 14;
+    constexpr int sample_step = 4;
+    constexpr double huber_delta = 0.08;
+    const int width = phase64.cols;
+    const int height = phase64.rows;
+    const double cx = width / 2.0;
+    const double cy = height / 2.0;
+    const double inv_scale = 1.0 / static_cast<double>(std::max(width, height));
+    const cv::Rect calibration_roi = cv::Rect(1000, 1200, 5801, 2701) &
+        cv::Rect(0, 0, width, height);
+    std::array<double, feature_count> coefficients{};
+
+    for (int iteration = 0; iteration < 5; ++iteration) {
+        cv::Mat1d lhs(feature_count, feature_count, 0.0);
+        cv::Mat1d rhs(feature_count, 1, 0.0);
+        for (int y = calibration_roi.y; y < calibration_roi.y + calibration_roi.height; y += sample_step) {
+            const double yn = (static_cast<double>(y) - cy) * inv_scale;
+            const double* phase_row = phase64.ptr<double>(y);
+            for (int x = calibration_roi.x; x < calibration_roi.x + calibration_roi.width; x += sample_step) {
+                const double xn = (static_cast<double>(x) - cx) * inv_scale;
+                const double phi = phase_row[x];
+                const double carrier = plane[0] * xn + plane[1] * yn + plane[2];
+                const double response = wrapPi(phi - carrier);
+                if (std::abs(response) >= 2.8) {
+                    continue;
+                }
+                std::array<double, feature_count> feature{
+                    1.0, xn, yn, xn * xn, xn * yn, yn * yn,
+                    std::sin(phi), std::cos(phi),
+                    std::sin(2.0 * phi), std::cos(2.0 * phi),
+                    std::sin(3.0 * phi), std::cos(3.0 * phi),
+                    std::sin(4.0 * phi), std::cos(4.0 * phi)};
+                double prediction = 0.0;
+                for (int i = 0; i < feature_count; ++i) {
+                    prediction += coefficients[static_cast<size_t>(i)] * feature[static_cast<size_t>(i)];
+                }
+                const double error = response - prediction;
+                const double weight = iteration == 0
+                    ? 1.0
+                    : std::min(1.0, huber_delta / std::max(std::abs(error), 1e-12));
+                for (int i = 0; i < feature_count; ++i) {
+                    rhs(i, 0) += weight * feature[static_cast<size_t>(i)] * response;
+                    for (int j = 0; j < feature_count; ++j) {
+                        lhs(i, j) += weight * feature[static_cast<size_t>(i)] * feature[static_cast<size_t>(j)];
+                    }
+                }
+            }
+        }
+        cv::Mat1d solved;
+        if (!cv::solve(lhs, rhs, solved, cv::DECOMP_SVD)) {
+            return {};
+        }
+        for (int i = 0; i < feature_count; ++i) {
+            coefficients[static_cast<size_t>(i)] = solved(i, 0);
+        }
+    }
+
+    PeriodicCalibration calibration;
+    for (int i = 0; i < 8; ++i) {
+        calibration.harmonic[static_cast<size_t>(i)] = coefficients[static_cast<size_t>(i + 6)];
+    }
+    double minimum = std::numeric_limits<double>::infinity();
+    double maximum = -std::numeric_limits<double>::infinity();
+    for (int i = 0; i < 4096; ++i) {
+        const double phase = -CV_PI + 2.0 * CV_PI * i / 4096.0;
+        const double error = periodicError(calibration.harmonic, phase);
+        minimum = std::min(minimum, error);
+        maximum = std::max(maximum, error);
+        double error_derivative = 0.0;
+        for (int order = 1; order <= 4; ++order) {
+            const double sine = calibration.harmonic[static_cast<size_t>((order - 1) * 2)];
+            const double cosine = calibration.harmonic[static_cast<size_t>((order - 1) * 2 + 1)];
+            error_derivative += order * sine * std::cos(order * phase);
+            error_derivative -= order * cosine * std::sin(order * phase);
+        }
+        calibration.minimum_derivative = std::min(calibration.minimum_derivative, 1.0 - error_derivative);
+    }
+    calibration.peak_to_peak = maximum - minimum;
+    calibration.applied = calibration.peak_to_peak >= 0.05 && calibration.minimum_derivative >= 0.25;
+    return calibration;
+}
+
 bool unwrapPhaseWithROIPlane(
     const cv::Mat& phase_input,
     const std::vector<PhaseROI>& rois,
     cv::Mat& unwrapped,
     cv::Mat& residual,
     cv::Mat& wrapped_residual,
+    cv::Mat& uncalibrated_residual,
     cv::Mat1b& integration_mask,
+    cv::Mat& corrected_phase,
+    cv::Mat1f& periodic_correction_lut,
     cv::Mat& k_order_image,
     cv::Vec3d& plane_coeffs) {
 
@@ -318,46 +475,50 @@ bool unwrapPhaseWithROIPlane(
     const double cy = height / 2.0;
     const double inv_scale = 1.0 / static_cast<double>(std::max(width, height));
 
-    int total_points = 0;
-    for (const auto& roi : rois) {
-        total_points += (roi.rect & cv::Rect(0, 0, width, height)).area();
-    }
-    cv::Mat design(total_points, 3, CV_64FC1);
-    cv::Mat target(total_points, 1, CV_64FC1);
-
     int row_index = 0;
-    for (const auto& roi : rois) {
-        const cv::Rect clipped = roi.rect & cv::Rect(0, 0, width, height);
-        for (int y = clipped.y; y < clipped.y + clipped.height; ++y) {
+    if (!fitCarrierPlane(phase64, rois, plane_coeffs, row_index)) {
+        return false;
+    }
+
+    uncalibrated_residual.create(height, width, CV_64FC1);
+    cv::parallel_for_(cv::Range(0, height), [&](const cv::Range& range) {
+        for (int y = range.start; y < range.end; ++y) {
             const double yn = (static_cast<double>(y) - cy) * inv_scale;
             const double* phase_row = phase64.ptr<double>(y);
-            for (int x = clipped.x; x < clipped.x + clipped.width; ++x) {
-                const double wrapped = phase_row[x];
-                if (std::abs(wrapped) >= kPhaseFitThreshold * CV_PI) {
-                    continue;
-                }
-                design.at<double>(row_index, 0) = (static_cast<double>(x) - cx) * inv_scale;
-                design.at<double>(row_index, 1) = yn;
-                design.at<double>(row_index, 2) = 1.0;
-                target.at<double>(row_index, 0) = wrapped + roi.k_order * 2.0 * CV_PI;
-                ++row_index;
+            double* output_row = uncalibrated_residual.ptr<double>(y);
+            for (int x = 0; x < width; ++x) {
+                const double xn = (static_cast<double>(x) - cx) * inv_scale;
+                const double carrier = plane_coeffs[0] * xn + plane_coeffs[1] * yn + plane_coeffs[2];
+                output_row[x] = wrapPi(phase_row[x] - carrier);
             }
         }
-    }
-    if (row_index < 3) {
-        return false;
-    }
-    design = design.rowRange(0, row_index);
-    target = target.rowRange(0, row_index);
+    });
 
-    cv::Mat coeffs;
-    if (!cv::solve(design, target, coeffs, cv::DECOMP_SVD)) {
-        return false;
+    const PeriodicCalibration calibration = fitPeriodicCalibration(phase64, plane_coeffs);
+    periodic_correction_lut = cv::Mat1f(1, 256, 0.0f);
+    for (int code = 0; code < 256; ++code) {
+        const double phase = code * (2.0 * CV_PI / 255.0) - CV_PI;
+        periodic_correction_lut(0, code) = calibration.applied
+            ? static_cast<float>(periodicError(calibration.harmonic, phase))
+            : 0.0f;
     }
-    plane_coeffs = cv::Vec3d(
-        coeffs.at<double>(0, 0),
-        coeffs.at<double>(1, 0),
-        coeffs.at<double>(2, 0));
+    if (calibration.applied) {
+        cv::parallel_for_(cv::Range(0, height), [&](const cv::Range& range) {
+            for (int y = range.start; y < range.end; ++y) {
+                double* row = phase64.ptr<double>(y);
+                for (int x = 0; x < width; ++x) {
+                    row[x] = wrapPi(row[x] - periodicError(calibration.harmonic, row[x]));
+                }
+            }
+        });
+        if (!fitCarrierPlane(phase64, rois, plane_coeffs, row_index)) {
+            return false;
+        }
+    }
+    corrected_phase = phase64.clone();
+    std::cout << "periodic calibration: p2p=" << calibration.peak_to_peak
+              << " rad, minimum derivative=" << calibration.minimum_derivative
+              << ", applied=" << (calibration.applied ? "yes" : "no") << "\n";
 
     unwrapped.create(height, width, CV_64FC1);
     residual.create(height, width, CV_64FC1);
@@ -436,6 +597,36 @@ void saveNormalized(const fs::path& path, const cv::Mat& source) {
     }
 }
 
+void savePeriodicCorrectionCurve(const fs::path& path, const cv::Mat1f& lut) {
+    constexpr int width = 768;
+    constexpr int height = 320;
+    constexpr int margin = 36;
+    cv::Mat3b canvas(height, width, cv::Vec3b(255, 255, 255));
+    double max_abs = 0.0;
+    for (int code = 0; code < lut.cols; ++code) {
+        max_abs = std::max(max_abs, std::abs(static_cast<double>(lut(0, code))));
+    }
+    max_abs = std::max(max_abs, 0.01);
+    const int center_y = height / 2;
+    cv::line(canvas, cv::Point(margin, center_y), cv::Point(width - margin, center_y), cv::Scalar(180, 180, 180), 1);
+    cv::line(canvas, cv::Point(margin, margin), cv::Point(margin, height - margin), cv::Scalar(180, 180, 180), 1);
+    std::vector<cv::Point> curve;
+    curve.reserve(static_cast<size_t>(lut.cols));
+    for (int code = 0; code < lut.cols; ++code) {
+        const int px = margin + code * (width - 2 * margin) / std::max(1, lut.cols - 1);
+        const int py = center_y - static_cast<int>(std::lround(lut(0, code) * (height / 2 - margin) / max_abs));
+        curve.emplace_back(px, py);
+    }
+    cv::polylines(canvas, curve, false, cv::Scalar(220, 70, 20), 2, cv::LINE_AA);
+    cv::putText(canvas, "phase code 0..255", cv::Point(width / 2 - 90, height - 8),
+                cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(60, 60, 60), 1, cv::LINE_AA);
+    cv::putText(canvas, "periodic correction (rad)", cv::Point(44, 24),
+                cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(60, 60, 60), 1, cv::LINE_AA);
+    if (!cv::imwrite(path.string(), canvas)) {
+        throw std::runtime_error("failed to write " + path.string());
+    }
+}
+
 int main(int argc, char** argv) {
     try {
         if (argc != 4 && argc != 5) {
@@ -465,22 +656,41 @@ int main(int argc, char** argv) {
         cv::Mat unwrapped;
         cv::Mat residual;
         cv::Mat wrapped_residual;
+        cv::Mat uncalibrated_residual;
         cv::Mat1b integration_mask;
+        cv::Mat corrected_phase;
+        cv::Mat1f periodic_correction_lut;
         cv::Mat k_orders;
         cv::Vec3d coeffs;
         if (!unwrapPhaseWithROIPlane(
-                phase, rois, unwrapped, residual, wrapped_residual, integration_mask, k_orders, coeffs)) {
+                phase,
+                rois,
+                unwrapped,
+                residual,
+                wrapped_residual,
+                uncalibrated_residual,
+                integration_mask,
+                corrected_phase,
+                periodic_correction_lut,
+                k_orders,
+                coeffs)) {
             throw std::runtime_error("ROI plane fitting failed");
         }
 
         saveFloatTiff(output / "unwrappedPhase.tiff", unwrapped);
         saveFloatTiff(output / "residualPhase.tiff", residual);
         saveFloatTiff(output / "residualPhase_simple_wrapped.tiff", wrapped_residual);
+        saveFloatTiff(output / "residualPhase_uncalibrated.tiff", uncalibrated_residual);
+        saveFloatTiff(output / "phase_corrected.tiff", corrected_phase);
+        saveFloatTiff(output / "periodic_correction_lut.tiff", periodic_correction_lut);
         saveFloatTiff(output / "kOrder.tiff", k_orders);
         saveNormalized(output / "wrapped.png", phase);
         saveNormalized(output / "unwrappedPhase.png", unwrapped);
         saveNormalized(output / "residualPhase.png", residual);
         saveNormalized(output / "residualPhase_simple_wrapped.png", wrapped_residual);
+        saveNormalized(output / "phase_corrected.png", corrected_phase);
+        saveNormalized(output / "periodic_correction_lut.png", periodic_correction_lut);
+        savePeriodicCorrectionCurve(output / "periodic_correction_curve.png", periodic_correction_lut);
         cv::imwrite((output / "integration_mask.png").string(), integration_mask);
 
         cv::Mat residual_kb;
@@ -490,6 +700,10 @@ int main(int argc, char** argv) {
         cv::Mat simple_residual_kb;
         wrapped_residual.convertTo(simple_residual_kb, CV_8UC1, -200.0, 128.0);
         cv::imwrite((output / "residualPhase_simple_detail_k-200_b128.png").string(), simple_residual_kb);
+
+        cv::Mat uncalibrated_kb;
+        uncalibrated_residual.convertTo(uncalibrated_kb, CV_8UC1, -200.0, 128.0);
+        cv::imwrite((output / "residualPhase_uncalibrated_k-200_b128.png").string(), uncalibrated_kb);
 
         cv::Mat roi_visual;
         cv::cvtColor(phase, roi_visual, cv::COLOR_GRAY2BGR);
