@@ -51,6 +51,17 @@ To inspect a questionable location without changing extraction parameters:
 The probe reports the local surfel owner and normal, nearby plane equations,
 point-to-plane distances, envelope decisions, and the final dense assignment.
 
+To write a read-only per-plane check of dense assignments:
+
+```powershell
+.\build\Release\edge_aware_plane_extract.exe input.ply --profile model-mm --output-dir results --audit-assignments
+```
+
+This adds `assignment_audit.csv`. Use `--distance-only` with the audit for an
+A/B control run that disables normal-guided dense assignment without changing
+plane extraction. The crossing-plane investigation is recorded in
+`docs/dense_assignment_crossing_audit.md`.
+
 Profiles:
 
 ```text
