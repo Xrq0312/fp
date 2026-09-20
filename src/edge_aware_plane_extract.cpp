@@ -116,6 +116,20 @@ struct CompetitionStats {
 
 struct DenseAssignmentStats {
     std::size_t normal_guided_points = 0;
+    std::size_t locally_supported_points = 0;
+    std::size_t established_guided_points = 0;
+};
+
+struct FinalizeStats {
+    std::size_t absorbed_patches = 0;
+    std::size_t absorbed_points = 0;
+    std::size_t discarded_sparse_points = 0;
+};
+
+struct GlobalNormalStats {
+    std::size_t reliable_surfels = 0;
+    float curvature_limit = 0.0f;
+    std::vector<Eigen::Vector3f> directions;
 };
 
 struct AssignmentAuditRow {
@@ -497,12 +511,41 @@ static std::vector<PlanePatch> extract_seed_grown_patches(
     return patches;
 }
 
-static bool patches_can_merge(const PlanePatch& a, const PlanePatch& b, const Config& cfg) {
+static int closest_global_normal_family(
+    const Eigen::Vector3f& normal,
+    const GlobalNormalStats& global_normals,
+    float minimum_dot) {
+    int best = -1;
+    float best_dot = minimum_dot;
+    for (std::size_t i = 0; i < global_normals.directions.size(); ++i) {
+        const float dot = std::abs(normal.dot(global_normals.directions[i]));
+        if (dot > best_dot) {
+            best_dot = dot;
+            best = static_cast<int>(i);
+        }
+    }
+    return best;
+}
+
+static bool patches_can_merge(
+    const PlanePatch& a,
+    const PlanePatch& b,
+    const Config& cfg,
+    const GlobalNormalStats& global_normals) {
     const float normal_cos = std::cos(cfg.merge_angle_deg / 180.0f * 3.14159265358979323846f);
     const float dot = a.normal.dot(b.normal);
-    if (std::abs(dot) < normal_cos) return false;
-    const float b_d = dot >= 0.0f ? b.d : -b.d;
-    if (std::abs(a.d - b_d) > cfg.merge_distance) return false;
+    const float family_cos = std::cos(cfg.smooth_angle_deg / 180.0f * 3.14159265358979323846f);
+    const int a_family = closest_global_normal_family(a.normal, global_normals, family_cos);
+    const int b_family = closest_global_normal_family(b.normal, global_normals, family_cos);
+    const bool same_global_family = a_family >= 0 && a_family == b_family;
+    if (std::abs(dot) < normal_cos && !same_global_family) return false;
+    if (same_global_family) {
+        const Eigen::Vector3f& direction = global_normals.directions[static_cast<std::size_t>(a_family)];
+        if (std::abs(direction.dot(a.centroid - b.centroid)) > cfg.merge_distance) return false;
+    } else {
+        const float b_d = dot >= 0.0f ? b.d : -b.d;
+        if (std::abs(a.d - b_d) > cfg.merge_distance) return false;
+    }
 
     Eigen::Vector3f a_u;
     Eigen::Vector3f a_v;
@@ -543,13 +586,17 @@ static bool patches_can_merge(const PlanePatch& a, const PlanePatch& b, const Co
     return u_touch && v_touch;
 }
 
-static void merge_patches(std::vector<PlanePatch>& patches, const std::vector<Surfel>& surfels, const Config& cfg) {
+static void merge_patches_impl(
+    std::vector<PlanePatch>& patches,
+    const std::vector<Surfel>& surfels,
+    const Config& cfg,
+    const GlobalNormalStats& global_normals) {
     bool changed = true;
     while (changed) {
         changed = false;
         for (std::size_t i = 0; i < patches.size() && !changed; ++i) {
             for (std::size_t j = i + 1; j < patches.size(); ++j) {
-                if (!patches_can_merge(patches[i], patches[j], cfg)) continue;
+                if (!patches_can_merge(patches[i], patches[j], cfg, global_normals)) continue;
                 patches[i].surfels.insert(patches[i].surfels.end(), patches[j].surfels.begin(), patches[j].surfels.end());
                 patches[i] = fit_patch_from_surfels(patches[i].surfels, surfels);
                 update_patch_envelope(patches[i], surfels);
@@ -562,6 +609,24 @@ static void merge_patches(std::vector<PlanePatch>& patches, const std::vector<Su
     std::sort(patches.begin(), patches.end(), [](const PlanePatch& a, const PlanePatch& b) {
         return a.surfels.size() > b.surfels.size();
     });
+}
+
+static std::size_t merge_patches_adaptive(
+    std::vector<PlanePatch>& patches,
+    const std::vector<Surfel>& surfels,
+    const Config& cfg,
+    const GlobalNormalStats& global_normals) {
+    const GlobalNormalStats no_global_relaxation;
+    merge_patches_impl(patches, surfels, cfg, no_global_relaxation);
+
+    // A single relaxed merge can be an accidental alignment.  Repeated merges
+    // into the same globally stable direction are evidence of a systematically
+    // fragmented face, which is the case this relaxation is meant to repair.
+    std::vector<PlanePatch> globally_merged = patches;
+    merge_patches_impl(globally_merged, surfels, cfg, global_normals);
+    const std::size_t relaxed_merges = patches.size() - globally_merged.size();
+    if (relaxed_merges >= 2) patches = std::move(globally_merged);
+    return relaxed_merges >= 2 ? relaxed_merges : 0;
 }
 
 static bool point_inside_patch_envelope(const PlanePatch& patch, const Eigen::Vector3f& q, float margin) {
@@ -737,68 +802,280 @@ static DenseAssignmentStats assign_full_points(
     DenseAssignmentStats stats;
     for (auto& patch : patches) patch.output.reset(new CloudT);
     const float smooth_cos = std::cos(cfg.smooth_angle_deg / 180.0f * 3.14159265358979323846f);
+    const float edge_cos = std::cos(cfg.edge_angle_deg / 180.0f * 3.14159265358979323846f);
+    const int support_radius = 2;
+    const std::vector<int> labels = build_surfel_labels(patches, surfels.size());
+
+    struct DenseCandidate {
+        int id = -1;
+        float distance = std::numeric_limits<float>::max();
+        float normal_dot = 1.0f;
+        int local_support = 0;
+        bool inside_tight = false;
+    };
 
     for (const auto& p : cloud->points) {
         const Eigen::Vector3f q(p.x, p.y, p.z);
-        const auto local = index_by_key.find(point_key(p, bounds, cfg.surfel_size));
+        const CellKey key = point_key(p, bounds, cfg.surfel_size);
+        const auto local = index_by_key.find(key);
         const Surfel* local_surfel = local != index_by_key.end()
             ? &surfels[static_cast<std::size_t>(local->second)]
             : nullptr;
-        const bool reliable_local_normal = enable_normal_guidance &&
-            local_surfel != nullptr && !local_surfel->edge_like;
+        const bool has_local_normal = enable_normal_guidance && local_surfel != nullptr;
 
-        int distance_best = -1;
-        int normal_best = -1;
-        float distance_best_value = std::numeric_limits<float>::max();
-        float normal_best_distance = std::numeric_limits<float>::max();
-        float distance_best_normal_dot = 1.0f;
-        bool distance_best_inside_tight = false;
+        std::array<DenseCandidate, 160> candidates{};
+        std::size_t candidate_count = 0;
         for (std::size_t i = 0; i < patches.size(); ++i) {
             const float distance = std::abs(patches[i].normal.dot(q) + patches[i].d);
             if (distance > cfg.assign_distance) continue;
             if (!point_inside_patch_envelope(patches[i], q, cfg.assign_margin)) continue;
-            const bool inside_tight = point_inside_patch_envelope(
+            if (candidate_count >= candidates.size()) continue;
+            DenseCandidate& candidate = candidates[candidate_count++];
+            candidate.id = static_cast<int>(i);
+            candidate.distance = distance;
+            candidate.normal_dot = has_local_normal
+                ? std::abs(local_surfel->normal.dot(patches[i].normal))
+                : 1.0f;
+            candidate.inside_tight = point_inside_patch_envelope(
                 patches[i], q, 2.0f * cfg.surfel_size);
-            if (distance < distance_best_value) {
-                distance_best_value = distance;
-                distance_best = static_cast<int>(i);
-                distance_best_inside_tight = inside_tight;
-                distance_best_normal_dot = reliable_local_normal
-                    ? std::abs(local_surfel->normal.dot(patches[i].normal))
-                    : 1.0f;
-            }
-            if (reliable_local_normal && distance < normal_best_distance &&
-                std::abs(local_surfel->normal.dot(patches[i].normal)) >= smooth_cos &&
-                inside_tight) {
-                normal_best_distance = distance;
-                normal_best = static_cast<int>(i);
+        }
+        if (candidate_count == 0) continue;
+
+        std::size_t distance_best = 0;
+        for (std::size_t i = 1; i < candidate_count; ++i) {
+            if (candidates[i].distance < candidates[distance_best].distance) distance_best = i;
+        }
+
+        // Only ambiguous points pay for the local support lookup.  The lookup is
+        // in the original 3-D surfel grid, so it cannot be fooled by a large 2-D
+        // patch rectangle extending through an unrelated surface.
+        if (candidate_count > 1) {
+            for (int dx = -support_radius; dx <= support_radius; ++dx) {
+                for (int dy = -support_radius; dy <= support_radius; ++dy) {
+                    for (int dz = -support_radius; dz <= support_radius; ++dz) {
+                        const auto neighbor = index_by_key.find({key.x + dx, key.y + dy, key.z + dz});
+                        if (neighbor == index_by_key.end()) continue;
+                        const int label = labels[static_cast<std::size_t>(neighbor->second)];
+                        for (std::size_t i = 0; i < candidate_count; ++i) {
+                            if (candidates[i].id == label) {
+                                ++candidates[i].local_support;
+                                break;
+                            }
+                        }
+                    }
+                }
             }
         }
-        // A plane that reaches the point only through the loose refill envelope must not
-        // steal it from a tightly supported plane whose local surfel normal agrees.
-        const bool use_normal_best = normal_best >= 0 && !distance_best_inside_tight &&
-            distance_best_normal_dot < smooth_cos &&
-            (distance_best < 0 || normal_best_distance <= distance_best_value + cfg.coplanar_distance);
-        const int best = use_normal_best ? normal_best : distance_best;
-        if (use_normal_best && normal_best != distance_best) ++stats.normal_guided_points;
+
+        std::size_t selected = distance_best;
+        std::size_t normal_best = candidate_count;
+        const float candidate_normal_cos = local_surfel != nullptr && local_surfel->edge_like
+            ? edge_cos : smooth_cos;
+        for (std::size_t i = 0; i < candidate_count; ++i) {
+            if (has_local_normal && (candidates[i].inside_tight || candidates[i].local_support > 0) &&
+                candidates[i].normal_dot >= candidate_normal_cos &&
+                candidates[i].distance <= candidates[distance_best].distance + cfg.coplanar_distance &&
+                (normal_best == candidate_count || candidates[i].distance < candidates[normal_best].distance)) {
+                normal_best = i;
+            }
+        }
+
+        const bool distance_has_bad_normal = candidates[distance_best].normal_dot < smooth_cos;
+        const bool distance_lacks_real_support = candidates[distance_best].local_support == 0;
+        const bool edge_normal_is_decisive = local_surfel == nullptr || !local_surfel->edge_like ||
+            candidates[distance_best].normal_dot <
+                std::cos(cfg.edge_angle_deg / 180.0f * 3.14159265358979323846f);
+        const bool correct_loose_or_unsupported = !candidates[distance_best].inside_tight ||
+            distance_lacks_real_support;
+        if (normal_best < candidate_count && distance_has_bad_normal && edge_normal_is_decisive &&
+            correct_loose_or_unsupported) {
+            selected = normal_best;
+            if (selected != distance_best) {
+                ++stats.normal_guided_points;
+                if (local_surfel != nullptr && !local_surfel->edge_like &&
+                    !candidates[distance_best].inside_tight && candidates[selected].inside_tight) {
+                    ++stats.established_guided_points;
+                }
+                if (candidates[distance_best].inside_tight && distance_lacks_real_support) {
+                    ++stats.locally_supported_points;
+                }
+            }
+        }
+
+        const int best = candidates[selected].id;
         if (best >= 0) patches[static_cast<std::size_t>(best)].output->push_back(p);
     }
 
     return stats;
 }
 
-static void finalize_dense_patches(std::vector<PlanePatch>& patches, const Config& cfg) {
-    patches.erase(
-        std::remove_if(patches.begin(), patches.end(), [&](const PlanePatch& patch) {
-            return patch.output->size() < static_cast<std::size_t>(std::max(cfg.min_output_points, 1));
+static Eigen::Vector3f canonical_normal(Eigen::Vector3f normal) {
+    Eigen::Index dominant = 0;
+    normal.cwiseAbs().maxCoeff(&dominant);
+    if (normal[dominant] < 0.0f) normal = -normal;
+    return normal;
+}
+
+static float median_value(std::vector<float> values) {
+    if (values.empty()) return 0.0f;
+    const std::size_t middle = values.size() / 2;
+    std::nth_element(values.begin(), values.begin() + static_cast<std::ptrdiff_t>(middle), values.end());
+    const float upper = values[middle];
+    if (values.size() % 2 != 0) return upper;
+    std::nth_element(values.begin(), values.begin() + static_cast<std::ptrdiff_t>(middle - 1), values.end());
+    return 0.5f * (upper + values[middle - 1]);
+}
+
+static GlobalNormalStats estimate_global_normal_families(
+    const std::vector<Surfel>& surfels,
+    const Config& cfg) {
+    GlobalNormalStats stats;
+    if (surfels.empty()) return stats;
+
+    std::vector<float> curvatures;
+    curvatures.reserve(surfels.size());
+    for (const Surfel& surfel : surfels) {
+        if (std::isfinite(surfel.curvature)) curvatures.push_back(std::max(surfel.curvature, 0.0f));
+    }
+    const float median_curvature = median_value(curvatures);
+    std::vector<float> deviations;
+    deviations.reserve(curvatures.size());
+    for (float curvature : curvatures) deviations.push_back(std::abs(curvature - median_curvature));
+    const float curvature_mad = median_value(std::move(deviations));
+    stats.curvature_limit = median_curvature + std::max(3.0f * curvature_mad, median_curvature);
+
+    std::vector<int> reliable;
+    reliable.reserve(surfels.size());
+    for (std::size_t i = 0; i < surfels.size(); ++i) {
+        if (surfels[i].curvature <= stats.curvature_limit) reliable.push_back(static_cast<int>(i));
+    }
+    std::sort(reliable.begin(), reliable.end(), [&](int a, int b) {
+        const Surfel& lhs = surfels[static_cast<std::size_t>(a)];
+        const Surfel& rhs = surfels[static_cast<std::size_t>(b)];
+        if (std::abs(lhs.curvature - rhs.curvature) > 1e-8f) return lhs.curvature < rhs.curvature;
+        return lhs.count > rhs.count;
+    });
+    stats.reliable_surfels = reliable.size();
+
+    struct Family {
+        Eigen::Vector3d weighted_sum{0.0, 0.0, 0.0};
+        Eigen::Vector3f direction{0.0f, 0.0f, 1.0f};
+        double weight = 0.0;
+        std::size_t members = 0;
+    };
+    std::vector<Family> families;
+    const float family_angle = std::max(1.0f, 0.5f * cfg.smooth_angle_deg);
+    const float family_cos = std::cos(family_angle / 180.0f * 3.14159265358979323846f);
+    for (int id : reliable) {
+        const Surfel& surfel = surfels[static_cast<std::size_t>(id)];
+        const Eigen::Vector3f normal = canonical_normal(surfel.normal);
+        int best = -1;
+        float best_dot = family_cos;
+        for (std::size_t i = 0; i < families.size(); ++i) {
+            const float dot = families[i].direction.dot(normal);
+            if (dot > best_dot) {
+                best_dot = dot;
+                best = static_cast<int>(i);
+            }
+        }
+
+        const double weight = static_cast<double>(std::max(surfel.count, 1));
+        if (best < 0) {
+            Family family;
+            family.weighted_sum = weight * normal.cast<double>();
+            family.direction = normal;
+            family.weight = weight;
+            family.members = 1;
+            families.push_back(family);
+        } else {
+            Family& family = families[static_cast<std::size_t>(best)];
+            family.weighted_sum += weight * normal.cast<double>();
+            family.weight += weight;
+            ++family.members;
+            family.direction = family.weighted_sum.cast<float>().normalized();
+        }
+    }
+
+    const std::size_t minimum_members = static_cast<std::size_t>(std::max(cfg.min_surfels, 3));
+    families.erase(
+        std::remove_if(families.begin(), families.end(), [&](const Family& family) {
+            return family.members < minimum_members;
         }),
-        patches.end());
+        families.end());
+    std::sort(families.begin(), families.end(), [](const Family& a, const Family& b) {
+        return a.weight > b.weight;
+    });
+    stats.directions.reserve(families.size());
+    for (const Family& family : families) stats.directions.push_back(family.direction);
+    return stats;
+}
+
+static FinalizeStats finalize_dense_patches(
+    std::vector<PlanePatch>& patches,
+    const Config& cfg) {
+    FinalizeStats stats;
+    if (patches.empty()) return stats;
+
+    const std::size_t minimum_points = static_cast<std::size_t>(std::max(cfg.min_output_points, 1));
+    std::vector<bool> keep(patches.size(), false);
+    for (std::size_t i = 0; i < patches.size(); ++i) {
+        keep[i] = patches[i].output->size() >= minimum_points;
+    }
+
+    // Before applying the existing output-support filter, rescue an entire small
+    // patch when all of its points have a valid destination on established faces.
+    // This preserves points without turning a few isolated leftovers into a new
+    // plane.  Partially unsupported patches still follow the original filter.
+    for (std::size_t patch_id = 0; patch_id < patches.size(); ++patch_id) {
+        if (keep[patch_id]) continue;
+        std::vector<int> targets;
+        targets.reserve(patches[patch_id].output->size());
+        bool fully_absorbable = true;
+        for (const PointT& point : patches[patch_id].output->points) {
+            const Eigen::Vector3f q(point.x, point.y, point.z);
+            int best = -1;
+            float best_distance = std::numeric_limits<float>::max();
+            for (std::size_t candidate = 0; candidate < patches.size(); ++candidate) {
+                if (!keep[candidate]) continue;
+                const float distance = std::abs(patches[candidate].normal.dot(q) + patches[candidate].d);
+                if (distance > cfg.assign_distance || distance >= best_distance) continue;
+                if (!point_inside_patch_envelope(patches[candidate], q, cfg.assign_margin)) continue;
+                best = static_cast<int>(candidate);
+                best_distance = distance;
+            }
+            if (best < 0) {
+                fully_absorbable = false;
+                break;
+            }
+            targets.push_back(best);
+        }
+
+        if (!fully_absorbable) {
+            stats.discarded_sparse_points += patches[patch_id].output->size();
+            continue;
+        }
+
+        for (std::size_t i = 0; i < targets.size(); ++i) {
+            patches[static_cast<std::size_t>(targets[i])].output->push_back(
+                patches[patch_id].output->points[i]);
+        }
+        ++stats.absorbed_patches;
+        stats.absorbed_points += targets.size();
+    }
+
+    std::vector<PlanePatch> retained;
+    retained.reserve(patches.size() - stats.absorbed_patches);
+    for (std::size_t i = 0; i < patches.size(); ++i) {
+        if (keep[i]) retained.push_back(std::move(patches[i]));
+    }
+    patches.swap(retained);
 
     for (auto& patch : patches) {
         patch.output->width = static_cast<std::uint32_t>(patch.output->size());
         patch.output->height = 1;
         patch.output->is_dense = true;
     }
+    return stats;
 }
 
 static std::vector<AssignmentAuditRow> audit_dense_assignments(
@@ -1052,7 +1329,8 @@ static void report_probe(
     probe_point.x = cfg.probe.x();
     probe_point.y = cfg.probe.y();
     probe_point.z = cfg.probe.z();
-    const auto local_it = index_by_key.find(point_key(probe_point, bounds, cfg.surfel_size));
+    const CellKey probe_key = point_key(probe_point, bounds, cfg.surfel_size);
+    const auto local_it = index_by_key.find(probe_key);
     const std::vector<int> labels = build_surfel_labels(patches, surfels.size());
 
     std::cout << "Probe: " << cfg.probe.transpose() << "\n";
@@ -1071,6 +1349,7 @@ static void report_probe(
         std::size_t id = 0;
         float distance = 0.0f;
         float normal_dot = 0.0f;
+        int local_support = 0;
         bool inside_tight = false;
         bool inside_assign = false;
     };
@@ -1089,37 +1368,54 @@ static void report_probe(
         }
         candidates.push_back(candidate);
     }
+    for (int dx = -2; dx <= 2; ++dx) {
+        for (int dy = -2; dy <= 2; ++dy) {
+            for (int dz = -2; dz <= 2; ++dz) {
+                const auto neighbor = index_by_key.find({probe_key.x + dx, probe_key.y + dy, probe_key.z + dz});
+                if (neighbor == index_by_key.end()) continue;
+                const int label = labels[static_cast<std::size_t>(neighbor->second)];
+                if (label >= 0 && static_cast<std::size_t>(label) < candidates.size()) {
+                    ++candidates[static_cast<std::size_t>(label)].local_support;
+                }
+            }
+        }
+    }
     std::sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) {
         return a.distance < b.distance;
     });
 
-    int selected = -1;
     int distance_selected = -1;
-    float distance_selected_value = std::numeric_limits<float>::max();
-    float distance_selected_normal_dot = 1.0f;
-    bool distance_selected_inside_tight = false;
+    int normal_selected = -1;
     const float smooth_cos = std::cos(cfg.smooth_angle_deg / 180.0f * 3.14159265358979323846f);
-    const bool reliable_local_normal = enable_normal_guidance && local_it != index_by_key.end() &&
-        !surfels[static_cast<std::size_t>(local_it->second)].edge_like;
-    for (const Candidate& candidate : candidates) {
-        if (candidate.distance <= cfg.assign_distance && candidate.inside_assign) {
-            if (distance_selected < 0) {
-                distance_selected = static_cast<int>(candidate.id);
-                distance_selected_value = candidate.distance;
-                distance_selected_normal_dot = candidate.normal_dot;
-                distance_selected_inside_tight = candidate.inside_tight;
-            }
-            if (reliable_local_normal && !distance_selected_inside_tight &&
-                distance_selected_normal_dot < smooth_cos && candidate.inside_tight &&
-                candidate.normal_dot >= smooth_cos &&
-                candidate.distance <= distance_selected_value + cfg.coplanar_distance) {
-                selected = static_cast<int>(candidate.id);
-                break;
-            }
+    const float edge_cos = std::cos(cfg.edge_angle_deg / 180.0f * 3.14159265358979323846f);
+    const bool has_local_normal = enable_normal_guidance && local_it != index_by_key.end();
+    const bool local_is_edge = local_it != index_by_key.end() &&
+        surfels[static_cast<std::size_t>(local_it->second)].edge_like;
+    const float candidate_normal_cos = local_is_edge ? edge_cos : smooth_cos;
+    for (std::size_t i = 0; i < candidates.size(); ++i) {
+        const Candidate& candidate = candidates[i];
+        if (candidate.distance > cfg.assign_distance || !candidate.inside_assign) continue;
+        if (distance_selected < 0) distance_selected = static_cast<int>(i);
+        const Candidate& distance_candidate = candidates[static_cast<std::size_t>(distance_selected)];
+        if (has_local_normal && (candidate.inside_tight || candidate.local_support > 0) &&
+            candidate.normal_dot >= candidate_normal_cos &&
+            candidate.distance <= distance_candidate.distance + cfg.coplanar_distance &&
+            normal_selected < 0) {
+            normal_selected = static_cast<int>(i);
         }
     }
-    if (selected < 0) selected = distance_selected;
-    std::cout << "Probe dense assignment: " << selected << "\n";
+    int selected = distance_selected;
+    if (distance_selected >= 0 && normal_selected >= 0) {
+        const Candidate& distance_candidate = candidates[static_cast<std::size_t>(distance_selected)];
+        const bool distance_has_bad_normal = distance_candidate.normal_dot < smooth_cos;
+        const bool edge_normal_is_decisive = !local_is_edge || distance_candidate.normal_dot < edge_cos;
+        if (distance_has_bad_normal && edge_normal_is_decisive &&
+            (!distance_candidate.inside_tight || distance_candidate.local_support == 0)) {
+            selected = normal_selected;
+        }
+    }
+    std::cout << "Probe dense assignment: "
+              << (selected >= 0 ? static_cast<int>(candidates[static_cast<std::size_t>(selected)].id) : -1) << "\n";
     const std::size_t shown = std::min<std::size_t>(candidates.size(), 8);
     for (std::size_t rank = 0; rank < shown; ++rank) {
         const Candidate& candidate = candidates[rank];
@@ -1128,6 +1424,7 @@ static void report_probe(
                   << ": plane=(" << patch.normal.transpose() << "; d=" << patch.d << ')'
                   << ", distance=" << candidate.distance
                   << ", normal_dot=" << candidate.normal_dot
+                  << ", local_support=" << candidate.local_support
                   << ", tight=" << (candidate.inside_tight ? "in" : "out")
                   << ", assign=" << (candidate.inside_assign ? "in" : "out")
                   << ", accepted=" << (candidate.distance <= cfg.assign_distance && candidate.inside_assign ? "yes" : "no")
@@ -1191,14 +1488,15 @@ int main(int argc, char** argv) {
         CloudPtr surfel_cloud;
         std::vector<Surfel> surfels = build_surfels(cloud, bounds, cfg, index_by_key, surfel_cloud);
         estimate_surfel_normals(surfels, surfel_cloud, cfg);
+        const GlobalNormalStats global_normals = estimate_global_normal_families(surfels, cfg);
         mark_edge_surfels(surfels, index_by_key, cfg);
         std::vector<PlanePatch> patches = extract_seed_grown_patches(surfels, index_by_key, cfg);
         const std::size_t grown_patch_count = patches.size();
-        merge_patches(patches, surfels, cfg);
+        std::size_t global_family_merges = merge_patches_adaptive(patches, surfels, cfg, global_normals);
         const std::size_t initially_merged_patch_count = patches.size();
         const CompetitionStats competition = refine_patch_ownership(patches, surfels, index_by_key, cfg);
         const std::size_t competed_patch_count = patches.size();
-        merge_patches(patches, surfels, cfg);
+        global_family_merges += merge_patches_adaptive(patches, surfels, cfg, global_normals);
         cfg.assign_margin = estimate_assign_margin(cloud, patches, cfg);
         DenseAssignmentStats dense_assignment = assign_full_points(
             cloud, patches, surfels, index_by_key, bounds, cfg, true);
@@ -1208,11 +1506,11 @@ int main(int argc, char** argv) {
             static_cast<std::size_t>(std::max(cfg.min_output_points, 1)) / 4,
             cloud->size() / 10000);
         const bool normal_guidance_applied = !cfg.distance_only &&
-            dense_assignment.normal_guided_points >= minimum_guided_evidence;
+            dense_assignment.established_guided_points >= minimum_guided_evidence;
         if (!normal_guidance_applied) {
             assign_full_points(cloud, patches, surfels, index_by_key, bounds, cfg, false);
         }
-        finalize_dense_patches(patches, cfg);
+        const FinalizeStats finalize_stats = finalize_dense_patches(patches, cfg);
         const std::vector<AssignmentAuditRow> assignment_audit = cfg.audit_assignments
             ? audit_dense_assignments(patches, surfels, index_by_key, bounds, cfg)
             : std::vector<AssignmentAuditRow>{};
@@ -1233,11 +1531,19 @@ int main(int argc, char** argv) {
             for (const auto& patch : patches) output_points += patch.output->size();
             std::cout << "Input points: " << cloud->size() << "\n";
             std::cout << "Surfels: " << surfels.size() << "\n";
+            std::cout << "Global normal families/reliable surfels: "
+                      << global_normals.directions.size() << '/' << global_normals.reliable_surfels << "\n";
+            std::cout << "Accepted global-family merges: " << global_family_merges << "\n";
             std::cout << "Grown/merged/competed patches: "
                       << grown_patch_count << '/' << initially_merged_patch_count << '/' << competed_patch_count << "\n";
             std::cout << "Boundary-reassigned surfels: " << competition.moved_surfels << "\n";
             std::cout << "Normal-guided dense candidates: " << dense_assignment.normal_guided_points
+                      << ", established evidence: " << dense_assignment.established_guided_points
                       << ", applied: " << (normal_guidance_applied ? "yes" : "no") << "\n";
+            std::cout << "Local-support dense candidates: " << dense_assignment.locally_supported_points << "\n";
+            std::cout << "Safely absorbed small patches/points: "
+                      << finalize_stats.absorbed_patches << '/' << finalize_stats.absorbed_points << "\n";
+            std::cout << "Discarded sparse patch points: " << finalize_stats.discarded_sparse_points << "\n";
             std::cout << "Assignment margin: " << cfg.assign_margin << "\n";
             std::cout << "Plane patches: " << patches.size() << "\n";
             std::cout << "Output points: " << output_points << "\n";
