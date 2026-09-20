@@ -55,6 +55,7 @@ struct Config {
     float intersection_merge_scale = 4.5f;
     int min_corner_support = 8;
     int min_plane_local_support = 3;
+    bool audit_assignments = false;
     bool has_probe = false;
     Eigen::Vector3f probe{0.0f, 0.0f, 0.0f};
     bool verbose = true;
@@ -112,6 +113,17 @@ struct CompetitionStats {
     std::size_t moved_surfels = 0;
 };
 
+struct AssignmentAuditRow {
+    std::size_t dense_points = 0;
+    std::size_t audited_points = 0;
+    std::size_t normal_mismatch_points = 0;
+    std::size_t recoverable_mismatch_points = 0;
+    float worst_normal_dot = 1.0f;
+    Eigen::Vector3f mismatch_min = Eigen::Vector3f::Constant(std::numeric_limits<float>::max());
+    Eigen::Vector3f mismatch_max = Eigen::Vector3f::Constant(std::numeric_limits<float>::lowest());
+    std::vector<std::size_t> alternative_counts;
+};
+
 struct CornerCandidate {
     Eigen::Vector3f position{0.0f, 0.0f, 0.0f};
     int support = 0;
@@ -142,6 +154,7 @@ static Config parse_args(int argc, char** argv) {
             << "Options:\n"
             << "  --profile model-mm|model-m|top-down|top-left-cut2\n"
             << "  --output-dir DIR\n"
+            << "  --audit-assignments  write per-plane dense-assignment diagnostics\n"
             << "  --probe X Y Z  print plane-assignment diagnostics at a point\n"
             << "  --quiet\n";
         std::exit(args.empty() ? 1 : 0);
@@ -156,6 +169,8 @@ static Config parse_args(int argc, char** argv) {
         } else if (arg == "--output-dir") {
             if (i + 1 >= args.size()) throw std::runtime_error("Missing value after --output-dir.");
             cfg.output_dir = args[++i];
+        } else if (arg == "--audit-assignments") {
+            cfg.audit_assignments = true;
         } else if (arg == "--probe") {
             if (i + 3 >= args.size()) throw std::runtime_error("--probe requires X Y Z.");
             const float x = std::stof(args[++i]);
@@ -736,6 +751,94 @@ static void assign_full_points(
     }
 }
 
+static std::vector<AssignmentAuditRow> audit_dense_assignments(
+    const std::vector<PlanePatch>& patches,
+    const std::vector<Surfel>& surfels,
+    const std::unordered_map<CellKey, int, CellKeyHash>& index_by_key,
+    const Bounds& bounds,
+    const Config& cfg) {
+    std::vector<AssignmentAuditRow> audit(patches.size());
+    const float smooth_cos = std::cos(cfg.smooth_angle_deg / 180.0f * 3.14159265358979323846f);
+
+    for (std::size_t patch_id = 0; patch_id < patches.size(); ++patch_id) {
+        AssignmentAuditRow& row = audit[patch_id];
+        row.dense_points = patches[patch_id].output->size();
+        row.alternative_counts.resize(patches.size(), 0);
+
+        for (const PointT& point : patches[patch_id].output->points) {
+            const auto local = index_by_key.find(point_key(point, bounds, cfg.surfel_size));
+            if (local == index_by_key.end()) continue;
+            const Surfel& surfel = surfels[static_cast<std::size_t>(local->second)];
+            ++row.audited_points;
+
+            const float assigned_dot = std::abs(surfel.normal.dot(patches[patch_id].normal));
+            row.worst_normal_dot = std::min(row.worst_normal_dot, assigned_dot);
+            if (assigned_dot >= smooth_cos) continue;
+            ++row.normal_mismatch_points;
+
+            int best_alternative = -1;
+            float best_distance = std::numeric_limits<float>::max();
+            for (std::size_t candidate_id = 0; candidate_id < patches.size(); ++candidate_id) {
+                if (candidate_id == patch_id) continue;
+                const PlanePatch& candidate = patches[candidate_id];
+                const float normal_dot = std::abs(surfel.normal.dot(candidate.normal));
+                if (normal_dot < smooth_cos) continue;
+                const Eigen::Vector3f q(point.x, point.y, point.z);
+                const float distance = std::abs(candidate.normal.dot(q) + candidate.d);
+                if (distance > cfg.assign_distance || distance >= best_distance) continue;
+                if (!point_inside_patch_envelope(candidate, q, cfg.assign_margin)) continue;
+                best_distance = distance;
+                best_alternative = static_cast<int>(candidate_id);
+            }
+
+            if (best_alternative >= 0) {
+                ++row.recoverable_mismatch_points;
+                ++row.alternative_counts[static_cast<std::size_t>(best_alternative)];
+                const Eigen::Vector3f q(point.x, point.y, point.z);
+                row.mismatch_min = row.mismatch_min.cwiseMin(q);
+                row.mismatch_max = row.mismatch_max.cwiseMax(q);
+            }
+        }
+    }
+    return audit;
+}
+
+static void save_assignment_audit(
+    const fs::path& path,
+    const std::vector<AssignmentAuditRow>& audit) {
+    std::ofstream out(path);
+    if (!out) throw std::runtime_error("Failed to write assignment audit: " + path.string());
+    out << "plane_id,dense_points,audited_points,normal_mismatch_points,recoverable_mismatch_points,"
+           "mismatch_rate,dominant_alternative,dominant_alternative_points,worst_normal_dot,"
+           "min_x,min_y,min_z,max_x,max_y,max_z\n";
+    for (std::size_t plane_id = 0; plane_id < audit.size(); ++plane_id) {
+        const AssignmentAuditRow& row = audit[plane_id];
+        std::size_t dominant_alternative = 0;
+        std::size_t dominant_count = 0;
+        for (std::size_t i = 0; i < row.alternative_counts.size(); ++i) {
+            if (row.alternative_counts[i] > dominant_count) {
+                dominant_count = row.alternative_counts[i];
+                dominant_alternative = i;
+            }
+        }
+        const double mismatch_rate = row.audited_points > 0
+            ? static_cast<double>(row.recoverable_mismatch_points) / static_cast<double>(row.audited_points)
+            : 0.0;
+        out << plane_id << ',' << row.dense_points << ',' << row.audited_points << ','
+            << row.normal_mismatch_points << ',' << row.recoverable_mismatch_points << ','
+            << mismatch_rate << ',';
+        if (dominant_count > 0) out << dominant_alternative;
+        out << ',' << dominant_count << ',' << row.worst_normal_dot << ',';
+        if (row.recoverable_mismatch_points > 0) {
+            out << row.mismatch_min.x() << ',' << row.mismatch_min.y() << ',' << row.mismatch_min.z() << ','
+                << row.mismatch_max.x() << ',' << row.mismatch_max.y() << ',' << row.mismatch_max.z();
+        } else {
+            out << ",,,,,";
+        }
+        out << '\n';
+    }
+}
+
 static std::array<std::uint8_t, 3> color_for(std::size_t id) {
     std::uint32_t x = static_cast<std::uint32_t>(id + 1);
     x ^= x >> 16;
@@ -1028,6 +1131,9 @@ int main(int argc, char** argv) {
         merge_patches(patches, surfels, cfg);
         cfg.assign_margin = estimate_assign_margin(cloud, patches, cfg);
         assign_full_points(cloud, patches, cfg);
+        const std::vector<AssignmentAuditRow> assignment_audit = cfg.audit_assignments
+            ? audit_dense_assignments(patches, surfels, index_by_key, bounds, cfg)
+            : std::vector<AssignmentAuditRow>{};
         report_probe(cfg, bounds, surfels, index_by_key, patches);
         const std::vector<CornerCandidate> corners = extract_corners_filtered(cloud, patches, bounds, cfg);
 
@@ -1036,6 +1142,9 @@ int main(int argc, char** argv) {
         save_plane_patches(out_dir / "edge_aware_plane_patches.ply", patches);
         save_feature_edges(out_dir / "feature_edges.ply", surfels, index_by_key, patches);
         save_corners(out_dir / "extracted_corners.ply", corners);
+        if (cfg.audit_assignments) {
+            save_assignment_audit(out_dir / "assignment_audit.csv", assignment_audit);
+        }
 
         if (cfg.verbose) {
             std::size_t output_points = 0;
