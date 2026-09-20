@@ -14,14 +14,24 @@ This implementation targets clean model-exported PLY point clouds. The current d
 
 1. Load the model-exported PLY and scale meters to millimeters with `--input-scale 1000`.
 2. Build a 0.5 mm surfel grid as the segmentation graph. The original dense points are preserved for final assignment.
-3. Estimate surfel normals with PCL k-nearest normal estimation.
+3. Estimate surfel normals with PCL k-nearest normal estimation, then robustly
+   cluster low-curvature surfels into global direction families. Local normals
+   remain unchanged; the families are merge evidence rather than replacements.
 4. Detect sharp normal discontinuities as line features. These edge surfels are allowed to belong to a plane, but they do not act as seeds that grow through an edge.
 5. Sort candidate seeds by non-edge status, low curvature, and support count.
 6. Fit a local seed plane from each seed neighborhood.
 7. Grow the plane by BFS over neighboring surfels, accepting only surfels that match the seed-fitted plane by normal angle and residual distance.
-8. Refit and merge coplanar adjacent patches, then run one synchronous boundary-competition pass. Only labels present in the original 26-neighborhood may compete, preventing an inclined plane from propagating across a large face.
+8. Refit and merge coplanar adjacent patches. Repeated fragments agreeing with
+   one stable global direction may merge using that direction's centroid offset;
+   an isolated relaxed merge is rejected. Then run one synchronous
+   boundary-competition pass. Only labels present in the original 26-neighborhood
+   may compete, preventing an inclined plane from propagating across a large face.
 9. Refit the corrected regions and merge once more.
-10. Assign original dense points to the nearest accepted plane. This is a final recovery step, not the main segmentation mechanism.
+10. Assign original dense points to accepted planes. Distance remains the
+    default, but ambiguous points consult nearby 3-D surfel ownership and the
+    local normal. This distinguishes real local support from a plane's rectangular
+    projected envelope. Small patches are removed only after all safely
+    transferable points have been moved to established planes.
 11. Generate diagnostic edge/corner candidates, then extract stricter corner points from three-plane intersections validated by real point support and per-plane local support.
 
 ## Public Parameters
@@ -82,7 +92,7 @@ Observed on `top_left_cut2.ply`:
 Input points: 10000014
 Surfels: 27545
 Plane patches: 54
-Output points: 9888767
+Output points: 9889388
 Extracted corners: 75
 ```
 

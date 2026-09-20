@@ -13,6 +13,13 @@ synchronous plane-competition pass. Distance, local normal agreement, envelope
 support, and connectivity all participate; labels do not propagate beyond the
 original boundary during this pass.
 
+Reliable surfel normals are also clustered into global direction families.
+These families are used only to repair repeated coplanar fragmentation during
+merge; an isolated relaxed merge is rejected. Dense assignment uses nearby
+3-D surfel ownership as real support, so a plane cannot win merely because its
+2-D bounding rectangle extends through another surface. Edge-like cells may
+still use their normal when the competing directions are clearly separated.
+
 ## Build
 
 ```powershell
@@ -80,18 +87,30 @@ kept internal so the tool does not require dataset-specific manual tuning.
 Recent validated results:
 
 ```text
+top_left_cut:
+  Plane patches: 33
+  Feature edge points: 891
+  Extracted corners: 23
+  Output plane points: 12621846
+
 top_down:
   Plane patches: 15
   Feature edge points: 517
   Extracted corners: 16
-  Output plane points: 5702072
+  Output plane points: 5702636
 
 top_left_cut2:
   Plane patches: 54
   Feature edge points: 179
   Extracted corners: 75
-  Output plane points: 9888767
+  Output plane points: 9889388
+
+top_down2:
+  Plane patches: 12
+  Feature edge points: 880
+  Extracted corners: 16
+  Output plane points: 10000006
 ```
 
 The full four-dataset regression is in
-`results_rerun_competition_20260920` (ignored by Git).
+`results_logic_fix_final_20260921` (ignored by Git).
