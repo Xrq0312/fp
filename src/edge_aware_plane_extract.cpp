@@ -55,6 +55,8 @@ struct Config {
     float intersection_merge_scale = 4.5f;
     int min_corner_support = 8;
     int min_plane_local_support = 3;
+    bool has_probe = false;
+    Eigen::Vector3f probe{0.0f, 0.0f, 0.0f};
     bool verbose = true;
 };
 
@@ -103,6 +105,11 @@ struct PlanePatch {
     float max_v = 0.0f;
     float extent_u = 0.0f;
     float extent_v = 0.0f;
+    float rms_distance = 0.0f;
+};
+
+struct CompetitionStats {
+    std::size_t moved_surfels = 0;
 };
 
 struct CornerCandidate {
@@ -135,6 +142,7 @@ static Config parse_args(int argc, char** argv) {
             << "Options:\n"
             << "  --profile model-mm|model-m|top-down|top-left-cut2\n"
             << "  --output-dir DIR\n"
+            << "  --probe X Y Z  print plane-assignment diagnostics at a point\n"
             << "  --quiet\n";
         std::exit(args.empty() ? 1 : 0);
     }
@@ -148,6 +156,13 @@ static Config parse_args(int argc, char** argv) {
         } else if (arg == "--output-dir") {
             if (i + 1 >= args.size()) throw std::runtime_error("Missing value after --output-dir.");
             cfg.output_dir = args[++i];
+        } else if (arg == "--probe") {
+            if (i + 3 >= args.size()) throw std::runtime_error("--probe requires X Y Z.");
+            const float x = std::stof(args[++i]);
+            const float y = std::stof(args[++i]);
+            const float z = std::stof(args[++i]);
+            cfg.probe = Eigen::Vector3f(x, y, z);
+            cfg.has_probe = true;
         } else if (arg == "--quiet") {
             cfg.verbose = false;
         } else if (!arg.empty() && arg.front() == '-') {
@@ -311,6 +326,13 @@ static PlanePatch fit_patch_from_surfels(const std::vector<int>& ids, const std:
     if (n.z() < 0.0) n = -n;
     patch.normal = n.cast<float>().normalized();
     patch.d = -patch.normal.dot(patch.centroid);
+    double squared_error = 0.0;
+    for (int id : ids) {
+        const auto& surfel = surfels[static_cast<std::size_t>(id)];
+        const double distance = static_cast<double>(patch.normal.dot(surfel.centroid) + patch.d);
+        squared_error += static_cast<double>(std::max(surfel.count, 1)) * distance * distance;
+    }
+    patch.rms_distance = static_cast<float>(std::sqrt(squared_error / std::max(total_weight, 1.0)));
     return patch;
 }
 
@@ -528,6 +550,113 @@ static bool point_inside_patch_envelope(const PlanePatch& patch, const Eigen::Ve
     const float v = centered.dot(axis_v);
     return u >= patch.min_u - margin && u <= patch.max_u + margin &&
            v >= patch.min_v - margin && v <= patch.max_v + margin;
+}
+
+static std::vector<int> build_surfel_labels(const std::vector<PlanePatch>& patches, std::size_t surfel_count) {
+    std::vector<int> labels(surfel_count, -1);
+    for (std::size_t patch_id = 0; patch_id < patches.size(); ++patch_id) {
+        for (int surfel_id : patches[patch_id].surfels) {
+            if (surfel_id >= 0 && static_cast<std::size_t>(surfel_id) < labels.size()) {
+                labels[static_cast<std::size_t>(surfel_id)] = static_cast<int>(patch_id);
+            }
+        }
+    }
+    return labels;
+}
+
+static float surfel_plane_score(const Surfel& surfel, const PlanePatch& patch, const Config& cfg) {
+    const float distance_scale = std::max(cfg.coplanar_distance, 0.5f * cfg.surfel_size);
+    const float distance = std::abs(patch.normal.dot(surfel.centroid) + patch.d);
+    const float normal_dot = std::clamp(std::abs(surfel.normal.dot(patch.normal)), 0.0f, 1.0f);
+    const float angle_scale = std::max(
+        std::sin(cfg.smooth_angle_deg / 180.0f * 3.14159265358979323846f),
+        1e-3f);
+    const float angular_residual = std::sqrt(std::max(0.0f, 1.0f - normal_dot * normal_dot)) / angle_scale;
+    const float angle_weight = surfel.edge_like ? 0.25f : 1.0f;
+    const float distance_residual = distance / distance_scale;
+    return distance_residual * distance_residual + angle_weight * angular_residual * angular_residual;
+}
+
+static CompetitionStats refine_patch_ownership(
+    std::vector<PlanePatch>& patches,
+    const std::vector<Surfel>& surfels,
+    const std::unordered_map<CellKey, int, CellKeyHash>& index_by_key,
+    const Config& cfg) {
+    CompetitionStats stats;
+    if (patches.empty() || surfels.empty()) return stats;
+
+    std::vector<int> labels = build_surfel_labels(patches, surfels.size());
+    const float smooth_cos = std::cos(cfg.smooth_angle_deg / 180.0f * 3.14159265358979323846f);
+    const float envelope_margin = std::max(2.0f * cfg.surfel_size, cfg.coplanar_distance);
+    std::vector<int> refined_labels = labels;
+
+    for (std::size_t surfel_id = 0; surfel_id < surfels.size(); ++surfel_id) {
+        const int current = labels[surfel_id];
+        if (current < 0) continue;
+
+        std::array<int, 27> candidates{};
+        int candidate_count = 0;
+        candidates[static_cast<std::size_t>(candidate_count++)] = current;
+        for (int neighbor : surfel_neighbors(static_cast<int>(surfel_id), surfels, index_by_key)) {
+            const int candidate = labels[static_cast<std::size_t>(neighbor)];
+            if (candidate < 0) continue;
+            bool duplicate = false;
+            for (int k = 0; k < candidate_count; ++k) {
+                if (candidates[static_cast<std::size_t>(k)] == candidate) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (!duplicate) candidates[static_cast<std::size_t>(candidate_count++)] = candidate;
+        }
+
+        int best = current;
+        float best_score = surfel_plane_score(surfels[surfel_id], patches[static_cast<std::size_t>(current)], cfg);
+        for (int k = 0; k < candidate_count; ++k) {
+            const int candidate = candidates[static_cast<std::size_t>(k)];
+            if (candidate == current) continue;
+            const PlanePatch& patch = patches[static_cast<std::size_t>(candidate)];
+            const float distance = std::abs(patch.normal.dot(surfels[surfel_id].centroid) + patch.d);
+            if (distance > cfg.coplanar_distance) continue;
+            if (!point_inside_patch_envelope(patch, surfels[surfel_id].centroid, envelope_margin)) continue;
+            const float normal_dot = std::abs(surfels[surfel_id].normal.dot(patch.normal));
+            if (!surfels[surfel_id].edge_like && normal_dot < smooth_cos) continue;
+
+            const float score = surfel_plane_score(surfels[surfel_id], patch, cfg);
+            if (score + 0.05f < best_score) {
+                best = candidate;
+                best_score = score;
+            }
+        }
+
+        if (best != current) {
+            refined_labels[surfel_id] = best;
+            ++stats.moved_surfels;
+        }
+    }
+
+    if (stats.moved_surfels > 0) {
+        std::vector<std::vector<int>> ids_by_patch(patches.size());
+        for (std::size_t surfel_id = 0; surfel_id < refined_labels.size(); ++surfel_id) {
+            const int label = refined_labels[surfel_id];
+            if (label >= 0) ids_by_patch[static_cast<std::size_t>(label)].push_back(static_cast<int>(surfel_id));
+        }
+        for (std::size_t patch_id = 0; patch_id < patches.size(); ++patch_id) {
+            if (ids_by_patch[patch_id].size() < 3) continue;
+            patches[patch_id] = fit_patch_from_surfels(ids_by_patch[patch_id], surfels);
+            update_patch_envelope(patches[patch_id], surfels);
+        }
+    }
+
+    patches.erase(
+        std::remove_if(patches.begin(), patches.end(), [&](const PlanePatch& patch) {
+            return patch.surfels.size() < static_cast<std::size_t>(std::max(cfg.min_surfels, 3)) || !valid_shape(patch, cfg);
+        }),
+        patches.end());
+    std::sort(patches.begin(), patches.end(), [](const PlanePatch& a, const PlanePatch& b) {
+        return a.surfels.size() > b.surfels.size();
+    });
+    return stats;
 }
 
 static float estimate_assign_margin(
@@ -757,19 +886,90 @@ static void save_plane_patches(const fs::path& path, const std::vector<PlanePatc
     }
 }
 
+static void report_probe(
+    const Config& cfg,
+    const Bounds& bounds,
+    const std::vector<Surfel>& surfels,
+    const std::unordered_map<CellKey, int, CellKeyHash>& index_by_key,
+    const std::vector<PlanePatch>& patches) {
+    if (!cfg.has_probe) return;
+
+    PointT probe_point;
+    probe_point.x = cfg.probe.x();
+    probe_point.y = cfg.probe.y();
+    probe_point.z = cfg.probe.z();
+    const auto local_it = index_by_key.find(point_key(probe_point, bounds, cfg.surfel_size));
+    const std::vector<int> labels = build_surfel_labels(patches, surfels.size());
+
+    std::cout << "Probe: " << cfg.probe.transpose() << "\n";
+    if (local_it == index_by_key.end()) {
+        std::cout << "Probe surfel: none\n";
+    } else {
+        const int surfel_id = local_it->second;
+        const Surfel& surfel = surfels[static_cast<std::size_t>(surfel_id)];
+        std::cout << "Probe surfel: " << surfel_id
+                  << ", owner=" << labels[static_cast<std::size_t>(surfel_id)]
+                  << ", edge=" << (surfel.edge_like ? "yes" : "no")
+                  << ", normal=" << surfel.normal.transpose() << "\n";
+    }
+
+    struct Candidate {
+        std::size_t id = 0;
+        float distance = 0.0f;
+        float normal_dot = 0.0f;
+        bool inside_tight = false;
+        bool inside_assign = false;
+    };
+    std::vector<Candidate> candidates;
+    candidates.reserve(patches.size());
+    for (std::size_t i = 0; i < patches.size(); ++i) {
+        const PlanePatch& patch = patches[i];
+        Candidate candidate;
+        candidate.id = i;
+        candidate.distance = std::abs(patch.normal.dot(cfg.probe) + patch.d);
+        candidate.inside_tight = point_inside_patch_envelope(patch, cfg.probe, 2.0f * cfg.surfel_size);
+        candidate.inside_assign = point_inside_patch_envelope(patch, cfg.probe, cfg.assign_margin);
+        if (local_it != index_by_key.end()) {
+            candidate.normal_dot = std::abs(
+                surfels[static_cast<std::size_t>(local_it->second)].normal.dot(patch.normal));
+        }
+        candidates.push_back(candidate);
+    }
+    std::sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) {
+        return a.distance < b.distance;
+    });
+
+    int selected = -1;
+    for (const Candidate& candidate : candidates) {
+        if (candidate.distance <= cfg.assign_distance && candidate.inside_assign) {
+            selected = static_cast<int>(candidate.id);
+            break;
+        }
+    }
+    std::cout << "Probe dense assignment: " << selected << "\n";
+    const std::size_t shown = std::min<std::size_t>(candidates.size(), 8);
+    for (std::size_t rank = 0; rank < shown; ++rank) {
+        const Candidate& candidate = candidates[rank];
+        const PlanePatch& patch = patches[candidate.id];
+        std::cout << "Probe candidate " << candidate.id
+                  << ": plane=(" << patch.normal.transpose() << "; d=" << patch.d << ')'
+                  << ", distance=" << candidate.distance
+                  << ", normal_dot=" << candidate.normal_dot
+                  << ", tight=" << (candidate.inside_tight ? "in" : "out")
+                  << ", assign=" << (candidate.inside_assign ? "in" : "out")
+                  << ", accepted=" << (candidate.distance <= cfg.assign_distance && candidate.inside_assign ? "yes" : "no")
+                  << ", rms=" << patch.rms_distance
+                  << ", surfels=" << patch.surfels.size()
+                  << ", dense=" << patch.output->size() << "\n";
+    }
+}
+
 static void save_feature_edges(
     const fs::path& path,
     const std::vector<Surfel>& surfels,
     const std::unordered_map<CellKey, int, CellKeyHash>& index_by_key,
     const std::vector<PlanePatch>& patches) {
-    std::vector<int> labels(surfels.size(), -1);
-    for (std::size_t patch_id = 0; patch_id < patches.size(); ++patch_id) {
-        for (int surfel_id : patches[patch_id].surfels) {
-            if (surfel_id >= 0 && static_cast<std::size_t>(surfel_id) < labels.size()) {
-                labels[static_cast<std::size_t>(surfel_id)] = static_cast<int>(patch_id);
-            }
-        }
-    }
+    const std::vector<int> labels = build_surfel_labels(patches, surfels.size());
 
     const auto is_feature_edge = [&](std::size_t i) {
         if (labels[i] < 0) return false;
@@ -820,9 +1020,15 @@ int main(int argc, char** argv) {
         estimate_surfel_normals(surfels, surfel_cloud, cfg);
         mark_edge_surfels(surfels, index_by_key, cfg);
         std::vector<PlanePatch> patches = extract_seed_grown_patches(surfels, index_by_key, cfg);
+        const std::size_t grown_patch_count = patches.size();
+        merge_patches(patches, surfels, cfg);
+        const std::size_t initially_merged_patch_count = patches.size();
+        const CompetitionStats competition = refine_patch_ownership(patches, surfels, index_by_key, cfg);
+        const std::size_t competed_patch_count = patches.size();
         merge_patches(patches, surfels, cfg);
         cfg.assign_margin = estimate_assign_margin(cloud, patches, cfg);
         assign_full_points(cloud, patches, cfg);
+        report_probe(cfg, bounds, surfels, index_by_key, patches);
         const std::vector<CornerCandidate> corners = extract_corners_filtered(cloud, patches, bounds, cfg);
 
         fs::path out_dir = cfg.output_dir / cfg.input.stem();
@@ -836,6 +1042,9 @@ int main(int argc, char** argv) {
             for (const auto& patch : patches) output_points += patch.output->size();
             std::cout << "Input points: " << cloud->size() << "\n";
             std::cout << "Surfels: " << surfels.size() << "\n";
+            std::cout << "Grown/merged/competed patches: "
+                      << grown_patch_count << '/' << initially_merged_patch_count << '/' << competed_patch_count << "\n";
+            std::cout << "Boundary-reassigned surfels: " << competition.moved_surfels << "\n";
             std::cout << "Assignment margin: " << cfg.assign_margin << "\n";
             std::cout << "Plane patches: " << patches.size() << "\n";
             std::cout << "Output points: " << output_points << "\n";

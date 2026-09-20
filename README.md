@@ -8,6 +8,11 @@ geometry outputs:
 - `feature_edges.ply`: surfel centers on plane boundaries
 - `extracted_corners.ply`: validated three-plane corner points
 
+After seed growth and coplanar merging, directly adjacent surfels perform one
+synchronous plane-competition pass. Distance, local normal agreement, envelope
+support, and connectivity all participate; labels do not propagate beyond the
+original boundary during this pass.
+
 ## Build
 
 ```powershell
@@ -37,6 +42,15 @@ Add `-RenderImages` to either script when projection images are needed.
 .\build\Release\edge_aware_plane_extract.exe input.ply --profile model-mm --output-dir results
 ```
 
+To inspect a questionable location without changing extraction parameters:
+
+```powershell
+.\build\Release\edge_aware_plane_extract.exe input.ply --profile top-down --output-dir results --probe 67.5148 -27.3549 -10.9934
+```
+
+The probe reports the local surfel owner and normal, nearby plane equations,
+point-to-plane distances, envelope decisions, and the final dense assignment.
+
 Profiles:
 
 ```text
@@ -57,13 +71,16 @@ Recent validated results:
 ```text
 top_down:
   Plane patches: 15
-  Feature edge points: 486
+  Feature edge points: 517
   Extracted corners: 16
-  Output plane points: 5701483
+  Output plane points: 5702072
 
 top_left_cut2:
   Plane patches: 54
-  Feature edge points: 164
-  Extracted corners: 76
-  Output plane points: 9888831
+  Feature edge points: 179
+  Extracted corners: 75
+  Output plane points: 9888767
 ```
+
+The full four-dataset regression is in
+`results_rerun_competition_20260920` (ignored by Git).
