@@ -3,7 +3,7 @@ import argparse
 import math
 import random
 from pathlib import Path
-from typing import Iterable, List, Tuple
+from typing import Iterable, List, Optional, Tuple
 
 from PIL import Image, ImageDraw
 
@@ -41,35 +41,59 @@ def parse_header(path: Path):
     return fmt, vertex_count, props, offset
 
 
-def sample_ascii(path: Path, count: int, sample_limit: int, scale: float, seed: int) -> List[Point]:
+def sample_ascii(
+    path: Path,
+    count: int,
+    sample_limit: int,
+    scale: float,
+    seed: int,
+    crop: Optional[Tuple[float, float, float, float, float, float]],
+) -> List[Point]:
     rng = random.Random(seed)
     sample: List[Point] = []
+    accepted = 0
     with path.open("r", encoding="ascii", errors="ignore") as fh:
         for line in fh:
             if line.strip() == "end_header":
                 break
-        for i, line in enumerate(fh):
+        for line in fh:
             parts = line.split()
             if len(parts) < 3:
+                continue
+            x = float(parts[0]) * scale
+            y = float(parts[1]) * scale
+            z = float(parts[2]) * scale
+            if crop is not None and not (
+                crop[0] <= x <= crop[1]
+                and crop[2] <= y <= crop[3]
+                and crop[4] <= z <= crop[5]
+            ):
                 continue
             color = (210, 210, 210)
             if len(parts) >= 6:
                 color = tuple(max(0, min(255, int(float(v)))) for v in parts[3:6])
-            point = (float(parts[0]) * scale, float(parts[1]) * scale, float(parts[2]) * scale, color)
+            point = (x, y, z, color)
             if len(sample) < sample_limit:
                 sample.append(point)
             else:
-                j = rng.randrange(i + 1)
+                j = rng.randrange(accepted + 1)
                 if j < sample_limit:
                     sample[j] = point
+            accepted += 1
     return sample
 
 
-def load_points(path: Path, sample_limit: int, scale: float, seed: int) -> List[Point]:
+def load_points(
+    path: Path,
+    sample_limit: int,
+    scale: float,
+    seed: int,
+    crop: Optional[Tuple[float, float, float, float, float, float]],
+) -> List[Point]:
     fmt, vertex_count, _props, _offset = parse_header(path)
     if fmt != "ascii":
         raise RuntimeError(f"{path} is {fmt}; this lightweight renderer expects ascii PLY")
-    return sample_ascii(path, vertex_count, sample_limit, scale, seed)
+    return sample_ascii(path, vertex_count, sample_limit, scale, seed, crop)
 
 
 def bounds(points: Iterable[Point]):
@@ -89,6 +113,8 @@ def render_projection(
     title: str,
     point_radius: int,
     use_rgb: bool,
+    marks: List[Tuple[float, float, float]],
+    mark_radius: int,
 ):
     b = bounds(points)
     ax0, ax1 = axes
@@ -120,6 +146,17 @@ def render_projection(
         else:
             draw.ellipse((px - point_radius, py - point_radius, px + point_radius, py + point_radius), fill=color)
 
+    for mark in marks:
+        px = int((mark[ax0] - min0) * scale + offset0)
+        py = int(size - ((mark[ax1] - min1) * scale + offset1))
+        draw.ellipse(
+            (px - mark_radius, py - mark_radius, px + mark_radius, py + mark_radius),
+            outline=(255, 45, 45),
+            width=max(2, mark_radius // 3),
+        )
+        draw.line((px - mark_radius, py, px + mark_radius, py), fill=(255, 45, 45), width=2)
+        draw.line((px, py - mark_radius, px, py + mark_radius), fill=(255, 45, 45), width=2)
+
     out_path.parent.mkdir(parents=True, exist_ok=True)
     img.save(out_path)
 
@@ -134,10 +171,14 @@ def main():
     parser.add_argument("--size", type=int, default=1800)
     parser.add_argument("--rgb", action="store_true")
     parser.add_argument("--point-radius", type=int, default=1)
+    parser.add_argument("--crop", type=float, nargs=6, metavar=("XMIN", "XMAX", "YMIN", "YMAX", "ZMIN", "ZMAX"))
+    parser.add_argument("--mark", type=float, nargs=3, action="append", default=[], metavar=("X", "Y", "Z"))
+    parser.add_argument("--mark-radius", type=int, default=10)
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
-    points = load_points(args.ply, args.sample_limit, args.scale, args.seed)
+    crop = tuple(args.crop) if args.crop is not None else None
+    points = load_points(args.ply, args.sample_limit, args.scale, args.seed, crop)
     if not points:
         raise RuntimeError("no points loaded")
 
@@ -151,6 +192,8 @@ def main():
             prefix,
             args.point_radius,
             args.rgb,
+            [tuple(mark) for mark in args.mark],
+            args.mark_radius,
         )
 
 
