@@ -1,5 +1,5 @@
 param(
-    [string[]]$Variants = @("baseline"),
+    [string[]]$Variants = @("baseline", "multiscale"),
     [string]$OutputDir = ".\results\ablation",
     [switch]$IncludeLargeDatasets,
     [switch]$SkipBuild
@@ -79,6 +79,9 @@ foreach ($variant in $Variants) {
             Surfels = $values["Surfels"]
             PlanePatches = $values["Plane patches"]
             OutputPoints = $values["Output points"]
+            Coverage = if ([double]$values["Input points"] -gt 0) {
+                [double]$values["Output points"] / [double]$values["Input points"]
+            } else { 0.0 }
             Corners = $values["Extracted corners"]
             AssignmentMargin = $values["Assignment margin"]
             PlanePrecision = if ($quality) { $quality.plane_precision } else { $null }

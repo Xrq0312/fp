@@ -4,7 +4,9 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
+#include <iterator>
 #include <limits>
 #include <numeric>
 #include <queue>
@@ -174,7 +176,7 @@ static Config parse_args(int argc, char** argv) {
             << "Options:\n"
             << "  --profile model-mm|model-m|top-down|top-left-cut2\n"
             << "  --output-dir DIR\n"
-            << "  --pipeline baseline  select an ablation pipeline\n"
+            << "  --pipeline baseline|multiscale  select an ablation pipeline\n"
             << "  --audit-assignments  write per-plane dense-assignment diagnostics\n"
             << "  --distance-only  diagnostic A/B: disable normal-guided dense assignment\n"
             << "  --probe X Y Z  print plane-assignment diagnostics at a point\n"
@@ -194,8 +196,8 @@ static Config parse_args(int argc, char** argv) {
         } else if (arg == "--pipeline") {
             if (i + 1 >= args.size()) throw std::runtime_error("Missing value after --pipeline.");
             cfg.pipeline = args[++i];
-            if (cfg.pipeline != "baseline") {
-                throw std::runtime_error("Unknown pipeline: " + cfg.pipeline + ". Available: baseline.");
+            if (cfg.pipeline != "baseline" && cfg.pipeline != "multiscale") {
+                throw std::runtime_error("Unknown pipeline: " + cfg.pipeline + ". Available: baseline, multiscale.");
             }
         } else if (arg == "--audit-assignments") {
             cfg.audit_assignments = true;
@@ -219,6 +221,12 @@ static Config parse_args(int argc, char** argv) {
         }
     }
     if (cfg.input.empty()) throw std::runtime_error("Missing input PLY path.");
+    if (cfg.pipeline == "multiscale") {
+        // Fine residual faces are real deliverables, not sparse leftovers.  The
+        // stricter proposal validation remains the primary false-positive guard.
+        cfg.min_output_points = 400;
+        cfg.min_extent = std::max(1.5f, 3.0f * cfg.surfel_size);
+    }
     return cfg;
 }
 
@@ -293,13 +301,16 @@ static std::vector<Surfel> build_surfels(
     return surfels;
 }
 
-static void estimate_surfel_normals(std::vector<Surfel>& surfels, const CloudPtr& surfel_cloud, const Config& cfg) {
+static void estimate_surfel_normals(
+    std::vector<Surfel>& surfels,
+    const CloudPtr& surfel_cloud,
+    int normal_k) {
     pcl::search::Search<PointT>::Ptr tree(new pcl::search::KdTree<PointT>);
     pcl::PointCloud<pcl::Normal>::Ptr normals(new pcl::PointCloud<pcl::Normal>);
     pcl::NormalEstimation<PointT, pcl::Normal> ne;
     ne.setInputCloud(surfel_cloud);
     ne.setSearchMethod(tree);
-    ne.setKSearch(std::max(cfg.normal_k, 3));
+    ne.setKSearch(std::max(normal_k, 3));
     ne.compute(*normals);
 
     for (std::size_t i = 0; i < surfels.size(); ++i) {
@@ -338,6 +349,28 @@ static void mark_edge_surfels(
             }
         }
     }
+}
+
+static std::vector<Surfel> fuse_multiscale_surfels(
+    const std::vector<Surfel>& coarse,
+    const std::vector<Surfel>& local) {
+    if (coarse.size() != local.size()) {
+        throw std::runtime_error("Multi-scale surfel arrays have different sizes.");
+    }
+    std::vector<Surfel> fused = coarse;
+    for (std::size_t i = 0; i < fused.size(); ++i) {
+        const bool prefer_local = (coarse[i].edge_like && !local[i].edge_like) ||
+            local[i].curvature + 1e-8f < coarse[i].curvature;
+        if (prefer_local) {
+            fused[i].normal = local[i].normal;
+            fused[i].curvature = local[i].curvature;
+        }
+        // A hard boundary must persist at both normal-support scales.  A jump
+        // visible at only one scale is retained later as soft competition
+        // evidence, but it must not suppress a complete small face here.
+        fused[i].edge_like = coarse[i].edge_like && local[i].edge_like;
+    }
+    return fused;
 }
 
 static void plane_basis(const PlanePatch& patch, Eigen::Vector3f& axis_u, Eigen::Vector3f& axis_v) {
@@ -606,6 +639,12 @@ static void merge_patches_impl(
             for (std::size_t j = i + 1; j < patches.size(); ++j) {
                 if (!patches_can_merge(patches[i], patches[j], cfg, global_normals)) continue;
                 patches[i].surfels.insert(patches[i].surfels.end(), patches[j].surfels.begin(), patches[j].surfels.end());
+                // Multi-scale proposal passes intentionally overlap.  Keep one
+                // vote per surfel when the same physical face is rediscovered.
+                std::sort(patches[i].surfels.begin(), patches[i].surfels.end());
+                patches[i].surfels.erase(
+                    std::unique(patches[i].surfels.begin(), patches[i].surfels.end()),
+                    patches[i].surfels.end());
                 patches[i] = fit_patch_from_surfels(patches[i].surfels, surfels);
                 update_patch_envelope(patches[i], surfels);
                 patches.erase(patches.begin() + static_cast<std::ptrdiff_t>(j));
@@ -1324,6 +1363,20 @@ static void save_plane_patches(const fs::path& path, const std::vector<PlanePatc
     }
 }
 
+static void save_plane_parameters_csv(const fs::path& path, const std::vector<PlanePatch>& patches) {
+    std::ofstream out(path);
+    if (!out) throw std::runtime_error("Failed to write plane parameters: " + path.string());
+    out << "plane_id,surfels,dense_points,nx,ny,nz,d,cx,cy,cz,extent_u,extent_v,rms_distance\n";
+    out << std::setprecision(9);
+    for (std::size_t i = 0; i < patches.size(); ++i) {
+        const PlanePatch& patch = patches[i];
+        out << i << ',' << patch.surfels.size() << ',' << patch.output->size() << ','
+            << patch.normal.x() << ',' << patch.normal.y() << ',' << patch.normal.z() << ',' << patch.d << ','
+            << patch.centroid.x() << ',' << patch.centroid.y() << ',' << patch.centroid.z() << ','
+            << patch.extent_u << ',' << patch.extent_v << ',' << patch.rms_distance << '\n';
+    }
+}
+
 static void report_probe(
     const Config& cfg,
     const Bounds& bounds,
@@ -1495,10 +1548,44 @@ int main(int argc, char** argv) {
         std::unordered_map<CellKey, int, CellKeyHash> index_by_key;
         CloudPtr surfel_cloud;
         std::vector<Surfel> surfels = build_surfels(cloud, bounds, cfg, index_by_key, surfel_cloud);
-        estimate_surfel_normals(surfels, surfel_cloud, cfg);
+        estimate_surfel_normals(surfels, surfel_cloud, cfg.normal_k);
+
+        std::vector<PlanePatch> patches;
+        std::size_t coarse_candidate_count = 0;
+        std::size_t local_candidate_count = 0;
+        if (cfg.pipeline == "baseline") {
+            mark_edge_surfels(surfels, index_by_key, cfg);
+            patches = extract_seed_grown_patches(surfels, index_by_key, cfg);
+            coarse_candidate_count = patches.size();
+        } else {
+            std::vector<Surfel> coarse_surfels = surfels;
+            std::vector<Surfel> local_surfels = surfels;
+            estimate_surfel_normals(local_surfels, surfel_cloud, std::max(6, cfg.normal_k / 2));
+            mark_edge_surfels(coarse_surfels, index_by_key, cfg);
+            mark_edge_surfels(local_surfels, index_by_key, cfg);
+
+            std::vector<PlanePatch> coarse_patches =
+                extract_seed_grown_patches(coarse_surfels, index_by_key, cfg);
+            coarse_candidate_count = coarse_patches.size();
+
+            surfels = fuse_multiscale_surfels(coarse_surfels, local_surfels);
+            Config local_cfg = cfg;
+            local_cfg.min_surfels = std::max(8, cfg.min_surfels / 2);
+            local_cfg.min_extent = std::max(1.5f, 3.0f * cfg.surfel_size);
+            local_cfg.smooth_angle_deg = std::min(10.0f, cfg.smooth_angle_deg + 2.0f);
+            local_cfg.max_planes = std::max(cfg.max_planes, 240);
+            std::vector<PlanePatch> local_patches =
+                extract_seed_grown_patches(surfels, index_by_key, local_cfg);
+            local_candidate_count = local_patches.size();
+
+            patches = std::move(coarse_patches);
+            patches.insert(
+                patches.end(),
+                std::make_move_iterator(local_patches.begin()),
+                std::make_move_iterator(local_patches.end()));
+        }
+
         const GlobalNormalStats global_normals = estimate_global_normal_families(surfels, cfg);
-        mark_edge_surfels(surfels, index_by_key, cfg);
-        std::vector<PlanePatch> patches = extract_seed_grown_patches(surfels, index_by_key, cfg);
         const std::size_t grown_patch_count = patches.size();
         std::size_t global_family_merges = merge_patches_adaptive(patches, surfels, cfg, global_normals);
         const std::size_t initially_merged_patch_count = patches.size();
@@ -1528,6 +1615,7 @@ int main(int argc, char** argv) {
         fs::path out_dir = cfg.output_dir / cfg.input.stem();
         fs::create_directories(out_dir);
         save_plane_patches(out_dir / "edge_aware_plane_patches.ply", patches);
+        save_plane_parameters_csv(out_dir / "plane_parameters.csv", patches);
         save_feature_edges(out_dir / "feature_edges.ply", surfels, index_by_key, patches);
         save_corners(out_dir / "extracted_corners.ply", corners);
         if (cfg.audit_assignments) {
@@ -1542,6 +1630,8 @@ int main(int argc, char** argv) {
             std::cout << "Surfels: " << surfels.size() << "\n";
             std::cout << "Global normal families/reliable surfels: "
                       << global_normals.directions.size() << '/' << global_normals.reliable_surfels << "\n";
+            std::cout << "Coarse/local candidate patches: "
+                      << coarse_candidate_count << '/' << local_candidate_count << "\n";
             std::cout << "Accepted global-family merges: " << global_family_merges << "\n";
             std::cout << "Grown/merged/competed patches: "
                       << grown_patch_count << '/' << initially_merged_patch_count << '/' << competed_patch_count << "\n";

@@ -22,6 +22,15 @@ still use their normal when the competing directions are clearly separated.
 
 ## Build
 
+The checked-in preset pins dependency discovery to the requested vcpkg tree:
+
+```powershell
+cmake --preset vcpkg-release
+cmake --build --preset vcpkg-release
+```
+
+The equivalent explicit commands are:
+
 ```powershell
 & 'D:\Program Files\Microsoft Visual Studio\2022\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe' -S . -B build -DCMAKE_TOOLCHAIN_FILE='D:/vcpkg/vcpkg/scripts/buildsystems/vcpkg.cmake' -DVCPKG_TARGET_TRIPLET=x64-windows
 & 'D:\Program Files\Microsoft Visual Studio\2022\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe' --build build --config Release --target edge_aware_plane_extract
@@ -48,6 +57,18 @@ Add `-RenderImages` to either script when projection images are needed.
 ```powershell
 .\build\Release\edge_aware_plane_extract.exe input.ply --profile model-mm --output-dir results
 ```
+
+Use `--pipeline baseline` for the preserved original algorithm or
+`--pipeline multiscale` for the first global/local proposal ablation. Run the
+deterministic synthetic comparison with:
+
+```powershell
+.\scripts\run_ablation.ps1 -SkipBuild
+```
+
+Add `-IncludeLargeDatasets` to include the supplied real point clouds. Design
+and measured ablations are recorded in `docs/multiplane_corner_optimization_plan.md`
+and `docs/ablation_results.md`.
 
 To inspect a questionable location without changing extraction parameters:
 
