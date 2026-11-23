@@ -37,3 +37,28 @@ narrow (the two smallest have 510/519 dense points and 0.026/0.009 mm surfel
 fit RMS); they need the later joint-model stage and visual/ground-truth review
 before being called true positives. `top_left_cut2` retained the exact baseline
 plane/corner counts and two additional dense points.
+
+## Stage 2: joint multi-model assignment and refit
+
+This stage replaces the one-pass, neighbor-label-only competition with bounded
+coordinate descent over all geometrically feasible hypotheses. The energy has
+point-to-plane/normal data cost, local label coherence, an outlier label, and a
+model cost that removes a small label only when another model explains at least
+90% of its support with negligible loss. Plane parameters are refitted after
+each synchronous labeling round.
+
+| Dataset | Planes | Corners | Point coverage | Time (s) | Joint iterations |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| stepped_box | 11 | 16 | 100.00% | 1.39 | 3 |
+| top_down | 20 | 16 | 99.99% | 36.72 | 5 |
+| top_left_cut2 | 54 | 62 | 98.89% | 67.66 | 5 |
+
+The synthetic quality metrics remain perfect; 1,549 surfel label changes fill
+previously unowned boundary support without deleting a true small face. The
+real-data runs pruned no model under the conservative label-cost rule. The
+additional `top_down` face has 627 dense points and 0.0076 mm fit RMS. On
+`top_left_cut2`, plane count and coverage remain stable while the old cubic
+corner filter returns 62 rather than 75 intersections. With no corner ground
+truth this is ambiguous, so corner quality is deferred to the later
+adjacency/boundary-aware stage instead of tuning this optimizer to reproduce a
+raw count.

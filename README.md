@@ -58,9 +58,10 @@ Add `-RenderImages` to either script when projection images are needed.
 .\build\Release\edge_aware_plane_extract.exe input.ply --profile model-mm --output-dir results
 ```
 
-Use `--pipeline baseline` for the preserved original algorithm or
-`--pipeline multiscale` for the first global/local proposal ablation. Run the
-deterministic synthetic comparison with:
+Use `--pipeline baseline` for the preserved original algorithm,
+`--pipeline multiscale` for global/local proposals, or `--pipeline joint` to
+add iterative multi-model assignment, refitting, outlier handling, and label
+cost pruning. Run the deterministic synthetic comparison with:
 
 ```powershell
 .\scripts\run_ablation.ps1 -SkipBuild

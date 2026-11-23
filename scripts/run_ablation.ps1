@@ -1,5 +1,5 @@
 param(
-    [string[]]$Variants = @("baseline", "multiscale"),
+    [string[]]$Variants = @("baseline", "multiscale", "joint"),
     [string]$OutputDir = ".\results\ablation",
     [switch]$IncludeLargeDatasets,
     [switch]$SkipBuild

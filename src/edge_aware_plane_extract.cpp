@@ -115,6 +115,9 @@ struct PlanePatch {
 
 struct CompetitionStats {
     std::size_t moved_surfels = 0;
+    std::size_t pruned_models = 0;
+    int iterations = 0;
+    double final_energy = 0.0;
 };
 
 struct DenseAssignmentStats {
@@ -176,7 +179,7 @@ static Config parse_args(int argc, char** argv) {
             << "Options:\n"
             << "  --profile model-mm|model-m|top-down|top-left-cut2\n"
             << "  --output-dir DIR\n"
-            << "  --pipeline baseline|multiscale  select an ablation pipeline\n"
+            << "  --pipeline baseline|multiscale|joint  select an ablation pipeline\n"
             << "  --audit-assignments  write per-plane dense-assignment diagnostics\n"
             << "  --distance-only  diagnostic A/B: disable normal-guided dense assignment\n"
             << "  --probe X Y Z  print plane-assignment diagnostics at a point\n"
@@ -196,8 +199,9 @@ static Config parse_args(int argc, char** argv) {
         } else if (arg == "--pipeline") {
             if (i + 1 >= args.size()) throw std::runtime_error("Missing value after --pipeline.");
             cfg.pipeline = args[++i];
-            if (cfg.pipeline != "baseline" && cfg.pipeline != "multiscale") {
-                throw std::runtime_error("Unknown pipeline: " + cfg.pipeline + ". Available: baseline, multiscale.");
+            if (cfg.pipeline != "baseline" && cfg.pipeline != "multiscale" && cfg.pipeline != "joint") {
+                throw std::runtime_error(
+                    "Unknown pipeline: " + cfg.pipeline + ". Available: baseline, multiscale, joint.");
             }
         } else if (arg == "--audit-assignments") {
             cfg.audit_assignments = true;
@@ -221,7 +225,7 @@ static Config parse_args(int argc, char** argv) {
         }
     }
     if (cfg.input.empty()) throw std::runtime_error("Missing input PLY path.");
-    if (cfg.pipeline == "multiscale") {
+    if (cfg.pipeline != "baseline") {
         // Fine residual faces are real deliverables, not sparse leftovers.  The
         // stricter proposal validation remains the primary false-positive guard.
         cfg.min_output_points = 400;
@@ -791,6 +795,175 @@ static CompetitionStats refine_patch_ownership(
     std::sort(patches.begin(), patches.end(), [](const PlanePatch& a, const PlanePatch& b) {
         return a.surfels.size() > b.surfels.size();
     });
+    return stats;
+}
+
+static float joint_surfel_data_cost(
+    const Surfel& surfel,
+    const PlanePatch& patch,
+    const Config& cfg) {
+    const float distance = std::abs(patch.normal.dot(surfel.centroid) + patch.d);
+    const float distance_limit = std::max(2.0f * cfg.coplanar_distance, cfg.surfel_size);
+    if (distance > distance_limit) return std::numeric_limits<float>::infinity();
+    if (!point_inside_patch_envelope(
+            patch, surfel.centroid, std::max(2.0f * cfg.surfel_size, cfg.coplanar_distance))) {
+        return std::numeric_limits<float>::infinity();
+    }
+    const float relaxed_angle = std::min(18.0f, 1.5f * cfg.smooth_angle_deg);
+    const float relaxed_cos = std::cos(relaxed_angle / 180.0f * 3.14159265358979323846f);
+    if (!surfel.edge_like && std::abs(surfel.normal.dot(patch.normal)) < relaxed_cos) {
+        return std::numeric_limits<float>::infinity();
+    }
+    return std::min(surfel_plane_score(surfel, patch, cfg), 25.0f);
+}
+
+static CompetitionStats refine_patch_ownership_joint(
+    std::vector<PlanePatch>& patches,
+    const std::vector<Surfel>& surfels,
+    const std::unordered_map<CellKey, int, CellKeyHash>& index_by_key,
+    const Config& cfg) {
+    CompetitionStats stats;
+    if (patches.empty() || surfels.empty()) return stats;
+
+    std::vector<std::vector<int>> neighbors(surfels.size());
+    for (std::size_t i = 0; i < surfels.size(); ++i) {
+        neighbors[i] = surfel_neighbors(static_cast<int>(i), surfels, index_by_key);
+    }
+
+    std::vector<int> labels = build_surfel_labels(patches, surfels.size());
+    std::vector<bool> active(patches.size(), true);
+    const int maximum_iterations = 5;
+    const float outlier_cost = 4.0f;
+
+    for (int iteration = 0; iteration < maximum_iterations; ++iteration) {
+        std::vector<int> next_labels = labels;
+        std::size_t moved_this_iteration = 0;
+        double iteration_energy = 0.0;
+
+        for (std::size_t surfel_id = 0; surfel_id < surfels.size(); ++surfel_id) {
+            const Surfel& surfel = surfels[surfel_id];
+            const float smooth_weight = surfel.edge_like ? 0.02f : 0.10f;
+            int best_label = -1;
+            float best_cost = outlier_cost;
+            for (int neighbor : neighbors[surfel_id]) {
+                if (labels[static_cast<std::size_t>(neighbor)] >= 0) best_cost += 0.5f * smooth_weight;
+            }
+
+            for (std::size_t patch_id = 0; patch_id < patches.size(); ++patch_id) {
+                if (!active[patch_id] || patches[patch_id].surfels.empty()) continue;
+                float cost = joint_surfel_data_cost(surfel, patches[patch_id], cfg);
+                if (!std::isfinite(cost)) continue;
+                for (int neighbor : neighbors[surfel_id]) {
+                    const int neighbor_label = labels[static_cast<std::size_t>(neighbor)];
+                    if (neighbor_label >= 0 && neighbor_label != static_cast<int>(patch_id)) {
+                        cost += smooth_weight;
+                    } else if (neighbor_label < 0) {
+                        cost += 0.25f * smooth_weight;
+                    }
+                }
+
+                // Deterministic inertia prevents equal-cost labels from
+                // oscillating when two hypotheses explain a boundary equally.
+                const float inertia = labels[surfel_id] == static_cast<int>(patch_id) ? -0.02f : 0.0f;
+                if (cost + inertia < best_cost) {
+                    best_cost = cost;
+                    best_label = static_cast<int>(patch_id);
+                }
+            }
+
+            next_labels[surfel_id] = best_label;
+            iteration_energy += best_cost;
+            if (best_label != labels[surfel_id]) ++moved_this_iteration;
+        }
+
+        labels.swap(next_labels);
+        stats.moved_surfels += moved_this_iteration;
+        stats.final_energy = iteration_energy;
+        stats.iterations = iteration + 1;
+
+        std::vector<std::vector<int>> ids_by_patch(patches.size());
+        for (std::size_t surfel_id = 0; surfel_id < labels.size(); ++surfel_id) {
+            const int label = labels[surfel_id];
+            if (label >= 0) ids_by_patch[static_cast<std::size_t>(label)].push_back(static_cast<int>(surfel_id));
+        }
+        for (std::size_t patch_id = 0; patch_id < patches.size(); ++patch_id) {
+            if (ids_by_patch[patch_id].size() < 3) {
+                active[patch_id] = false;
+                patches[patch_id].surfels.clear();
+                continue;
+            }
+            patches[patch_id] = fit_patch_from_surfels(ids_by_patch[patch_id], surfels);
+            update_patch_envelope(patches[patch_id], surfels);
+        }
+        if (moved_this_iteration == 0) break;
+    }
+
+    // PEARL-style label cost: a small model is redundant when almost all of its
+    // surfels can move to another active model with negligible data-cost loss.
+    const std::size_t small_model_limit = static_cast<std::size_t>(std::max(4 * cfg.min_surfels, 64));
+    for (std::size_t patch_id = 0; patch_id < patches.size(); ++patch_id) {
+        if (!active[patch_id] || patches[patch_id].surfels.empty() ||
+            patches[patch_id].surfels.size() > small_model_limit) {
+            continue;
+        }
+        std::size_t explainable = 0;
+        for (int surfel_id : patches[patch_id].surfels) {
+            const Surfel& surfel = surfels[static_cast<std::size_t>(surfel_id)];
+            const float current_cost = joint_surfel_data_cost(surfel, patches[patch_id], cfg);
+            float alternative_cost = std::numeric_limits<float>::infinity();
+            for (std::size_t candidate = 0; candidate < patches.size(); ++candidate) {
+                if (candidate == patch_id || !active[candidate] || patches[candidate].surfels.empty()) continue;
+                alternative_cost = std::min(
+                    alternative_cost, joint_surfel_data_cost(surfel, patches[candidate], cfg));
+            }
+            if (std::isfinite(alternative_cost) && alternative_cost <= current_cost + 0.20f) ++explainable;
+        }
+        if (explainable * 10 >= patches[patch_id].surfels.size() * 9) {
+            active[patch_id] = false;
+            ++stats.pruned_models;
+        }
+    }
+
+    // Reassign support from a pruned label once; leaving it as an outlier is
+    // preferable to forcing it onto a geometrically incompatible surface.
+    for (std::size_t surfel_id = 0; surfel_id < labels.size(); ++surfel_id) {
+        const int current = labels[surfel_id];
+        if (current < 0 || active[static_cast<std::size_t>(current)]) continue;
+        int best = -1;
+        float best_cost = outlier_cost;
+        for (std::size_t candidate = 0; candidate < patches.size(); ++candidate) {
+            if (!active[candidate] || patches[candidate].surfels.empty()) continue;
+            const float cost = joint_surfel_data_cost(surfels[surfel_id], patches[candidate], cfg);
+            if (cost < best_cost) {
+                best = static_cast<int>(candidate);
+                best_cost = cost;
+            }
+        }
+        labels[surfel_id] = best;
+    }
+
+    std::vector<std::vector<int>> final_ids(patches.size());
+    for (std::size_t surfel_id = 0; surfel_id < labels.size(); ++surfel_id) {
+        const int label = labels[surfel_id];
+        if (label >= 0 && active[static_cast<std::size_t>(label)]) {
+            final_ids[static_cast<std::size_t>(label)].push_back(static_cast<int>(surfel_id));
+        }
+    }
+    std::vector<PlanePatch> retained;
+    retained.reserve(patches.size());
+    for (std::size_t patch_id = 0; patch_id < patches.size(); ++patch_id) {
+        if (!active[patch_id] ||
+            final_ids[patch_id].size() < static_cast<std::size_t>(std::max(cfg.min_surfels, 3))) {
+            continue;
+        }
+        PlanePatch patch = fit_patch_from_surfels(final_ids[patch_id], surfels);
+        update_patch_envelope(patch, surfels);
+        if (valid_shape(patch, cfg)) retained.push_back(std::move(patch));
+    }
+    std::sort(retained.begin(), retained.end(), [](const PlanePatch& a, const PlanePatch& b) {
+        return a.surfels.size() > b.surfels.size();
+    });
+    patches.swap(retained);
     return stats;
 }
 
@@ -1589,7 +1762,9 @@ int main(int argc, char** argv) {
         const std::size_t grown_patch_count = patches.size();
         std::size_t global_family_merges = merge_patches_adaptive(patches, surfels, cfg, global_normals);
         const std::size_t initially_merged_patch_count = patches.size();
-        const CompetitionStats competition = refine_patch_ownership(patches, surfels, index_by_key, cfg);
+        const CompetitionStats competition = cfg.pipeline == "joint"
+            ? refine_patch_ownership_joint(patches, surfels, index_by_key, cfg)
+            : refine_patch_ownership(patches, surfels, index_by_key, cfg);
         const std::size_t competed_patch_count = patches.size();
         global_family_merges += merge_patches_adaptive(patches, surfels, cfg, global_normals);
         cfg.assign_margin = estimate_assign_margin(cloud, patches, cfg);
@@ -1636,6 +1811,11 @@ int main(int argc, char** argv) {
             std::cout << "Grown/merged/competed patches: "
                       << grown_patch_count << '/' << initially_merged_patch_count << '/' << competed_patch_count << "\n";
             std::cout << "Boundary-reassigned surfels: " << competition.moved_surfels << "\n";
+            if (cfg.pipeline == "joint") {
+                std::cout << "Joint iterations/pruned models/energy: "
+                          << competition.iterations << '/' << competition.pruned_models << '/'
+                          << competition.final_energy << "\n";
+            }
             std::cout << "Normal-guided dense candidates: " << dense_assignment.normal_guided_points
                       << ", established evidence: " << dense_assignment.established_guided_points
                       << ", applied: " << (normal_guidance_applied ? "yes" : "no") << "\n";
