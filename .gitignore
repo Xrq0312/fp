@@ -1,5 +1,6 @@
 # Build outputs
 /build/
+**/build/
 *.obj
 *.exe
 *.dll
@@ -17,6 +18,10 @@
 /results_seed_grow*/
 /compare_*/
 /compare_images/
+/registration_results/
+/phase_unwrap_task/phase_distribution_analysis/
+/simple_phase_plane_cpp/test_results/
+/simple_phase_plane_cpp/*_smoke*/
 /phase_unwrap_task/results*/
 /delivery/pointcloud_corner_delivery/results/
 /delivery/pointcloud_corner_delivery/run_results/
@@ -25,6 +30,8 @@
 # Large source data and packaged artifacts
 /PMD_DATA/
 /PMD_DATA.zip
+/data/
+/data_phase_unwrap/
 /data01/
 /data02/
 /delivery/**/*.zip
@@ -34,6 +41,8 @@
 /.codex/
 .vs/
 .vscode/
+__pycache__/
+*.py[cod]
 *.user
 *.suo
 Thumbs.db
