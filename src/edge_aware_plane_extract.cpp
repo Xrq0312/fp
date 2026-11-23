@@ -60,6 +60,7 @@ struct Config {
     bool has_probe = false;
     Eigen::Vector3f probe{0.0f, 0.0f, 0.0f};
     bool verbose = true;
+    std::string pipeline = "baseline";
 };
 
 struct Bounds {
@@ -173,6 +174,7 @@ static Config parse_args(int argc, char** argv) {
             << "Options:\n"
             << "  --profile model-mm|model-m|top-down|top-left-cut2\n"
             << "  --output-dir DIR\n"
+            << "  --pipeline baseline  select an ablation pipeline\n"
             << "  --audit-assignments  write per-plane dense-assignment diagnostics\n"
             << "  --distance-only  diagnostic A/B: disable normal-guided dense assignment\n"
             << "  --probe X Y Z  print plane-assignment diagnostics at a point\n"
@@ -189,6 +191,12 @@ static Config parse_args(int argc, char** argv) {
         } else if (arg == "--output-dir") {
             if (i + 1 >= args.size()) throw std::runtime_error("Missing value after --output-dir.");
             cfg.output_dir = args[++i];
+        } else if (arg == "--pipeline") {
+            if (i + 1 >= args.size()) throw std::runtime_error("Missing value after --pipeline.");
+            cfg.pipeline = args[++i];
+            if (cfg.pipeline != "baseline") {
+                throw std::runtime_error("Unknown pipeline: " + cfg.pipeline + ". Available: baseline.");
+            }
         } else if (arg == "--audit-assignments") {
             cfg.audit_assignments = true;
         } else if (arg == "--distance-only") {
@@ -1529,6 +1537,7 @@ int main(int argc, char** argv) {
         if (cfg.verbose) {
             std::size_t output_points = 0;
             for (const auto& patch : patches) output_points += patch.output->size();
+            std::cout << "Pipeline: " << cfg.pipeline << "\n";
             std::cout << "Input points: " << cloud->size() << "\n";
             std::cout << "Surfels: " << surfels.size() << "\n";
             std::cout << "Global normal families/reliable surfels: "
