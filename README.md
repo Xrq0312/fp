@@ -67,7 +67,9 @@ cost pruning. Run the deterministic synthetic comparison with:
 .\scripts\run_ablation.ps1 -SkipBuild
 ```
 
-Add `-IncludeLargeDatasets` to include the supplied real point clouds. Design
+Add `-IncludeLargeDatasets` to include all four supplied real point clouds
+(`top_left_cut`, `top_left_cut2`, `top_down`, and `top_down2`). Use
+`-DatasetNames top_left_cut,top_down2` to select a subset. Design
 and measured ablations are recorded in `docs/multiplane_corner_optimization_plan.md`
 and `docs/ablation_results.md`.
 

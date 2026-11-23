@@ -1,5 +1,6 @@
 param(
     [string[]]$Variants = @("baseline", "multiscale", "joint"),
+    [string[]]$DatasetNames = @(),
     [string]$OutputDir = ".\results\ablation",
     [switch]$IncludeLargeDatasets,
     [switch]$SkipBuild
@@ -29,9 +30,17 @@ $datasets = @(
 )
 if ($IncludeLargeDatasets) {
     $datasets += @(
+        [pscustomobject]@{ Name = "top_left_cut"; Path = "..\data\data01\data01\top_left_cut.ply"; Profile = "model-mm" },
+        [pscustomobject]@{ Name = "top_left_cut2"; Path = "..\data\data01\data01\top_left_cut2.ply"; Profile = "top-left-cut2" },
         [pscustomobject]@{ Name = "top_down"; Path = "..\data\data02\data02\top_down.ply"; Profile = "top-down" },
-        [pscustomobject]@{ Name = "top_left_cut2"; Path = "..\data\data01\data01\top_left_cut2.ply"; Profile = "top-left-cut2" }
+        [pscustomobject]@{ Name = "top_down2"; Path = "..\data\data02\data02\top_down2.ply"; Profile = "top-down" }
     )
+}
+if ($DatasetNames.Count -gt 0) {
+    $datasets = @($datasets | Where-Object { $DatasetNames -contains $_.Name })
+    if ($datasets.Count -ne $DatasetNames.Count) {
+        throw "One or more requested datasets are unknown: $($DatasetNames -join ', ')"
+    }
 }
 
 $rows = @()
