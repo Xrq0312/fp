@@ -77,3 +77,53 @@ corner filter returns 62 rather than 75 intersections. With no corner ground
 truth this is ambiguous, so corner quality is deferred to the later
 adjacency/boundary-aware stage instead of tuning this optimizer to reproduce a
 raw count.
+
+## Stage 3: observed-topology boundary correction
+
+This stage targets the small colored wedges and speckles caused by dense points
+being assigned across an observed plane intersection. It does not replace the
+joint classifier. Plane adjacency is read from the surfel label graph; a
+directed half-space constraint is created only for non-parallel neighbors when
+the owner patch has decisive support on exactly one side of the adjacent plane.
+Support on both sides vetoes clipping, which preserves crossing sheets and large
+faces surrounding internal openings. The tolerance is three fitted-noise
+standard deviations rather than a dataset-specific distance.
+
+Small proposals remain detectable, but a log-support median/MAD lower-tail
+outlier cannot clip an established face. A joint assignment is changed only if
+it violates such a constraint, the actually crossed neighbor is also a feasible
+candidate, and that neighbor has no weaker observed local support. If no safe
+replacement exists, the original joint label is retained.
+
+| Dataset | Planes | Corners | Point coverage | Corrected dense points | Active constraints | Time (s) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| stepped_box | 11 | 16 | 100.00% | 0 | 44 | 1.98 |
+| top_left_cut | 49 | 19 | 99.94% | 1,736 | 119 | 54.82 |
+| top_left_cut2 | 54 | 61 | 98.89% | 348 | 348 | 88.75 |
+| top_down | 20 | 16 | 99.99% | 44 | 48 | 46.49 |
+| top_down2 | 20 | 32 | 100.00% | 0 | 72 | 77.23 |
+
+On the dedicated intersecting-plane fixture, topology changed 233 edge-band
+points and improved macro IoU from 0.96918 (`joint`) to 0.98540 while retaining
+2/2 planes and 100% coverage. The stepped-box regression remains exactly 1.0
+for plane precision, recall, macro IoU, coverage, corner precision, and corner
+recall, demonstrating that external boundaries, internal openings, and the
+small raised box are not clipped.
+
+All four real PLY files were run with the same rule set. Patch count and coverage
+match the joint stage on every file; `top_left_cut2` changes from 62 to 61 raw
+corner candidates, which is reported as a regression observation rather than an
+accuracy claim. Against `data2.STEP`, all 54 predicted `top_left_cut2` patches
+match an analytic STEP plane within 3 degrees and 0.75 coordinate units, and the
+matched-point fraction is 1.0. Earlier, less conservative topology experiments
+created up to three small transition patches; those variants were rejected and
+are not part of this stage.
+
+The stage writes `topology_corrections.ply` and `.csv` for direct inspection.
+Orthographic overlays show the corrected points as thin line segments and corner
+clusters along observed plane intersections, rather than patches scattered over
+face interiors. The renderer now has a standard-library PNG fallback, so these
+checks do not require Pillow. Timings are representative Release runs and vary
+with concurrent desktop load; the zero-correction `top_down2` case is about 6%
+slower than the recorded joint run after deferring topology checks until the
+ordinary joint candidate has been selected.

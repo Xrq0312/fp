@@ -113,6 +113,12 @@ struct PlanePatch {
     float rms_distance = 0.0f;
 };
 
+struct BoundaryConstraint {
+    int other_plane = -1;
+    float expected_sign = 1.0f;
+    float tolerance = 0.0f;
+};
+
 struct CompetitionStats {
     std::size_t moved_surfels = 0;
     std::size_t pruned_models = 0;
@@ -120,10 +126,20 @@ struct CompetitionStats {
     double final_energy = 0.0;
 };
 
+struct TopologyCorrection {
+    PointT point;
+    int from_plane = -1;
+    int to_plane = -1;
+};
+
 struct DenseAssignmentStats {
     std::size_t normal_guided_points = 0;
     std::size_t locally_supported_points = 0;
     std::size_t established_guided_points = 0;
+    std::size_t topology_guided_points = 0;
+    std::size_t boundary_rejected_candidates = 0;
+    std::size_t boundary_constraints = 0;
+    std::vector<TopologyCorrection> corrections;
 };
 
 struct FinalizeStats {
@@ -154,6 +170,8 @@ struct CornerCandidate {
     int support = 0;
 };
 
+static float median_value(std::vector<float> values);
+
 static float scale_for_profile(const std::string& profile) {
     if (profile == "model-mm" || profile == "top-down") {
         return 1.0f;
@@ -179,7 +197,7 @@ static Config parse_args(int argc, char** argv) {
             << "Options:\n"
             << "  --profile model-mm|model-m|top-down|top-left-cut2\n"
             << "  --output-dir DIR\n"
-            << "  --pipeline baseline|multiscale|joint  select an ablation pipeline\n"
+            << "  --pipeline baseline|multiscale|joint|topology  select an ablation pipeline\n"
             << "  --audit-assignments  write per-plane dense-assignment diagnostics\n"
             << "  --distance-only  diagnostic A/B: disable normal-guided dense assignment\n"
             << "  --probe X Y Z  print plane-assignment diagnostics at a point\n"
@@ -199,9 +217,11 @@ static Config parse_args(int argc, char** argv) {
         } else if (arg == "--pipeline") {
             if (i + 1 >= args.size()) throw std::runtime_error("Missing value after --pipeline.");
             cfg.pipeline = args[++i];
-            if (cfg.pipeline != "baseline" && cfg.pipeline != "multiscale" && cfg.pipeline != "joint") {
+            if (cfg.pipeline != "baseline" && cfg.pipeline != "multiscale" &&
+                cfg.pipeline != "joint" && cfg.pipeline != "topology") {
                 throw std::runtime_error(
-                    "Unknown pipeline: " + cfg.pipeline + ". Available: baseline, multiscale, joint.");
+                    "Unknown pipeline: " + cfg.pipeline +
+                    ". Available: baseline, multiscale, joint, topology.");
             }
         } else if (arg == "--audit-assignments") {
             cfg.audit_assignments = true;
@@ -344,7 +364,8 @@ static void mark_edge_surfels(
                     const int j = it->second;
                     if (j <= static_cast<int>(i)) continue;
 
-                    const bool angle_edge = std::abs(surfels[i].normal.dot(surfels[static_cast<std::size_t>(j)].normal)) < edge_cos;
+                    const bool angle_edge = std::abs(
+                        surfels[i].normal.dot(surfels[static_cast<std::size_t>(j)].normal)) < edge_cos;
                     if (angle_edge) {
                         surfels[i].edge_like = true;
                         surfels[static_cast<std::size_t>(j)].edge_like = true;
@@ -703,6 +724,87 @@ static std::vector<int> build_surfel_labels(const std::vector<PlanePatch>& patch
     return labels;
 }
 
+static std::vector<std::vector<BoundaryConstraint>> build_boundary_constraints(
+    const std::vector<PlanePatch>& patches,
+    const std::vector<Surfel>& surfels,
+    const std::unordered_map<CellKey, int, CellKeyHash>& index_by_key,
+    const Config& cfg) {
+    std::vector<std::vector<BoundaryConstraint>> constraints(patches.size());
+    if (patches.size() < 2) return constraints;
+    const std::vector<int> labels = build_surfel_labels(patches, surfels.size());
+    std::vector<float> log_support;
+    log_support.reserve(patches.size());
+    for (const PlanePatch& patch : patches) {
+        log_support.push_back(std::log(static_cast<float>(std::max<std::size_t>(patch.surfels.size(), 1))));
+    }
+    const float median_log_support = median_value(log_support);
+    std::vector<float> support_deviations;
+    support_deviations.reserve(log_support.size());
+    for (float value : log_support) support_deviations.push_back(std::abs(value - median_log_support));
+    const float support_sigma = 1.4826f * median_value(std::move(support_deviations));
+    const float boundary_authority_floor = median_log_support - 3.0f * support_sigma;
+    std::set<std::pair<int, int>> adjacent_pairs;
+    for (std::size_t surfel_id = 0; surfel_id < labels.size(); ++surfel_id) {
+        const int first = labels[surfel_id];
+        if (first < 0) continue;
+        for (int neighbor : surfel_neighbors(static_cast<int>(surfel_id), surfels, index_by_key)) {
+            const int second = labels[static_cast<std::size_t>(neighbor)];
+            if (second < 0 || second == first) continue;
+            adjacent_pairs.emplace(std::min(first, second), std::max(first, second));
+        }
+    }
+
+    const float nonparallel_cos = std::cos(
+        cfg.smooth_angle_deg / 180.0f * 3.14159265358979323846f);
+    for (const auto& pair : adjacent_pairs) {
+        const int first = pair.first;
+        const int second = pair.second;
+        const PlanePatch& a = patches[static_cast<std::size_t>(first)];
+        const PlanePatch& b = patches[static_cast<std::size_t>(second)];
+        if (std::abs(a.normal.dot(b.normal)) >= nonparallel_cos) continue;
+        const float fit_sigma = std::hypot(a.rms_distance, b.rms_distance);
+        const float tolerance = std::max(3.0f * fit_sigma, 1e-6f * cfg.surfel_size);
+
+        const auto add_if_one_sided = [&](int owner, int other) {
+            // Local/small proposals remain valid output models, but a support
+            // outlier may not clip a better-established neighbor.  The lower
+            // bound is inferred from this scene's log-support distribution, so
+            // uniformly small scenes retain full boundary authority.
+            if (log_support[static_cast<std::size_t>(other)] < boundary_authority_floor) return;
+            std::size_t positive = 0;
+            std::size_t negative = 0;
+            const PlanePatch& owner_patch = patches[static_cast<std::size_t>(owner)];
+            const PlanePatch& other_patch = patches[static_cast<std::size_t>(other)];
+            for (int surfel_id : owner_patch.surfels) {
+                const float signed_distance = other_patch.normal.dot(
+                    surfels[static_cast<std::size_t>(surfel_id)].centroid) + other_patch.d;
+                if (signed_distance > tolerance) {
+                    ++positive;
+                } else if (signed_distance < -tolerance) {
+                    ++negative;
+                }
+            }
+            const std::size_t decisive = positive + negative;
+            if (decisive == 0) return;
+            // A terminating boundary must be genuinely one-sided.  Merely
+            // having a dominant side is insufficient: a large plane around an
+            // internal opening can have unequal areas on the two sides of an
+            // adjacent wall while still continuing across its infinite plane.
+            // The 3-sigma dead band above absorbs fit noise; any decisive
+            // support on both sides therefore vetoes the half-space constraint.
+            if (positive > 0 && negative > 0) return;
+            constraints[static_cast<std::size_t>(owner)].push_back({
+                other,
+                positive >= negative ? 1.0f : -1.0f,
+                tolerance
+            });
+        };
+        add_if_one_sided(first, second);
+        add_if_one_sided(second, first);
+    }
+    return constraints;
+}
+
 static float surfel_plane_score(const Surfel& surfel, const PlanePatch& patch, const Config& cfg) {
     const float distance_scale = std::max(cfg.coplanar_distance, 0.5f * cfg.surfel_size);
     const float distance = std::abs(patch.normal.dot(surfel.centroid) + patch.d);
@@ -1025,6 +1127,11 @@ static DenseAssignmentStats assign_full_points(
     const float edge_cos = std::cos(cfg.edge_angle_deg / 180.0f * 3.14159265358979323846f);
     const int support_radius = 2;
     const std::vector<int> labels = build_surfel_labels(patches, surfels.size());
+    const bool topology_aware = cfg.pipeline == "topology";
+    const std::vector<std::vector<BoundaryConstraint>> boundary_constraints = topology_aware
+        ? build_boundary_constraints(patches, surfels, index_by_key, cfg)
+        : std::vector<std::vector<BoundaryConstraint>>(patches.size());
+    for (const auto& constraints : boundary_constraints) stats.boundary_constraints += constraints.size();
 
     struct DenseCandidate {
         int id = -1;
@@ -1041,6 +1148,12 @@ static DenseAssignmentStats assign_full_points(
         const Surfel* local_surfel = local != index_by_key.end()
             ? &surfels[static_cast<std::size_t>(local->second)]
             : nullptr;
+        const int local_owner = local != index_by_key.end()
+            ? labels[static_cast<std::size_t>(local->second)]
+            : -1;
+        const int established_local_owner = local_surfel != nullptr && !local_surfel->edge_like
+            ? local_owner
+            : -1;
         const bool has_local_normal = enable_normal_guidance && local_surfel != nullptr;
 
         std::array<DenseCandidate, 160> candidates{};
@@ -1061,15 +1174,11 @@ static DenseAssignmentStats assign_full_points(
         }
         if (candidate_count == 0) continue;
 
-        std::size_t distance_best = 0;
-        for (std::size_t i = 1; i < candidate_count; ++i) {
-            if (candidates[i].distance < candidates[distance_best].distance) distance_best = i;
-        }
-
         // Only ambiguous points pay for the local support lookup.  The lookup is
         // in the original 3-D surfel grid, so it cannot be fooled by a large 2-D
         // patch rectangle extending through an unrelated surface.
-        if (candidate_count > 1) {
+        const bool needs_local_support = candidate_count > 1;
+        if (needs_local_support) {
             for (int dx = -support_radius; dx <= support_radius; ++dx) {
                 for (int dy = -support_radius; dy <= support_radius; ++dy) {
                     for (int dz = -support_radius; dz <= support_radius; ++dz) {
@@ -1087,6 +1196,18 @@ static DenseAssignmentStats assign_full_points(
             }
         }
 
+        std::size_t distance_best = candidate_count;
+        for (std::size_t i = 0; i < candidate_count; ++i) {
+            if (distance_best == candidate_count ||
+                candidates[i].distance < candidates[distance_best].distance) {
+                distance_best = i;
+            }
+        }
+        if (distance_best == candidate_count) continue;
+
+        // Preserve the joint pipeline's dense assignment exactly as the base
+        // decision.  Topology is a conservative correction applied below, not
+        // a replacement classifier for every point in the cloud.
         std::size_t selected = distance_best;
         std::size_t normal_best = candidate_count;
         const float candidate_normal_cos = local_surfel != nullptr && local_surfel->edge_like
@@ -1103,8 +1224,7 @@ static DenseAssignmentStats assign_full_points(
         const bool distance_has_bad_normal = candidates[distance_best].normal_dot < smooth_cos;
         const bool distance_lacks_real_support = candidates[distance_best].local_support == 0;
         const bool edge_normal_is_decisive = local_surfel == nullptr || !local_surfel->edge_like ||
-            candidates[distance_best].normal_dot <
-                std::cos(cfg.edge_angle_deg / 180.0f * 3.14159265358979323846f);
+            candidates[distance_best].normal_dot < edge_cos;
         const bool correct_loose_or_unsupported = !candidates[distance_best].inside_tight ||
             distance_lacks_real_support;
         if (normal_best < candidate_count && distance_has_bad_normal && edge_normal_is_decisive &&
@@ -1117,6 +1237,57 @@ static DenseAssignmentStats assign_full_points(
                     ++stats.established_guided_points;
                 }
                 if (candidates[distance_best].inside_tight && distance_lacks_real_support) {
+                    ++stats.locally_supported_points;
+                }
+            }
+        }
+
+        const auto crossed_neighbor = [&](const DenseCandidate& candidate) {
+            if (!topology_aware || established_local_owner == candidate.id) return -1;
+            float largest_violation = 0.0f;
+            int crossed = -1;
+            for (const BoundaryConstraint& constraint :
+                    boundary_constraints[static_cast<std::size_t>(candidate.id)]) {
+                const PlanePatch& other = patches[static_cast<std::size_t>(constraint.other_plane)];
+                const float signed_distance = constraint.expected_sign * (other.normal.dot(q) + other.d);
+                if (signed_distance >= -constraint.tolerance) continue;
+                const float violation = -constraint.tolerance - signed_distance;
+                if (violation > largest_violation) {
+                    largest_violation = violation;
+                    crossed = constraint.other_plane;
+                }
+            }
+            return crossed;
+        };
+
+        const int crossed = crossed_neighbor(candidates[selected]);
+        if (crossed >= 0) {
+            std::size_t corrected = candidate_count;
+            for (std::size_t i = 0; i < candidate_count; ++i) {
+                if (candidates[i].id != crossed) continue;
+                if (crossed_neighbor(candidates[i]) >= 0) continue;
+                // Boundary geometry may only overturn the joint decision when
+                // the adjacent feasible model has no weaker observed neighborhood
+                // support.  This prevents a thin transition/edge proposal from
+                // acquiring points merely because it lies on the allowed side.
+                if (candidates[i].local_support < candidates[selected].local_support) continue;
+                if (corrected == candidate_count || candidates[i].distance < candidates[corrected].distance) {
+                    corrected = i;
+                }
+            }
+            // Never turn a classified point into an outlier solely because all
+            // candidates violate uncertain fitted boundaries.  Correct only
+            // when the ordinary joint candidate set contains a feasible model.
+            if (corrected < candidate_count) {
+                stats.corrections.push_back({
+                    p,
+                    candidates[selected].id,
+                    candidates[corrected].id
+                });
+                selected = corrected;
+                ++stats.topology_guided_points;
+                ++stats.boundary_rejected_candidates;
+                if (candidates[selected].local_support > 0) {
                     ++stats.locally_supported_points;
                 }
             }
@@ -1536,6 +1707,28 @@ static void save_plane_patches(const fs::path& path, const std::vector<PlanePatc
     }
 }
 
+static void save_topology_corrections(
+    const fs::path& ply_path,
+    const fs::path& csv_path,
+    const std::vector<TopologyCorrection>& corrections) {
+    std::ofstream ply(ply_path);
+    if (!ply) throw std::runtime_error("Failed to write topology corrections: " + ply_path.string());
+    write_color_ply_header(ply, corrections.size());
+    for (const TopologyCorrection& correction : corrections) {
+        ply << correction.point.x << ' ' << correction.point.y << ' ' << correction.point.z
+            << " 255 48 48\n";
+    }
+
+    std::ofstream csv(csv_path);
+    if (!csv) throw std::runtime_error("Failed to write topology corrections: " + csv_path.string());
+    csv << "x,y,z,from_plane,to_plane\n";
+    csv << std::setprecision(9);
+    for (const TopologyCorrection& correction : corrections) {
+        csv << correction.point.x << ',' << correction.point.y << ',' << correction.point.z << ','
+            << correction.from_plane << ',' << correction.to_plane << '\n';
+    }
+}
+
 static void save_plane_parameters_csv(const fs::path& path, const std::vector<PlanePatch>& patches) {
     std::ofstream out(path);
     if (!out) throw std::runtime_error("Failed to write plane parameters: " + path.string());
@@ -1762,7 +1955,8 @@ int main(int argc, char** argv) {
         const std::size_t grown_patch_count = patches.size();
         std::size_t global_family_merges = merge_patches_adaptive(patches, surfels, cfg, global_normals);
         const std::size_t initially_merged_patch_count = patches.size();
-        const CompetitionStats competition = cfg.pipeline == "joint"
+        const CompetitionStats competition =
+            (cfg.pipeline == "joint" || cfg.pipeline == "topology")
             ? refine_patch_ownership_joint(patches, surfels, index_by_key, cfg)
             : refine_patch_ownership(patches, surfels, index_by_key, cfg);
         const std::size_t competed_patch_count = patches.size();
@@ -1775,8 +1969,9 @@ int main(int argc, char** argv) {
         const std::size_t minimum_guided_evidence = std::max<std::size_t>(
             static_cast<std::size_t>(std::max(cfg.min_output_points, 1)) / 4,
             cloud->size() / 10000);
-        const bool normal_guidance_applied = !cfg.distance_only &&
-            dense_assignment.established_guided_points >= minimum_guided_evidence;
+        const bool topology_guidance_applied = cfg.pipeline == "topology";
+        const bool normal_guidance_applied = topology_guidance_applied ||
+            (!cfg.distance_only && dense_assignment.established_guided_points >= minimum_guided_evidence);
         if (!normal_guidance_applied) {
             assign_full_points(cloud, patches, surfels, index_by_key, bounds, cfg, false);
         }
@@ -1793,6 +1988,12 @@ int main(int argc, char** argv) {
         save_plane_parameters_csv(out_dir / "plane_parameters.csv", patches);
         save_feature_edges(out_dir / "feature_edges.ply", surfels, index_by_key, patches);
         save_corners(out_dir / "extracted_corners.ply", corners);
+        if (cfg.pipeline == "topology") {
+            save_topology_corrections(
+                out_dir / "topology_corrections.ply",
+                out_dir / "topology_corrections.csv",
+                dense_assignment.corrections);
+        }
         if (cfg.audit_assignments) {
             save_assignment_audit(out_dir / "assignment_audit.csv", assignment_audit);
         }
@@ -1811,7 +2012,7 @@ int main(int argc, char** argv) {
             std::cout << "Grown/merged/competed patches: "
                       << grown_patch_count << '/' << initially_merged_patch_count << '/' << competed_patch_count << "\n";
             std::cout << "Boundary-reassigned surfels: " << competition.moved_surfels << "\n";
-            if (cfg.pipeline == "joint") {
+            if (cfg.pipeline == "joint" || cfg.pipeline == "topology") {
                 std::cout << "Joint iterations/pruned models/energy: "
                           << competition.iterations << '/' << competition.pruned_models << '/'
                           << competition.final_energy << "\n";
@@ -1820,6 +2021,12 @@ int main(int argc, char** argv) {
                       << ", established evidence: " << dense_assignment.established_guided_points
                       << ", applied: " << (normal_guidance_applied ? "yes" : "no") << "\n";
             std::cout << "Local-support dense candidates: " << dense_assignment.locally_supported_points << "\n";
+            std::cout << "Topology-guided dense assignments: "
+                      << dense_assignment.topology_guided_points << "\n";
+            std::cout << "Boundary-rejected dense candidates: "
+                      << dense_assignment.boundary_rejected_candidates << "\n";
+            std::cout << "Active plane-side constraints: "
+                      << dense_assignment.boundary_constraints << "\n";
             std::cout << "Safely absorbed small patches/points: "
                       << finalize_stats.absorbed_patches << '/' << finalize_stats.absorbed_points << "\n";
             std::cout << "Discarded sparse patch points: " << finalize_stats.discarded_sparse_points << "\n";

@@ -1,14 +1,108 @@
 #!/usr/bin/env python3
 import argparse
+import struct
 import math
 import random
+import zlib
 from pathlib import Path
 from typing import Iterable, List, Optional, Tuple
 
-from PIL import Image, ImageDraw
+try:
+    from PIL import Image, ImageDraw
+except ModuleNotFoundError:
+    Image = None
+    ImageDraw = None
 
 
 Point = Tuple[float, float, float, Tuple[int, int, int]]
+
+
+class RasterImage:
+    """Small dependency-free RGB canvas used when Pillow is unavailable."""
+
+    def __init__(self, width: int, height: int, color: Tuple[int, int, int]):
+        self.width = width
+        self.height = height
+        self.pixels = bytearray(color * (width * height))
+
+    def putpixel(self, point: Tuple[int, int], color: Tuple[int, int, int]) -> None:
+        x, y = point
+        if not (0 <= x < self.width and 0 <= y < self.height):
+            return
+        offset = 3 * (y * self.width + x)
+        self.pixels[offset : offset + 3] = bytes(color)
+
+    @staticmethod
+    def _chunk(name: bytes, payload: bytes) -> bytes:
+        body = name + payload
+        return struct.pack(">I", len(payload)) + body + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF)
+
+    def save(self, path: Path) -> None:
+        rows = bytearray()
+        stride = self.width * 3
+        for y in range(self.height):
+            rows.append(0)
+            rows.extend(self.pixels[y * stride : (y + 1) * stride])
+        header = struct.pack(">IIBBBBB", self.width, self.height, 8, 2, 0, 0, 0)
+        payload = b"\x89PNG\r\n\x1a\n"
+        payload += self._chunk(b"IHDR", header)
+        payload += self._chunk(b"IDAT", zlib.compress(bytes(rows), 6))
+        payload += self._chunk(b"IEND", b"")
+        path.write_bytes(payload)
+
+
+class RasterDraw:
+    def __init__(self, image: RasterImage):
+        self.image = image
+
+    def text(self, _point, _text, fill=None) -> None:
+        # Labels are cosmetic; keeping the raster fallback dependency-free is
+        # more useful than embedding a bitmap font.
+        return
+
+    def ellipse(self, box, fill=None, outline=None, width=1) -> None:
+        x0, y0, x1, y1 = map(int, box)
+        cx = 0.5 * (x0 + x1)
+        cy = 0.5 * (y0 + y1)
+        rx = max(0.5, 0.5 * abs(x1 - x0))
+        ry = max(0.5, 0.5 * abs(y1 - y0))
+        color = fill if fill is not None else outline
+        if color is None:
+            return
+        inner_rx = max(0.0, rx - width)
+        inner_ry = max(0.0, ry - width)
+        for y in range(max(0, y0), min(self.image.height - 1, y1) + 1):
+            for x in range(max(0, x0), min(self.image.width - 1, x1) + 1):
+                outer = ((x - cx) / rx) ** 2 + ((y - cy) / ry) ** 2 <= 1.0
+                if not outer:
+                    continue
+                if fill is None and inner_rx > 0.0 and inner_ry > 0.0:
+                    inner = ((x - cx) / inner_rx) ** 2 + ((y - cy) / inner_ry) ** 2 < 1.0
+                    if inner:
+                        continue
+                self.image.putpixel((x, y), color)
+
+    def line(self, points, fill, width=1) -> None:
+        x0, y0, x1, y1 = map(int, points)
+        dx = abs(x1 - x0)
+        sx = 1 if x0 < x1 else -1
+        dy = -abs(y1 - y0)
+        sy = 1 if y0 < y1 else -1
+        error = dx + dy
+        radius = max(0, width // 2)
+        while True:
+            for oy in range(-radius, radius + 1):
+                for ox in range(-radius, radius + 1):
+                    self.image.putpixel((x0 + ox, y0 + oy), fill)
+            if x0 == x1 and y0 == y1:
+                break
+            twice = 2 * error
+            if twice >= dy:
+                error += dy
+                x0 += sx
+            if twice <= dx:
+                error += dx
+                y0 += sy
 
 
 def parse_header(path: Path):
@@ -124,8 +218,12 @@ def render_projection(
     span1 = max(max1 - min1, 1e-9)
 
     margin = 44
-    img = Image.new("RGB", (size, size), (18, 20, 22))
-    draw = ImageDraw.Draw(img)
+    if Image is not None and ImageDraw is not None:
+        img = Image.new("RGB", (size, size), (18, 20, 22))
+        draw = ImageDraw.Draw(img)
+    else:
+        img = RasterImage(size, size, (18, 20, 22))
+        draw = RasterDraw(img)
 
     usable = size - margin * 2
     scale = min(usable / span0, usable / span1)
@@ -173,6 +271,8 @@ def main():
     parser.add_argument("--point-radius", type=int, default=1)
     parser.add_argument("--crop", type=float, nargs=6, metavar=("XMIN", "XMAX", "YMIN", "YMAX", "ZMIN", "ZMAX"))
     parser.add_argument("--mark", type=float, nargs=3, action="append", default=[], metavar=("X", "Y", "Z"))
+    parser.add_argument("--overlay-ply", type=Path)
+    parser.add_argument("--overlay-sample-limit", type=int, default=50000)
     parser.add_argument("--mark-radius", type=int, default=10)
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
@@ -181,6 +281,17 @@ def main():
     points = load_points(args.ply, args.sample_limit, args.scale, args.seed, crop)
     if not points:
         raise RuntimeError("no points loaded")
+
+    marks = [tuple(mark) for mark in args.mark]
+    if args.overlay_ply is not None:
+        overlay = load_points(
+            args.overlay_ply,
+            args.overlay_sample_limit,
+            args.scale,
+            args.seed,
+            crop,
+        )
+        marks.extend((point[0], point[1], point[2]) for point in overlay)
 
     prefix = args.prefix or args.ply.stem
     for name, axes in [("xy", (0, 1)), ("xz", (0, 2)), ("yz", (1, 2))]:
@@ -192,7 +303,7 @@ def main():
             prefix,
             args.point_radius,
             args.rgb,
-            [tuple(mark) for mark in args.mark],
+            marks,
             args.mark_radius,
         )
 

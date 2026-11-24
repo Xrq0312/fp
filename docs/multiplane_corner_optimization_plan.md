@@ -43,7 +43,8 @@ not a reconstruction from Git history.
 | `baseline` | frozen original path | repository baseline |
 | `multiscale` | global pass plus adaptive fine residual proposals; deterministic oriented three-surfel hypotheses | CPFN, Efficient RANSAC, Minimal Quadric Fits |
 | `joint` | alternating multi-label assignment/refit, label cost, model birth/death/merge | Progressive-X, PEARL |
-| `boundary` | continuous multi-scale boundary confidence and boundary-crossing penalty | SED-Net |
+| `topology` | observed adjacency, one-sided plane support, and conservative dense boundary correction | SED-Net, Progressive-X |
+| `boundary` (planned) | continuous multi-scale boundary confidence | SED-Net |
 | `relations` | robust parallel/orthogonal relation discovery and constrained normal refinement | GlobFit |
 | `enhanced` | adjacency-driven corner extraction with conditioning and three-boundary support | SED-Net, GCCao validation pattern |
 
@@ -73,13 +74,17 @@ plane proposals; this project does not currently detect cylinders.
 
 Two kinds of evidence are kept separate:
 
-1. A deterministic synthetic stepped-box fixture provides plane instance labels
-   and corner coordinates. Report plane precision/recall, macro IoU, coverage,
-   over-segmentation, corner precision/recall/error, and runtime.
+1. Deterministic synthetic fixtures provide plane instance labels. The stepped
+   box covers small faces, internal openings, and corners; intersecting planes
+   with noisy dense edge bands measure boundary spill. Report plane
+   precision/recall, macro IoU, coverage, over-segmentation, corner
+   precision/recall/error, and runtime.
 2. The four supplied real point clouds have no checked-in instance ground truth.
    They are regression datasets. Report coverage, patch count, fragmentation
    proxies, edge/corner counts, fit RMS, deterministic repeatability, and CPU
-   time. These numbers must not be described as accuracy or recall.
+   time. These numbers must not be described as accuracy or recall. Where the
+   coordinate frame agrees, compare fitted equations against analytic STEP
+   planes as an independent geometry check.
 
 Acceptance priorities are: (1) no regression in synthetic plane/corner recall,
 (2) reduced false merge and fragmentation, (3) higher real-data coverage, and

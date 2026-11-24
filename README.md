@@ -7,6 +7,8 @@ geometry outputs:
 - `edge_aware_plane_patches.ply`: dense points assigned to extracted planes
 - `feature_edges.ply`: surfel centers on plane boundaries
 - `extracted_corners.ply`: validated three-plane corner points
+- `topology_corrections.ply/.csv`: points whose joint label was conservatively
+  changed by `--pipeline topology`, including source/target candidate ids
 
 After seed growth and coplanar merging, directly adjacent surfels perform one
 synchronous plane-competition pass. Distance, local normal agreement, envelope
@@ -32,8 +34,8 @@ cmake --build --preset vcpkg-release
 The equivalent explicit commands are:
 
 ```powershell
-& 'D:\Program Files\Microsoft Visual Studio\2022\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe' -S . -B build -DCMAKE_TOOLCHAIN_FILE='D:/vcpkg/vcpkg/scripts/buildsystems/vcpkg.cmake' -DVCPKG_TARGET_TRIPLET=x64-windows
-& 'D:\Program Files\Microsoft Visual Studio\2022\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe' --build build --config Release --target edge_aware_plane_extract
+cmake -S . -B build -DCMAKE_TOOLCHAIN_FILE='C:/vcpkg/vcpkg/scripts/buildsystems/vcpkg.cmake' -DVCPKG_TARGET_TRIPLET=x64-windows
+cmake --build build --config Release --target edge_aware_plane_extract
 ```
 
 ## Run
@@ -61,7 +63,10 @@ Add `-RenderImages` to either script when projection images are needed.
 Use `--pipeline baseline` for the preserved original algorithm,
 `--pipeline multiscale` for global/local proposals, or `--pipeline joint` to
 add iterative multi-model assignment, refitting, outlier handling, and label
-cost pruning. Run the deterministic synthetic comparison with:
+cost pruning. Use `--pipeline topology` to add conservative observed-boundary
+constraints that correct dense points spilling across an adjacent plane while
+leaving the joint decision unchanged elsewhere. Run the deterministic synthetic
+comparison with:
 
 ```powershell
 .\scripts\run_ablation.ps1 -SkipBuild

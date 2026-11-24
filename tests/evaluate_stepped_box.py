@@ -69,21 +69,26 @@ def evaluate(labels_path: Path, truth_path: Path, result_dir: Path) -> dict[str,
             contingency[predicted][label] += 1
 
 
-    best_iou_by_gt: dict[int, float] = {label: 0.0 for label in gt_sizes}
-    best_gt_by_prediction: dict[tuple[int, int, int], tuple[int, float]] = {}
+    pair_ious: list[tuple[float, tuple[int, int, int], int]] = []
     for predicted, predicted_size in predicted_sizes.items():
-        best_label = -1
-        best_iou = 0.0
         for label, intersection in contingency[predicted].items():
             union = predicted_size + gt_sizes[label] - intersection
             iou = intersection / union if union else 0.0
-            if iou > best_iou:
-                best_label, best_iou = label, iou
-            best_iou_by_gt[label] = max(best_iou_by_gt[label], iou)
-        best_gt_by_prediction[predicted] = best_label, best_iou
+            pair_ious.append((iou, predicted, label))
 
-    detected = sum(iou >= 0.5 for iou in best_iou_by_gt.values())
-    valid_predictions = sum(iou >= 0.5 for _, iou in best_gt_by_prediction.values())
+    # One predicted instance cannot claim multiple ground-truth instances.
+    # Greedy maximum-IoU matching is deterministic and sufficient for these
+    # small fixtures without introducing a SciPy dependency.
+    used_predictions: set[tuple[int, int, int]] = set()
+    used_labels: set[int] = set()
+    matched_ious: list[float] = []
+    for iou, predicted, label in sorted(pair_ious, reverse=True):
+        if predicted in used_predictions or label in used_labels:
+            continue
+        used_predictions.add(predicted)
+        used_labels.add(label)
+        matched_ious.append(iou)
+    valid_matches = sum(iou >= 0.5 for iou in matched_ious)
     fragments_per_gt: Counter[int] = Counter()
     for predicted, counts in contingency.items():
         for label, intersection in counts.items():
@@ -111,9 +116,9 @@ def evaluate(labels_path: Path, truth_path: Path, result_dir: Path) -> dict[str,
 
     matched_points = sum(sum(counts.values()) for counts in contingency.values())
     metrics: dict[str, object] = {
-        "plane_precision": valid_predictions / len(predicted_sizes) if predicted_sizes else 0.0,
-        "plane_recall": detected / len(gt_sizes) if gt_sizes else 0.0,
-        "plane_macro_iou": sum(best_iou_by_gt.values()) / len(gt_sizes) if gt_sizes else 0.0,
+        "plane_precision": valid_matches / len(predicted_sizes) if predicted_sizes else 0.0,
+        "plane_recall": valid_matches / len(gt_sizes) if gt_sizes else 0.0,
+        "plane_macro_iou": sum(matched_ious) / len(gt_sizes) if gt_sizes else 0.0,
         "plane_instances": len(predicted_sizes),
         "plane_oversegmentation": oversegmentation,
         "point_coverage": matched_points / len(labels) if labels else 0.0,

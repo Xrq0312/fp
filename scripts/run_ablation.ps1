@@ -1,5 +1,5 @@
 param(
-    [string[]]$Variants = @("baseline", "multiscale", "joint"),
+    [string[]]$Variants = @("baseline", "multiscale", "joint", "topology"),
     [string[]]$DatasetNames = @(),
     [string]$OutputDir = ".\results\ablation",
     [switch]$IncludeLargeDatasets,
@@ -17,23 +17,26 @@ if (-not $SkipBuild) {
 
 $fixtureDir = Join-Path $OutputDir "fixtures"
 New-Item -ItemType Directory -Force -Path $fixtureDir | Out-Null
-$fixture = Join-Path $fixtureDir "stepped_box.ply"
+$steppedFixture = Join-Path $fixtureDir "stepped_box.ply"
+$crossingFixture = Join-Path $fixtureDir "crossing_planes.ply"
 $python = Get-ChildItem "$env:LOCALAPPDATA\Programs\Python\Python*\python.exe" -ErrorAction SilentlyContinue |
     Select-Object -First 1 -ExpandProperty FullName
 if (-not $python) {
     throw "A real Python installation is required; the Windows Store alias is not sufficient."
 }
-& $python .\tests\generate_stepped_box.py $fixture
+& $python .\tests\generate_stepped_box.py $steppedFixture
+& $python .\tests\generate_crossing_planes.py $crossingFixture
 
 $datasets = @(
-    [pscustomobject]@{ Name = "stepped_box"; Path = $fixture; Profile = "model-mm" }
+    [pscustomobject]@{ Name = "stepped_box"; Path = $steppedFixture; Profile = "model-mm"; Synthetic = $true },
+    [pscustomobject]@{ Name = "crossing_planes"; Path = $crossingFixture; Profile = "model-mm"; Synthetic = $true }
 )
 if ($IncludeLargeDatasets) {
     $datasets += @(
-        [pscustomobject]@{ Name = "top_left_cut"; Path = "..\data\data01\data01\top_left_cut.ply"; Profile = "model-mm" },
-        [pscustomobject]@{ Name = "top_left_cut2"; Path = "..\data\data01\data01\top_left_cut2.ply"; Profile = "top-left-cut2" },
-        [pscustomobject]@{ Name = "top_down"; Path = "..\data\data02\data02\top_down.ply"; Profile = "top-down" },
-        [pscustomobject]@{ Name = "top_down2"; Path = "..\data\data02\data02\top_down2.ply"; Profile = "top-down" }
+        [pscustomobject]@{ Name = "top_left_cut"; Path = "..\data\data01\data01\top_left_cut.ply"; Profile = "model-mm"; Synthetic = $false },
+        [pscustomobject]@{ Name = "top_left_cut2"; Path = "..\data\data01\data01\top_left_cut2.ply"; Profile = "top-left-cut2"; Synthetic = $false },
+        [pscustomobject]@{ Name = "top_down"; Path = "..\data\data02\data02\top_down.ply"; Profile = "top-down"; Synthetic = $false },
+        [pscustomobject]@{ Name = "top_down2"; Path = "..\data\data02\data02\top_down2.ply"; Profile = "top-down"; Synthetic = $false }
     )
 }
 if ($DatasetNames.Count -gt 0) {
@@ -64,14 +67,26 @@ foreach ($variant in $Variants) {
         }
 
         $quality = $null
-        if ($dataset.Name -eq "stepped_box") {
-            $resultPath = Join-Path $runDir "stepped_box"
+        $stepQuality = $null
+        if ($dataset.Synthetic) {
+            $resultPath = Join-Path $runDir $dataset.Name
             $metricsPath = Join-Path $runDir "metrics.json"
             & $python .\tests\evaluate_stepped_box.py `
-                ([IO.Path]::ChangeExtension($fixture, ".labels.csv")) `
-                ([IO.Path]::ChangeExtension($fixture, ".ground_truth.json")) `
+                ([IO.Path]::ChangeExtension($dataset.Path, ".labels.csv")) `
+                ([IO.Path]::ChangeExtension($dataset.Path, ".ground_truth.json")) `
                 $resultPath --json $metricsPath | Out-Null
             $quality = Get-Content $metricsPath -Raw | ConvertFrom-Json
+        } elseif ($dataset.Name -eq "top_left_cut2") {
+            $stepPath = "..\data\data01\data2.STEP"
+            if (Test-Path $stepPath) {
+                $resultPath = Join-Path $runDir $dataset.Name
+                $stepMetricsPath = Join-Path $runDir "step_metrics.json"
+                & $python .\tests\evaluate_step_planes.py `
+                    $stepPath `
+                    (Join-Path $resultPath "plane_parameters.csv") `
+                    --json $stepMetricsPath | Out-Null
+                $stepQuality = Get-Content $stepMetricsPath -Raw | ConvertFrom-Json
+            }
         }
 
         $values = @{}
@@ -101,6 +116,9 @@ foreach ($variant in $Variants) {
             CornerPrecision = if ($quality) { $quality.corner_precision } else { $null }
             CornerRecall = if ($quality) { $quality.corner_recall } else { $null }
             CornerMeanError = if ($quality) { $quality.corner_mean_error } else { $null }
+            StepMatchedPatches = if ($stepQuality) { $stepQuality.matched_patches } else { $null }
+            StepPatchPrecision = if ($stepQuality) { $stepQuality.patch_precision_proxy } else { $null }
+            StepMatchedPoints = if ($stepQuality) { $stepQuality.matched_point_fraction } else { $null }
         }
     }
 }
