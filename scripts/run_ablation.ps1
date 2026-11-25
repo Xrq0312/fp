@@ -4,6 +4,7 @@ param(
     [string]$OutputDir = ".\results\ablation",
     [ValidateSet("global", "adjacency")]
     [string]$CornerMode = "global",
+    [switch]$EdgeResidualProposals,
     [switch]$IncludeLargeDatasets,
     [switch]$SkipBuild
 )
@@ -60,6 +61,9 @@ foreach ($variant in $Variants) {
             "--pipeline", $variant,
             "--corner-mode", $CornerMode
         )
+        if ($EdgeResidualProposals) {
+            $arguments += "--edge-residual-proposals"
+        }
         $watch = [Diagnostics.Stopwatch]::StartNew()
         $output = & .\build\Release\edge_aware_plane_extract.exe @arguments 2>&1
         $exitCode = $LASTEXITCODE

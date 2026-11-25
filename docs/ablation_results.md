@@ -233,3 +233,40 @@ support at the 0.5 mm surfel scale, explaining why non-edge seed growing fails.
 This becomes the next proposal-generation target; the default minimum extent is
 not reduced globally because that would reintroduce transition-plane false
 positives on scans.
+
+## Stage 5: residual boundary proposals and occupied support
+
+The optional `--edge-residual-proposals` pass targets narrow planes whose
+surfels are all persistent multi-scale boundaries. It runs only on boundary
+surfels left unexplained by both ordinary proposal passes. A candidate is born
+only if a deterministic 200k-point sample estimates at least the existing
+`min_output_points` worth of locally occupied points that no established model
+can explain. This is a model-birth benefit test, not a new geometry threshold.
+Accepted boundary models additionally require a same-label surfel in the local
+3-D occupancy grid during dense assignment, preventing their rectangular
+envelopes from filling holes or absorbing adjacent curved surfaces.
+
+| Dataset | Generated / accepted | Final planes | Corners | Coverage | Result versus adjacency-only |
+| --- | ---: | ---: | ---: | ---: | --- |
+| stepped_box | 0 / 0 | 11 | 16 | 100.00% | byte-identical |
+| crossing_planes | 0 / 0 | 2 | 0 | 100.00% | unchanged |
+| top_left_cut | 5 / 0 | 49 | 17 | 99.94% | byte-identical |
+| top_left_cut2 | 2 / 2 | 55 | 48 | 99.19% | recovered annulus |
+| top_down | 1 / 0 | 20 | 16 | 99.99% | byte-identical |
+| top_down2 | 0 / 0 | 20 | 32 | 100.00% | byte-identical |
+
+Without occupied support, the recovered annulus received 126,361 points and
+had IoU 0.456 because the rectangular envelope filled its hole. Occupancy
+validation rejects 150,338 infeasible candidate assignments, leaves 79,236
+points on the annulus, and raises its IoU to 0.685. Overall `top_left_cut2`
+improves from 54/55 to 55/55 matched finite faces: plane precision, recall, and
+F1 become 1.0 and instance macro IoU rises from 0.9566 to 0.9713 with no over-
+or under-segmentation. Corner F1 remains 1.0.
+
+A rejected BIC experiment is retained in `proposal_diagnostics.csv`: the true
+annulus has 15.8 degree normal RMS and positive quadratic BIC gain because both
+boundaries contaminate its local normals, while the false `top_down` patch looks
+more planar by BIC. Thus curvature/BIC rejection would remove the desired face
+before the false one. Novel unexplained support correctly rejects the scan
+candidate (estimated novel points: zero) and accepts the CAD annulus (maximum
+estimate: 27,550 points).

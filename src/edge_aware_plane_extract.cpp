@@ -65,6 +65,7 @@ struct Config {
     bool verbose = true;
     std::string pipeline = "baseline";
     std::string corner_mode = "global";
+    bool edge_residual_proposals = false;
 };
 
 struct Bounds {
@@ -115,6 +116,7 @@ struct PlanePatch {
     float extent_u = 0.0f;
     float extent_v = 0.0f;
     float rms_distance = 0.0f;
+    bool requires_local_support = false;
 };
 
 struct BoundaryConstraint {
@@ -144,6 +146,7 @@ struct DenseAssignmentStats {
     std::size_t boundary_rejected_candidates = 0;
     std::size_t boundary_constraints = 0;
     std::size_t max_candidates_per_point = 0;
+    std::size_t occupancy_rejected_candidates = 0;
     std::vector<TopologyCorrection> corrections;
 };
 
@@ -168,6 +171,13 @@ struct FinalizeStats {
     std::size_t absorbed_patches = 0;
     std::size_t absorbed_points = 0;
     std::size_t discarded_sparse_points = 0;
+};
+
+struct ResidualNoveltyStats {
+    std::size_t generated = 0;
+    std::size_t accepted = 0;
+    std::size_t rejected = 0;
+    double maximum_estimated_novel_points = 0.0;
 };
 
 struct GlobalNormalStats {
@@ -241,6 +251,7 @@ static Config parse_args(int argc, char** argv) {
             << "  --pipeline baseline|multiscale|joint|topology  select an ablation pipeline\n"
             << "  --corner-mode global|adjacency  choose global triples or observed finite intersections\n"
             << "  --proposal-initial-cap N  diagnostic initial proposal capacity; expands automatically\n"
+            << "  --edge-residual-proposals  propose planes from unexplained persistent boundary surfels\n"
             << "  --audit-assignments  write per-plane dense-assignment diagnostics\n"
             << "  --distance-only  diagnostic A/B: disable normal-guided dense assignment\n"
             << "  --probe X Y Z  print plane-assignment diagnostics at a point\n"
@@ -283,6 +294,8 @@ static Config parse_args(int argc, char** argv) {
             if (cfg.max_planes < 1) {
                 throw std::runtime_error("--proposal-initial-cap must be positive.");
             }
+        } else if (arg == "--edge-residual-proposals") {
+            cfg.edge_residual_proposals = true;
         } else if (arg == "--distance-only") {
             cfg.distance_only = true;
         } else if (arg == "--probe") {
@@ -546,7 +559,8 @@ static std::vector<PlanePatch> extract_seed_grown_patches(
     const std::vector<Surfel>& surfels,
     const SurfelNeighborhoods& neighborhoods,
     const Config& cfg,
-    bool& capacity_exceeded) {
+    bool& capacity_exceeded,
+    const std::vector<std::uint8_t>* eligible) {
     capacity_exceeded = false;
     std::vector<int> order(surfels.size());
     std::iota(order.begin(), order.end(), 0);
@@ -563,13 +577,18 @@ static std::vector<PlanePatch> extract_seed_grown_patches(
     const float smooth_cos = std::cos(cfg.smooth_angle_deg / 180.0f * 3.14159265358979323846f);
     std::vector<int> owner(surfels.size(), -1);
     std::vector<PlanePatch> patches;
+    const auto is_eligible = [&](int id) {
+        return eligible == nullptr || (*eligible)[static_cast<std::size_t>(id)] != 0;
+    };
 
     for (int seed : order) {
-        if (owner[static_cast<std::size_t>(seed)] >= 0 || surfels[static_cast<std::size_t>(seed)].edge_like) continue;
+        if (!is_eligible(seed) || owner[static_cast<std::size_t>(seed)] >= 0 ||
+            surfels[static_cast<std::size_t>(seed)].edge_like) continue;
 
         std::vector<int> seed_ids{seed};
         for (int neighbor : neighborhoods[static_cast<std::size_t>(seed)]) {
-            if (owner[static_cast<std::size_t>(neighbor)] >= 0 || surfels[static_cast<std::size_t>(neighbor)].edge_like) continue;
+            if (!is_eligible(neighbor) || owner[static_cast<std::size_t>(neighbor)] >= 0 ||
+                surfels[static_cast<std::size_t>(neighbor)].edge_like) continue;
             if (std::abs(surfels[static_cast<std::size_t>(seed)].normal.dot(surfels[static_cast<std::size_t>(neighbor)].normal)) >= smooth_cos) {
                 seed_ids.push_back(neighbor);
             }
@@ -583,7 +602,8 @@ static std::vector<PlanePatch> extract_seed_grown_patches(
         std::set<int> touched;
 
         auto try_add = [&](int id, bool can_expand) {
-            if (owner[static_cast<std::size_t>(id)] >= 0 || touched.find(id) != touched.end()) return;
+            if (!is_eligible(id) || owner[static_cast<std::size_t>(id)] >= 0 ||
+                touched.find(id) != touched.end()) return;
             if (!surfel_matches_plane(surfels[static_cast<std::size_t>(id)], patch, cfg, smooth_cos, 1.0f)) return;
             touched.insert(id);
             ids.push_back(id);
@@ -635,7 +655,8 @@ static std::vector<PlanePatch> extract_all_seed_grown_patches(
     const std::vector<Surfel>& surfels,
     const SurfelNeighborhoods& neighborhoods,
     const Config& cfg,
-    std::size_t& capacity_expansions) {
+    std::size_t& capacity_expansions,
+    const std::vector<std::uint8_t>* eligible = nullptr) {
     capacity_expansions = 0;
     Config expanded_cfg = cfg;
     expanded_cfg.max_planes = std::max(expanded_cfg.max_planes, 1);
@@ -644,7 +665,7 @@ static std::vector<PlanePatch> extract_all_seed_grown_patches(
     while (true) {
         bool capacity_exceeded = false;
         std::vector<PlanePatch> patches = extract_seed_grown_patches(
-            surfels, neighborhoods, expanded_cfg, capacity_exceeded);
+            surfels, neighborhoods, expanded_cfg, capacity_exceeded, eligible);
         if (!capacity_exceeded) return patches;
 
         ++capacity_expansions;
@@ -751,7 +772,10 @@ static void merge_patches_impl(
                 patches[i].surfels.erase(
                     std::unique(patches[i].surfels.begin(), patches[i].surfels.end()),
                     patches[i].surfels.end());
+                const bool requires_local_support =
+                    patches[i].requires_local_support || patches[j].requires_local_support;
                 patches[i] = fit_patch_from_surfels(patches[i].surfels, surfels);
+                patches[i].requires_local_support = requires_local_support;
                 update_patch_envelope(patches[i], surfels);
                 patches.erase(patches.begin() + static_cast<std::ptrdiff_t>(j));
                 changed = true;
@@ -965,7 +989,9 @@ static CompetitionStats refine_patch_ownership(
         }
         for (std::size_t patch_id = 0; patch_id < patches.size(); ++patch_id) {
             if (ids_by_patch[patch_id].size() < 3) continue;
+            const bool requires_local_support = patches[patch_id].requires_local_support;
             patches[patch_id] = fit_patch_from_surfels(ids_by_patch[patch_id], surfels);
+            patches[patch_id].requires_local_support = requires_local_support;
             update_patch_envelope(patches[patch_id], surfels);
         }
     }
@@ -1070,7 +1096,9 @@ static CompetitionStats refine_patch_ownership_joint(
                 patches[patch_id].surfels.clear();
                 continue;
             }
+            const bool requires_local_support = patches[patch_id].requires_local_support;
             patches[patch_id] = fit_patch_from_surfels(ids_by_patch[patch_id], surfels);
+            patches[patch_id].requires_local_support = requires_local_support;
             update_patch_envelope(patches[patch_id], surfels);
         }
         if (moved_this_iteration == 0) break;
@@ -1135,6 +1163,7 @@ static CompetitionStats refine_patch_ownership_joint(
             continue;
         }
         PlanePatch patch = fit_patch_from_surfels(final_ids[patch_id], surfels);
+        patch.requires_local_support = patches[patch_id].requires_local_support;
         update_patch_envelope(patch, surfels);
         if (valid_shape(patch, cfg)) retained.push_back(std::move(patch));
     }
@@ -1142,6 +1171,86 @@ static CompetitionStats refine_patch_ownership_joint(
         return a.surfels.size() > b.surfels.size();
     });
     patches.swap(retained);
+    return stats;
+}
+
+static ResidualNoveltyStats retain_novel_residual_proposals(
+    std::vector<PlanePatch>& residual_patches,
+    const std::vector<PlanePatch>& existing_patches,
+    const CloudPtr& cloud,
+    const std::vector<Surfel>& surfels,
+    const std::unordered_map<CellKey, int, CellKeyHash>& index_by_key,
+    const Bounds& bounds,
+    const Config& cfg) {
+    ResidualNoveltyStats stats;
+    stats.generated = residual_patches.size();
+    if (residual_patches.empty() || cloud->empty()) return stats;
+
+    const std::size_t sample_limit = 200000;
+    const std::size_t stride = std::max<std::size_t>(1, cloud->size() / sample_limit);
+    std::vector<std::size_t> sample_indices;
+    sample_indices.reserve(std::min(cloud->size(), sample_limit + 1));
+    for (std::size_t point_id = 0; point_id < cloud->size(); point_id += stride) {
+        sample_indices.push_back(point_id);
+    }
+
+    const float existing_margin = std::max(24.0f * cfg.surfel_size, 2.0f);
+    std::vector<std::uint8_t> explained(sample_indices.size(), 0);
+    for (std::size_t sample_id = 0; sample_id < sample_indices.size(); ++sample_id) {
+        const PointT& point = cloud->points[sample_indices[sample_id]];
+        const Eigen::Vector3f q(point.x, point.y, point.z);
+        for (const PlanePatch& patch : existing_patches) {
+            if (std::abs(patch.normal.dot(q) + patch.d) > cfg.assign_distance) continue;
+            if (!point_inside_patch_envelope(patch, q, existing_margin)) continue;
+            explained[sample_id] = 1;
+            break;
+        }
+    }
+
+    std::vector<PlanePatch> retained;
+    retained.reserve(residual_patches.size());
+    std::vector<std::uint8_t> member(surfels.size(), 0);
+    for (PlanePatch& patch : residual_patches) {
+        std::fill(member.begin(), member.end(), static_cast<std::uint8_t>(0));
+        for (int surfel_id : patch.surfels) member[static_cast<std::size_t>(surfel_id)] = 1;
+
+        std::size_t novel_samples = 0;
+        for (std::size_t sample_id = 0; sample_id < sample_indices.size(); ++sample_id) {
+            const PointT& point = cloud->points[sample_indices[sample_id]];
+            const Eigen::Vector3f q(point.x, point.y, point.z);
+            if (std::abs(patch.normal.dot(q) + patch.d) > cfg.assign_distance) continue;
+            if (!point_inside_patch_envelope(patch, q, cfg.assign_margin)) continue;
+
+            const CellKey key = point_key(point, bounds, cfg.surfel_size);
+            bool locally_supported = false;
+            for (int dx = -1; dx <= 1 && !locally_supported; ++dx) {
+                for (int dy = -1; dy <= 1 && !locally_supported; ++dy) {
+                    for (int dz = -1; dz <= 1; ++dz) {
+                        const auto neighbor = index_by_key.find({key.x + dx, key.y + dy, key.z + dz});
+                        if (neighbor != index_by_key.end() &&
+                            member[static_cast<std::size_t>(neighbor->second)] != 0) {
+                            locally_supported = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (locally_supported && explained[sample_id] == 0) ++novel_samples;
+        }
+
+        const double estimated_novel_points = sample_indices.empty() ? 0.0 :
+            static_cast<double>(novel_samples) * static_cast<double>(cloud->size()) /
+                static_cast<double>(sample_indices.size());
+        stats.maximum_estimated_novel_points =
+            std::max(stats.maximum_estimated_novel_points, estimated_novel_points);
+        if (estimated_novel_points >= static_cast<double>(std::max(cfg.min_output_points, 1))) {
+            retained.push_back(std::move(patch));
+            ++stats.accepted;
+        } else {
+            ++stats.rejected;
+        }
+    }
+    residual_patches.swap(retained);
     return stats;
 }
 
@@ -1215,7 +1324,9 @@ static DenseAssignmentStats assign_full_points(
         float distance = std::numeric_limits<float>::max();
         float normal_dot = 1.0f;
         int local_support = 0;
+        int strict_local_support = 0;
         bool inside_tight = false;
+        bool requires_local_support = false;
     };
 
     std::vector<DenseCandidate> candidates;
@@ -1250,15 +1361,19 @@ static DenseAssignmentStats assign_full_points(
                 : 1.0f;
             candidate.inside_tight = point_inside_patch_envelope(
                 patches[i], q, 2.0f * cfg.surfel_size);
+            candidate.requires_local_support = patches[i].requires_local_support;
         }
-        const std::size_t candidate_count = candidates.size();
+        std::size_t candidate_count = candidates.size();
         stats.max_candidates_per_point = std::max(stats.max_candidates_per_point, candidate_count);
         if (candidate_count == 0) continue;
 
         // Only ambiguous points pay for the local support lookup.  The lookup is
         // in the original 3-D surfel grid, so it cannot be fooled by a large 2-D
         // patch rectangle extending through an unrelated surface.
-        const bool needs_local_support = candidate_count > 1;
+        const bool needs_local_support = candidate_count > 1 ||
+            std::any_of(candidates.begin(), candidates.end(), [](const DenseCandidate& candidate) {
+                return candidate.requires_local_support;
+            });
         if (needs_local_support) {
             for (int dx = -support_radius; dx <= support_radius; ++dx) {
                 for (int dy = -support_radius; dy <= support_radius; ++dy) {
@@ -1269,6 +1384,9 @@ static DenseAssignmentStats assign_full_points(
                         for (std::size_t i = 0; i < candidate_count; ++i) {
                             if (candidates[i].id == label) {
                                 ++candidates[i].local_support;
+                                if (std::abs(dx) <= 1 && std::abs(dy) <= 1 && std::abs(dz) <= 1) {
+                                    ++candidates[i].strict_local_support;
+                                }
                                 break;
                             }
                         }
@@ -1276,6 +1394,16 @@ static DenseAssignmentStats assign_full_points(
                 }
             }
         }
+
+        const std::size_t candidates_before_occupancy = candidates.size();
+        candidates.erase(
+            std::remove_if(candidates.begin(), candidates.end(), [](const DenseCandidate& candidate) {
+                return candidate.requires_local_support && candidate.strict_local_support == 0;
+            }),
+            candidates.end());
+        stats.occupancy_rejected_candidates += candidates_before_occupancy - candidates.size();
+        candidate_count = candidates.size();
+        if (candidate_count == 0) continue;
 
         std::size_t distance_best = candidate_count;
         for (std::size_t i = 0; i < candidate_count; ++i) {
@@ -2032,6 +2160,69 @@ static void save_plane_parameters_csv(const fs::path& path, const std::vector<Pl
     }
 }
 
+static std::pair<float, float> patch_model_diagnostics(
+    const PlanePatch& patch,
+    const std::vector<Surfel>& surfels) {
+    if (patch.surfels.size() < 7) {
+        return {std::numeric_limits<float>::infinity(), 0.0f};
+    }
+    Eigen::Vector3f axis_u;
+    Eigen::Vector3f axis_v;
+    plane_basis(patch, axis_u, axis_v);
+    const Eigen::Index count = static_cast<Eigen::Index>(patch.surfels.size());
+    Eigen::MatrixXd design(count, 6);
+    Eigen::VectorXd response(count);
+    double plane_rss = 0.0;
+    double angle_squared = 0.0;
+    double total_weight = 0.0;
+    for (Eigen::Index row = 0; row < count; ++row) {
+        const Surfel& surfel = surfels[static_cast<std::size_t>(patch.surfels[static_cast<std::size_t>(row)])];
+        const Eigen::Vector3f centered = surfel.centroid - patch.centroid;
+        const double u = static_cast<double>(centered.dot(axis_u));
+        const double v = static_cast<double>(centered.dot(axis_v));
+        const double height = static_cast<double>(patch.normal.dot(surfel.centroid) + patch.d);
+        const double weight = static_cast<double>(std::max(surfel.count, 1));
+        const double root_weight = std::sqrt(weight);
+        design.row(row) << root_weight * u * u, root_weight * u * v,
+            root_weight * v * v, root_weight * u, root_weight * v, root_weight;
+        response[row] = root_weight * height;
+        plane_rss += weight * height * height;
+        const double dot = std::clamp(
+            static_cast<double>(std::abs(surfel.normal.dot(patch.normal))), 0.0, 1.0);
+        const double angle = std::acos(dot) * 180.0 / 3.14159265358979323846;
+        angle_squared += weight * angle * angle;
+        total_weight += weight;
+    }
+    const Eigen::VectorXd coefficients = design.colPivHouseholderQr().solve(response);
+    const double quadratic_rss = (design * coefficients - response).squaredNorm();
+    const double observations = static_cast<double>(patch.surfels.size());
+    const double floor = std::max(1e-18, observations * 1e-18);
+    const double plane_bic = observations * std::log(std::max(plane_rss, floor) / observations) +
+        3.0 * std::log(observations);
+    const double quadratic_bic = observations * std::log(std::max(quadratic_rss, floor) / observations) +
+        6.0 * std::log(observations);
+    return {
+        static_cast<float>(std::sqrt(angle_squared / std::max(total_weight, 1.0))),
+        static_cast<float>(plane_bic - quadratic_bic)
+    };
+}
+
+static void save_proposal_diagnostics(
+    const fs::path& path,
+    const std::vector<PlanePatch>& patches,
+    const std::vector<Surfel>& surfels) {
+    std::ofstream out(path);
+    if (!out) throw std::runtime_error("Failed to write proposal diagnostics: " + path.string());
+    out << "plane_id,residual_boundary_model,surfels,dense_points,normal_rms_deg,quadratic_bic_gain\n";
+    out << std::setprecision(9);
+    for (std::size_t patch_id = 0; patch_id < patches.size(); ++patch_id) {
+        const auto diagnostics = patch_model_diagnostics(patches[patch_id], surfels);
+        out << patch_id << ',' << (patches[patch_id].requires_local_support ? 1 : 0) << ','
+            << patches[patch_id].surfels.size() << ',' << patches[patch_id].output->size() << ','
+            << diagnostics.first << ',' << diagnostics.second << '\n';
+    }
+}
+
 static void report_probe(
     const Config& cfg,
     const Bounds& bounds,
@@ -2249,6 +2440,10 @@ int main(int argc, char** argv) {
         std::size_t local_candidate_count = 0;
         std::size_t coarse_capacity_expansions = 0;
         std::size_t local_capacity_expansions = 0;
+        std::size_t residual_boundary_surfels = 0;
+        std::size_t residual_candidate_count = 0;
+        std::size_t residual_capacity_expansions = 0;
+        ResidualNoveltyStats residual_novelty;
         if (cfg.pipeline == "baseline") {
             mark_edge_surfels(surfels, neighborhoods, cfg);
             patches = extract_all_seed_grown_patches(
@@ -2282,6 +2477,48 @@ int main(int argc, char** argv) {
                 patches.end(),
                 std::make_move_iterator(local_patches.begin()),
                 std::make_move_iterator(local_patches.end()));
+
+            if (cfg.edge_residual_proposals) {
+                std::vector<std::uint8_t> eligible(surfels.size(), 0);
+                for (std::size_t i = 0; i < surfels.size(); ++i) {
+                    eligible[i] = surfels[i].edge_like ? 1 : 0;
+                }
+                for (const PlanePatch& patch : patches) {
+                    for (int surfel_id : patch.surfels) {
+                        eligible[static_cast<std::size_t>(surfel_id)] = 0;
+                    }
+                }
+                residual_boundary_surfels = static_cast<std::size_t>(
+                    std::count(eligible.begin(), eligible.end(), static_cast<std::uint8_t>(1)));
+
+                std::vector<Surfel> residual_surfels = surfels;
+                for (std::size_t i = 0; i < residual_surfels.size(); ++i) {
+                    if (eligible[i] != 0) residual_surfels[i].edge_like = false;
+                }
+                Config residual_cfg = local_cfg;
+                std::vector<PlanePatch> residual_patches = extract_all_seed_grown_patches(
+                    residual_surfels,
+                    neighborhoods,
+                    residual_cfg,
+                    residual_capacity_expansions,
+                    &eligible);
+                residual_novelty = retain_novel_residual_proposals(
+                    residual_patches,
+                    patches,
+                    cloud,
+                    surfels,
+                    index_by_key,
+                    bounds,
+                    cfg);
+                for (PlanePatch& patch : residual_patches) {
+                    patch.requires_local_support = true;
+                }
+                residual_candidate_count = residual_patches.size();
+                patches.insert(
+                    patches.end(),
+                    std::make_move_iterator(residual_patches.begin()),
+                    std::make_move_iterator(residual_patches.end()));
+            }
         }
         now = Clock::now();
         timings.proposal_ms = elapsed_ms(stage_start, now);
@@ -2357,6 +2594,9 @@ int main(int argc, char** argv) {
         fs::create_directories(out_dir);
         save_plane_patches(out_dir / "edge_aware_plane_patches.ply", patches);
         save_plane_parameters_csv(out_dir / "plane_parameters.csv", patches);
+        if (cfg.edge_residual_proposals) {
+            save_proposal_diagnostics(out_dir / "proposal_diagnostics.csv", patches, surfels);
+        }
         save_feature_edges(out_dir / "feature_edges.ply", surfels, neighborhoods, patches);
         save_corners(out_dir / "extracted_corners.ply", corners);
         if (cfg.corner_mode == "adjacency") {
@@ -2391,6 +2631,13 @@ int main(int argc, char** argv) {
                       << coarse_candidate_count << '/' << local_candidate_count << "\n";
             std::cout << "Coarse/local proposal capacity expansions: "
                       << coarse_capacity_expansions << '/' << local_capacity_expansions << "\n";
+            std::cout << "Residual boundary surfels/candidates/capacity expansions: "
+                      << residual_boundary_surfels << '/' << residual_candidate_count << '/'
+                      << residual_capacity_expansions << "\n";
+            std::cout << "Residual candidates generated/accepted/rejected/max novel estimate: "
+                      << residual_novelty.generated << '/' << residual_novelty.accepted << '/'
+                      << residual_novelty.rejected << '/'
+                      << residual_novelty.maximum_estimated_novel_points << "\n";
             std::cout << "Accepted global-family merges: " << global_family_merges << "\n";
             std::cout << "Grown/merged/competed patches: "
                       << grown_patch_count << '/' << initially_merged_patch_count << '/' << competed_patch_count << "\n";
@@ -2412,6 +2659,8 @@ int main(int argc, char** argv) {
                       << dense_assignment.boundary_constraints << "\n";
             std::cout << "Maximum dense candidates per point: "
                       << dense_assignment.max_candidates_per_point << "\n";
+            std::cout << "Occupancy-rejected boundary candidates: "
+                      << dense_assignment.occupancy_rejected_candidates << "\n";
             std::cout << "Safely absorbed small patches/points: "
                       << finalize_stats.absorbed_patches << '/' << finalize_stats.absorbed_points << "\n";
             std::cout << "Discarded sparse patch points: " << finalize_stats.discarded_sparse_points << "\n";

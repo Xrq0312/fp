@@ -47,6 +47,7 @@ not a reconstruction from Git history.
 | `boundary` (planned) | continuous multi-scale boundary confidence | SED-Net |
 | `relations` | robust parallel/orthogonal relation discovery and constrained normal refinement | GlobFit |
 | `--corner-mode adjacency` | observed finite intersections, graph-local triples, SVD conditioning, and two-branch support | SED-Net, GCCao validation pattern |
+| `--edge-residual-proposals` | unexplained persistent-boundary proposals, model-birth benefit, and local occupied support | CPFN, Progressive-X, SED-Net |
 
 The neural components of CPFN and SED-Net are not copied: no training data or
 GPU runtime is introduced. Their transferable principles are used instead:
