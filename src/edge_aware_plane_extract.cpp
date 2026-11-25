@@ -1868,6 +1868,73 @@ static std::vector<CornerCandidate> merge_corner_candidates(std::vector<CornerCa
     return merged;
 }
 
+static std::vector<CornerCandidate> merge_corner_candidates_complete_link(
+    std::vector<CornerCandidate> candidates,
+    float merge_radius) {
+    const auto position_less = [](const CornerCandidate& a, const CornerCandidate& b) {
+        if (a.position.x() != b.position.x()) return a.position.x() < b.position.x();
+        if (a.position.y() != b.position.y()) return a.position.y() < b.position.y();
+        return a.position.z() < b.position.z();
+    };
+    std::sort(candidates.begin(), candidates.end(), position_less);
+    std::vector<std::vector<std::size_t>> clusters;
+    clusters.reserve(candidates.size());
+    for (std::size_t i = 0; i < candidates.size(); ++i) clusters.push_back({i});
+    const float merge_sq = merge_radius * merge_radius;
+
+    while (true) {
+        std::size_t best_a = clusters.size();
+        std::size_t best_b = clusters.size();
+        float best_complete_distance = std::numeric_limits<float>::max();
+        for (std::size_t a = 0; a < clusters.size(); ++a) {
+            for (std::size_t b = a + 1; b < clusters.size(); ++b) {
+                float complete_distance = 0.0f;
+                bool mergeable = true;
+                for (std::size_t first : clusters[a]) {
+                    for (std::size_t second : clusters[b]) {
+                        complete_distance = std::max(
+                            complete_distance,
+                            (candidates[first].position - candidates[second].position).squaredNorm());
+                        if (complete_distance > merge_sq) {
+                            mergeable = false;
+                            break;
+                        }
+                    }
+                    if (!mergeable) break;
+                }
+                if (mergeable && complete_distance < best_complete_distance) {
+                    best_complete_distance = complete_distance;
+                    best_a = a;
+                    best_b = b;
+                }
+            }
+        }
+        if (best_a == clusters.size()) break;
+        clusters[best_a].insert(
+            clusters[best_a].end(), clusters[best_b].begin(), clusters[best_b].end());
+        clusters.erase(clusters.begin() + static_cast<std::ptrdiff_t>(best_b));
+    }
+
+    std::vector<CornerCandidate> merged;
+    merged.reserve(clusters.size());
+    for (const std::vector<std::size_t>& cluster : clusters) {
+        CornerCandidate representative = candidates[cluster.front()];
+        for (std::size_t candidate_id : cluster) {
+            const CornerCandidate& candidate = candidates[candidate_id];
+            if (candidate.support > representative.support ||
+                (candidate.support == representative.support && position_less(candidate, representative))) {
+                representative = candidate;
+            }
+        }
+        merged.push_back(representative);
+    }
+    std::sort(merged.begin(), merged.end(), [&](const CornerCandidate& a, const CornerCandidate& b) {
+        if (a.support != b.support) return a.support > b.support;
+        return position_less(a, b);
+    });
+    return merged;
+}
+
 static std::vector<CornerCandidate> extract_corners_filtered(
     const CloudPtr& cloud,
     const std::vector<PlanePatch>& patches,
@@ -2088,7 +2155,7 @@ static CornerExtractionResult extract_corners_from_adjacency(
         if (nearby_support_count_on_patch(patches[k], p, support_radius) < cfg.min_plane_local_support) continue;
         candidates.push_back({p, support});
     }
-    result.corners = merge_corner_candidates(std::move(candidates), merge_radius);
+    result.corners = merge_corner_candidates_complete_link(std::move(candidates), merge_radius);
     return result;
 }
 

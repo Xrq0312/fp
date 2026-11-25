@@ -205,6 +205,14 @@ one-to-one corner matching.
 
 The adjacency method therefore removed 13 false corners and recovered three
 missed STEP corners on `top_left_cut2`; it did not trade precision for recall.
+Adjacency-mode duplicate handling now uses deterministic complete-link
+clustering: every pair of candidates in a cluster must lie within the merge
+radius, so a chain of intermediate candidates cannot merge two nearby real
+corners. Candidates are first sorted lexicographically and support/position
+ties are deterministic. The stepped-box coordinate set is unchanged. On
+`top_left_cut2`, two cluster representatives move slightly, but all 48 STEP
+corners remain matched (F1 1.0), maximum error stays 0.0721 mm, and mean error
+changes only from 0.01111 to 0.01122 mm.
 Raw corner counts on the two scans without CAD corner truth changed from 19 to
 17 (`top_left_cut`) and remained 16 (`top_down`). Those count changes are not
 treated as accuracy claims. The option remains independently selectable while
