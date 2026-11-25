@@ -278,3 +278,15 @@ more planar by BIC. Thus curvature/BIC rejection would remove the desired face
 before the false one. Novel unexplained support correctly rejects the scan
 candidate (estimated novel points: zero) and accepts the CAD annulus (maximum
 estimate: 27,550 points).
+
+## Binary result serialization
+
+`--binary-plane-output` changes only the large colored
+`edge_aware_plane_patches.ply` serialization to standard little-endian binary
+PLY; all vertices, labels/colors, and ordering are identical. PCL successfully
+reloads the file, and the NumPy evaluator reads both formats. On stepped_box the
+file shrinks from 7.18 MB to 2.61 MB and save time falls from roughly 0.53 s to
+0.019 s. On `top_down`, save time falls from 17.14 s to 0.094 s and total time
+from 44.09 s to 27.45 s (38% reduction). The default stays ASCII for human
+inspection and backward compatibility; binary is the recommended production
+setting for multi-million-point results.

@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -66,6 +67,7 @@ struct Config {
     std::string pipeline = "baseline";
     std::string corner_mode = "global";
     bool edge_residual_proposals = false;
+    bool binary_plane_output = false;
 };
 
 struct Bounds {
@@ -252,6 +254,7 @@ static Config parse_args(int argc, char** argv) {
             << "  --corner-mode global|adjacency  choose global triples or observed finite intersections\n"
             << "  --proposal-initial-cap N  diagnostic initial proposal capacity; expands automatically\n"
             << "  --edge-residual-proposals  propose planes from unexplained persistent boundary surfels\n"
+            << "  --binary-plane-output  write the large colored plane PLY in binary format\n"
             << "  --audit-assignments  write per-plane dense-assignment diagnostics\n"
             << "  --distance-only  diagnostic A/B: disable normal-guided dense assignment\n"
             << "  --probe X Y Z  print plane-assignment diagnostics at a point\n"
@@ -296,6 +299,8 @@ static Config parse_args(int argc, char** argv) {
             }
         } else if (arg == "--edge-residual-proposals") {
             cfg.edge_residual_proposals = true;
+        } else if (arg == "--binary-plane-output") {
+            cfg.binary_plane_output = true;
         } else if (arg == "--distance-only") {
             cfg.distance_only = true;
         } else if (arg == "--probe") {
@@ -2174,11 +2179,52 @@ static void write_color_ply_header(std::ofstream& out, std::size_t vertex_count)
     out.precision(6);
 }
 
-static void save_plane_patches(const fs::path& path, const std::vector<PlanePatch>& patches) {
-    std::ofstream out(path);
+static void save_plane_patches(
+    const fs::path& path,
+    const std::vector<PlanePatch>& patches,
+    bool binary) {
+    std::ofstream out(path, binary ? (std::ios::out | std::ios::binary) : std::ios::out);
     if (!out) throw std::runtime_error("Failed to write PLY: " + path.string());
     std::size_t vertex_count = 0;
     for (const auto& patch : patches) vertex_count += patch.output->size();
+    if (binary) {
+        out << "ply\n"
+            << "format binary_little_endian 1.0\n"
+            << "element vertex " << vertex_count << "\n"
+            << "property float x\n"
+            << "property float y\n"
+            << "property float z\n"
+            << "property uchar red\n"
+            << "property uchar green\n"
+            << "property uchar blue\n"
+            << "end_header\n";
+        constexpr std::size_t packed_size = 3 * sizeof(float) + 3 * sizeof(std::uint8_t);
+        constexpr std::size_t points_per_chunk = 65536;
+        std::vector<char> packed(points_per_chunk * packed_size);
+        std::size_t buffered_points = 0;
+        const auto flush = [&]() {
+            out.write(
+                packed.data(),
+                static_cast<std::streamsize>(buffered_points * packed_size));
+            buffered_points = 0;
+        };
+        for (std::size_t i = 0; i < patches.size(); ++i) {
+            const auto color = color_for(i);
+            for (const auto& point : patches[i].output->points) {
+                char* destination = packed.data() + buffered_points * packed_size;
+                std::memcpy(destination, &point.x, sizeof(float));
+                std::memcpy(destination + sizeof(float), &point.y, sizeof(float));
+                std::memcpy(destination + 2 * sizeof(float), &point.z, sizeof(float));
+                destination[3 * sizeof(float)] = static_cast<char>(color[0]);
+                destination[3 * sizeof(float) + 1] = static_cast<char>(color[1]);
+                destination[3 * sizeof(float) + 2] = static_cast<char>(color[2]);
+                ++buffered_points;
+                if (buffered_points == points_per_chunk) flush();
+            }
+        }
+        if (buffered_points > 0) flush();
+        return;
+    }
     write_color_ply_header(out, vertex_count);
     for (std::size_t i = 0; i < patches.size(); ++i) {
         const auto color = color_for(i);
@@ -2659,7 +2705,8 @@ int main(int argc, char** argv) {
 
         fs::path out_dir = cfg.output_dir / cfg.input.stem();
         fs::create_directories(out_dir);
-        save_plane_patches(out_dir / "edge_aware_plane_patches.ply", patches);
+        save_plane_patches(
+            out_dir / "edge_aware_plane_patches.ply", patches, cfg.binary_plane_output);
         save_plane_parameters_csv(out_dir / "plane_parameters.csv", patches);
         if (cfg.edge_residual_proposals) {
             save_proposal_diagnostics(out_dir / "proposal_diagnostics.csv", patches, surfels);

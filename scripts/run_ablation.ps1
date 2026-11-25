@@ -5,6 +5,7 @@ param(
     [ValidateSet("global", "adjacency")]
     [string]$CornerMode = "global",
     [switch]$EdgeResidualProposals,
+    [switch]$BinaryPlaneOutput,
     [switch]$IncludeLargeDatasets,
     [switch]$SkipBuild
 )
@@ -63,6 +64,9 @@ foreach ($variant in $Variants) {
         )
         if ($EdgeResidualProposals) {
             $arguments += "--edge-residual-proposals"
+        }
+        if ($BinaryPlaneOutput) {
+            $arguments += "--binary-plane-output"
         }
         $watch = [Diagnostics.Stopwatch]::StartNew()
         $output = & .\build\Release\edge_aware_plane_extract.exe @arguments 2>&1

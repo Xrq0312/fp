@@ -203,17 +203,39 @@ def label_points(
 
 
 def load_ascii_ply_points(path: Path, scale: float) -> np.ndarray:
-    with path.open("r", encoding="ascii") as handle:
+    with path.open("rb") as handle:
         vertex_count = None
+        ply_format = None
+        properties = []
         for line in handle:
-            fields = line.strip().split()
-            if fields[:2] == ["element", "vertex"]:
+            fields = line.decode("ascii").strip().split()
+            if fields[:1] == ["format"]:
+                ply_format = fields[1]
+            elif fields[:2] == ["element", "vertex"]:
                 vertex_count = int(fields[2])
+            elif fields[:1] == ["property"] and vertex_count is not None:
+                properties.append((fields[1], fields[2]))
             if fields == ["end_header"]:
                 break
         if vertex_count is None:
             raise ValueError(f"PLY has no vertex count: {path}")
-        points = np.loadtxt(handle, dtype=np.float32, usecols=(0, 1, 2), max_rows=vertex_count)
+        if ply_format == "ascii":
+            points = np.loadtxt(handle, dtype=np.float32, usecols=(0, 1, 2), max_rows=vertex_count)
+        elif ply_format == "binary_little_endian":
+            type_map = {
+                "float": "<f4",
+                "float32": "<f4",
+                "uchar": "u1",
+                "uint8": "u1",
+            }
+            try:
+                dtype = np.dtype([(name, type_map[data_type]) for data_type, name in properties])
+            except KeyError as error:
+                raise ValueError(f"Unsupported binary PLY property type: {error.args[0]}") from error
+            records = np.fromfile(handle, dtype=dtype, count=vertex_count)
+            points = np.column_stack((records["x"], records["y"], records["z"]))
+        else:
+            raise ValueError(f"Unsupported PLY format {ply_format!r}: {path}")
     if points.ndim == 1:
         points = points.reshape(1, 3)
     if points.shape[0] != vertex_count:

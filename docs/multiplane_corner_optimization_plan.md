@@ -70,6 +70,10 @@ plane proposals; this project does not currently detect cylinders.
   dependency to the CPU build.
 - Corner candidates come from triangles in the plane adjacency graph rather
   than all `O(P^3)` triples.
+- The dominant large-cloud wall time is PLY parsing/serialization rather than
+  joint labeling. `--binary-plane-output` preserves the colored result exactly
+  while avoiding tens of seconds of ASCII formatting; ASCII remains the
+  compatibility default.
 
 ## Evaluation protocol
 
