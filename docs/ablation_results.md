@@ -157,6 +157,16 @@ compatibility. A per-plane KDTree experiment preserved results exactly but made
 the real corner stage slower (1.42 s to 1.91 s) because tree construction
 dominated the small number of accepted triple queries; it was removed.
 
+The 26-cell surfel neighborhood is now built once in the original deterministic
+offset order and reused by edge marking, both proposal passes, label
+competition, topology constraints, finite intersections, and feature-edge
+output. All synthetic artifacts remained byte-identical. On `top_down`, proposal
+time fell from 1.97 s to 1.32 s, joint competition from 0.181 s to 0.128 s, and
+dense assignment from 1.573 s to 1.488 s. The cache uses dynamically grown
+neighbor arrays instead of reserving 26 entries for every surfel and reports its
+allocated storage in the run log; the stepped-box cache is 1.60 MiB for 27,573
+surfels and 225,302 directed neighbor references.
+
 ## Stage 4: observed finite intersections and adjacency corners
 
 The optional `--corner-mode adjacency` constructs a plane graph from pairs of

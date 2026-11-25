@@ -100,6 +100,8 @@ struct Surfel {
     bool edge_like = false;
 };
 
+using SurfelNeighborhoods = std::vector<std::vector<int>>;
+
 struct PlanePatch {
     Eigen::Vector3f normal{0.0f, 0.0f, 1.0f};
     float d = 0.0f;
@@ -405,28 +407,17 @@ static void estimate_surfel_normals(
 
 static void mark_edge_surfels(
     std::vector<Surfel>& surfels,
-    const std::unordered_map<CellKey, int, CellKeyHash>& index_by_key,
+    const SurfelNeighborhoods& neighborhoods,
     const Config& cfg) {
     const float edge_cos = std::cos(cfg.edge_angle_deg / 180.0f * 3.14159265358979323846f);
     for (std::size_t i = 0; i < surfels.size(); ++i) {
-        const CellKey key = surfels[i].key;
-        for (int dx = -1; dx <= 1; ++dx) {
-            for (int dy = -1; dy <= 1; ++dy) {
-                for (int dz = -1; dz <= 1; ++dz) {
-                    if (dx == 0 && dy == 0 && dz == 0) continue;
-                    CellKey nk{key.x + dx, key.y + dy, key.z + dz};
-                    auto it = index_by_key.find(nk);
-                    if (it == index_by_key.end()) continue;
-                    const int j = it->second;
-                    if (j <= static_cast<int>(i)) continue;
-
-                    const bool angle_edge = std::abs(
-                        surfels[i].normal.dot(surfels[static_cast<std::size_t>(j)].normal)) < edge_cos;
-                    if (angle_edge) {
-                        surfels[i].edge_like = true;
-                        surfels[static_cast<std::size_t>(j)].edge_like = true;
-                    }
-                }
+        for (int j : neighborhoods[i]) {
+            if (j <= static_cast<int>(i)) continue;
+            const bool angle_edge = std::abs(
+                surfels[i].normal.dot(surfels[static_cast<std::size_t>(j)].normal)) < edge_cos;
+            if (angle_edge) {
+                surfels[i].edge_like = true;
+                surfels[static_cast<std::size_t>(j)].edge_like = true;
             }
         }
     }
@@ -523,24 +514,25 @@ static bool valid_shape(const PlanePatch& patch, const Config& cfg) {
     return short_extent >= cfg.min_extent && aspect >= cfg.min_aspect_ratio;
 }
 
-static std::vector<int> surfel_neighbors(
-    int surfel_id,
+static SurfelNeighborhoods build_surfel_neighborhoods(
     const std::vector<Surfel>& surfels,
     const std::unordered_map<CellKey, int, CellKeyHash>& index_by_key) {
-    std::vector<int> out;
-    out.reserve(26);
-    const CellKey base = surfels[static_cast<std::size_t>(surfel_id)].key;
-    for (int dx = -1; dx <= 1; ++dx) {
-        for (int dy = -1; dy <= 1; ++dy) {
-            for (int dz = -1; dz <= 1; ++dz) {
-                if (dx == 0 && dy == 0 && dz == 0) continue;
-                const CellKey key{base.x + dx, base.y + dy, base.z + dz};
-                auto it = index_by_key.find(key);
-                if (it != index_by_key.end()) out.push_back(it->second);
+    SurfelNeighborhoods neighborhoods(surfels.size());
+    for (std::size_t surfel_id = 0; surfel_id < surfels.size(); ++surfel_id) {
+        std::vector<int>& out = neighborhoods[surfel_id];
+        const CellKey base = surfels[surfel_id].key;
+        for (int dx = -1; dx <= 1; ++dx) {
+            for (int dy = -1; dy <= 1; ++dy) {
+                for (int dz = -1; dz <= 1; ++dz) {
+                    if (dx == 0 && dy == 0 && dz == 0) continue;
+                    const CellKey key{base.x + dx, base.y + dy, base.z + dz};
+                    const auto it = index_by_key.find(key);
+                    if (it != index_by_key.end()) out.push_back(it->second);
+                }
             }
         }
     }
-    return out;
+    return neighborhoods;
 }
 
 static bool surfel_matches_plane(const Surfel& surfel, const PlanePatch& patch, const Config& cfg, float angle_cos, float distance_scale) {
@@ -552,7 +544,7 @@ static bool surfel_matches_plane(const Surfel& surfel, const PlanePatch& patch, 
 
 static std::vector<PlanePatch> extract_seed_grown_patches(
     const std::vector<Surfel>& surfels,
-    const std::unordered_map<CellKey, int, CellKeyHash>& index_by_key,
+    const SurfelNeighborhoods& neighborhoods,
     const Config& cfg,
     bool& capacity_exceeded) {
     capacity_exceeded = false;
@@ -576,7 +568,7 @@ static std::vector<PlanePatch> extract_seed_grown_patches(
         if (owner[static_cast<std::size_t>(seed)] >= 0 || surfels[static_cast<std::size_t>(seed)].edge_like) continue;
 
         std::vector<int> seed_ids{seed};
-        for (int neighbor : surfel_neighbors(seed, surfels, index_by_key)) {
+        for (int neighbor : neighborhoods[static_cast<std::size_t>(seed)]) {
             if (owner[static_cast<std::size_t>(neighbor)] >= 0 || surfels[static_cast<std::size_t>(neighbor)].edge_like) continue;
             if (std::abs(surfels[static_cast<std::size_t>(seed)].normal.dot(surfels[static_cast<std::size_t>(neighbor)].normal)) >= smooth_cos) {
                 seed_ids.push_back(neighbor);
@@ -602,7 +594,7 @@ static std::vector<PlanePatch> extract_seed_grown_patches(
         while (!q.empty()) {
             const int current = q.front();
             q.pop();
-            for (int neighbor : surfel_neighbors(current, surfels, index_by_key)) {
+            for (int neighbor : neighborhoods[static_cast<std::size_t>(current)]) {
                 try_add(neighbor, true);
             }
         }
@@ -612,7 +604,7 @@ static std::vector<PlanePatch> extract_seed_grown_patches(
             patch = fit_patch_from_surfels(ids, surfels);
             std::vector<int> frontier = ids;
             for (int current : frontier) {
-                for (int neighbor : surfel_neighbors(current, surfels, index_by_key)) {
+                for (int neighbor : neighborhoods[static_cast<std::size_t>(current)]) {
                     try_add(neighbor, !surfels[static_cast<std::size_t>(neighbor)].edge_like);
                 }
             }
@@ -641,7 +633,7 @@ static std::vector<PlanePatch> extract_seed_grown_patches(
 
 static std::vector<PlanePatch> extract_all_seed_grown_patches(
     const std::vector<Surfel>& surfels,
-    const std::unordered_map<CellKey, int, CellKeyHash>& index_by_key,
+    const SurfelNeighborhoods& neighborhoods,
     const Config& cfg,
     std::size_t& capacity_expansions) {
     capacity_expansions = 0;
@@ -652,7 +644,7 @@ static std::vector<PlanePatch> extract_all_seed_grown_patches(
     while (true) {
         bool capacity_exceeded = false;
         std::vector<PlanePatch> patches = extract_seed_grown_patches(
-            surfels, index_by_key, expanded_cfg, capacity_exceeded);
+            surfels, neighborhoods, expanded_cfg, capacity_exceeded);
         if (!capacity_exceeded) return patches;
 
         ++capacity_expansions;
@@ -816,7 +808,7 @@ static std::vector<int> build_surfel_labels(const std::vector<PlanePatch>& patch
 static std::vector<std::vector<BoundaryConstraint>> build_boundary_constraints(
     const std::vector<PlanePatch>& patches,
     const std::vector<Surfel>& surfels,
-    const std::unordered_map<CellKey, int, CellKeyHash>& index_by_key,
+    const SurfelNeighborhoods& neighborhoods,
     const Config& cfg) {
     std::vector<std::vector<BoundaryConstraint>> constraints(patches.size());
     if (patches.size() < 2) return constraints;
@@ -836,7 +828,7 @@ static std::vector<std::vector<BoundaryConstraint>> build_boundary_constraints(
     for (std::size_t surfel_id = 0; surfel_id < labels.size(); ++surfel_id) {
         const int first = labels[surfel_id];
         if (first < 0) continue;
-        for (int neighbor : surfel_neighbors(static_cast<int>(surfel_id), surfels, index_by_key)) {
+        for (int neighbor : neighborhoods[surfel_id]) {
             const int second = labels[static_cast<std::size_t>(neighbor)];
             if (second < 0 || second == first) continue;
             adjacent_pairs.emplace(std::min(first, second), std::max(first, second));
@@ -910,7 +902,7 @@ static float surfel_plane_score(const Surfel& surfel, const PlanePatch& patch, c
 static CompetitionStats refine_patch_ownership(
     std::vector<PlanePatch>& patches,
     const std::vector<Surfel>& surfels,
-    const std::unordered_map<CellKey, int, CellKeyHash>& index_by_key,
+    const SurfelNeighborhoods& neighborhoods,
     const Config& cfg) {
     CompetitionStats stats;
     if (patches.empty() || surfels.empty()) return stats;
@@ -927,7 +919,7 @@ static CompetitionStats refine_patch_ownership(
         std::array<int, 27> candidates{};
         int candidate_count = 0;
         candidates[static_cast<std::size_t>(candidate_count++)] = current;
-        for (int neighbor : surfel_neighbors(static_cast<int>(surfel_id), surfels, index_by_key)) {
+        for (int neighbor : neighborhoods[surfel_id]) {
             const int candidate = labels[static_cast<std::size_t>(neighbor)];
             if (candidate < 0) continue;
             bool duplicate = false;
@@ -1011,15 +1003,10 @@ static float joint_surfel_data_cost(
 static CompetitionStats refine_patch_ownership_joint(
     std::vector<PlanePatch>& patches,
     const std::vector<Surfel>& surfels,
-    const std::unordered_map<CellKey, int, CellKeyHash>& index_by_key,
+    const SurfelNeighborhoods& neighborhoods,
     const Config& cfg) {
     CompetitionStats stats;
     if (patches.empty() || surfels.empty()) return stats;
-
-    std::vector<std::vector<int>> neighbors(surfels.size());
-    for (std::size_t i = 0; i < surfels.size(); ++i) {
-        neighbors[i] = surfel_neighbors(static_cast<int>(i), surfels, index_by_key);
-    }
 
     std::vector<int> labels = build_surfel_labels(patches, surfels.size());
     std::vector<bool> active(patches.size(), true);
@@ -1036,7 +1023,7 @@ static CompetitionStats refine_patch_ownership_joint(
             const float smooth_weight = surfel.edge_like ? 0.02f : 0.10f;
             int best_label = -1;
             float best_cost = outlier_cost;
-            for (int neighbor : neighbors[surfel_id]) {
+            for (int neighbor : neighborhoods[surfel_id]) {
                 if (labels[static_cast<std::size_t>(neighbor)] >= 0) best_cost += 0.5f * smooth_weight;
             }
 
@@ -1044,7 +1031,7 @@ static CompetitionStats refine_patch_ownership_joint(
                 if (!active[patch_id] || patches[patch_id].surfels.empty()) continue;
                 float cost = joint_surfel_data_cost(surfel, patches[patch_id], cfg);
                 if (!std::isfinite(cost)) continue;
-                for (int neighbor : neighbors[surfel_id]) {
+                for (int neighbor : neighborhoods[surfel_id]) {
                     const int neighbor_label = labels[static_cast<std::size_t>(neighbor)];
                     if (neighbor_label >= 0 && neighbor_label != static_cast<int>(patch_id)) {
                         cost += smooth_weight;
@@ -1207,6 +1194,7 @@ static DenseAssignmentStats assign_full_points(
     std::vector<PlanePatch>& patches,
     const std::vector<Surfel>& surfels,
     const std::unordered_map<CellKey, int, CellKeyHash>& index_by_key,
+    const SurfelNeighborhoods& neighborhoods,
     const Bounds& bounds,
     const Config& cfg,
     bool enable_normal_guidance) {
@@ -1218,7 +1206,7 @@ static DenseAssignmentStats assign_full_points(
     const std::vector<int> labels = build_surfel_labels(patches, surfels.size());
     const bool topology_aware = cfg.pipeline == "topology";
     const std::vector<std::vector<BoundaryConstraint>> boundary_constraints = topology_aware
-        ? build_boundary_constraints(patches, surfels, index_by_key, cfg)
+        ? build_boundary_constraints(patches, surfels, neighborhoods, cfg)
         : std::vector<std::vector<BoundaryConstraint>>(patches.size());
     for (const auto& constraints : boundary_constraints) stats.boundary_constraints += constraints.size();
 
@@ -1810,7 +1798,7 @@ static std::vector<CornerCandidate> extract_corners_filtered(
 static std::vector<FinitePlaneIntersection> build_finite_plane_intersections(
     const std::vector<PlanePatch>& patches,
     const std::vector<Surfel>& surfels,
-    const std::unordered_map<CellKey, int, CellKeyHash>& index_by_key,
+    const SurfelNeighborhoods& neighborhoods,
     const Config& cfg) {
     if (patches.size() < 2 || surfels.empty()) return {};
     const std::vector<int> labels = build_surfel_labels(patches, surfels.size());
@@ -1820,7 +1808,7 @@ static std::vector<FinitePlaneIntersection> build_finite_plane_intersections(
     for (std::size_t surfel_id = 0; surfel_id < surfels.size(); ++surfel_id) {
         const int label_a = labels[surfel_id];
         if (label_a < 0) continue;
-        for (int neighbor : surfel_neighbors(static_cast<int>(surfel_id), surfels, index_by_key)) {
+        for (int neighbor : neighborhoods[surfel_id]) {
             if (neighbor <= static_cast<int>(surfel_id)) continue;
             const int label_b = labels[static_cast<std::size_t>(neighbor)];
             if (label_b < 0 || label_a == label_b) continue;
@@ -1873,12 +1861,12 @@ static CornerExtractionResult extract_corners_from_adjacency(
     const CloudPtr& cloud,
     const std::vector<PlanePatch>& patches,
     const std::vector<Surfel>& surfels,
-    const std::unordered_map<CellKey, int, CellKeyHash>& index_by_key,
+    const SurfelNeighborhoods& neighborhoods,
     const Bounds& bounds,
     const Config& cfg) {
     CornerExtractionResult result;
     result.finite_intersections =
-        build_finite_plane_intersections(patches, surfels, index_by_key, cfg);
+        build_finite_plane_intersections(patches, surfels, neighborhoods, cfg);
     if (patches.size() < 3 || result.finite_intersections.size() < 2) return result;
 
     const std::size_t plane_count = patches.size();
@@ -2165,13 +2153,13 @@ static void report_probe(
 static void save_feature_edges(
     const fs::path& path,
     const std::vector<Surfel>& surfels,
-    const std::unordered_map<CellKey, int, CellKeyHash>& index_by_key,
+    const SurfelNeighborhoods& neighborhoods,
     const std::vector<PlanePatch>& patches) {
     const std::vector<int> labels = build_surfel_labels(patches, surfels.size());
 
     const auto is_feature_edge = [&](std::size_t i) {
         if (labels[i] < 0) return false;
-        for (int neighbor : surfel_neighbors(static_cast<int>(i), surfels, index_by_key)) {
+        for (int neighbor : neighborhoods[i]) {
             const int label = labels[static_cast<std::size_t>(neighbor)];
             if (label >= 0 && label != labels[i]) return true;
         }
@@ -2242,6 +2230,15 @@ int main(int argc, char** argv) {
         std::unordered_map<CellKey, int, CellKeyHash> index_by_key;
         CloudPtr surfel_cloud;
         std::vector<Surfel> surfels = build_surfels(cloud, bounds, cfg, index_by_key, surfel_cloud);
+        const SurfelNeighborhoods neighborhoods = build_surfel_neighborhoods(surfels, index_by_key);
+        std::size_t neighborhood_entries = 0;
+        std::size_t neighborhood_capacity = 0;
+        for (const std::vector<int>& neighbors : neighborhoods) {
+            neighborhood_entries += neighbors.size();
+            neighborhood_capacity += neighbors.capacity();
+        }
+        const std::size_t neighborhood_storage_bytes =
+            neighborhoods.size() * sizeof(std::vector<int>) + neighborhood_capacity * sizeof(int);
         now = Clock::now();
         timings.surfel_build_ms = elapsed_ms(stage_start, now);
         stage_start = now;
@@ -2253,20 +2250,20 @@ int main(int argc, char** argv) {
         std::size_t coarse_capacity_expansions = 0;
         std::size_t local_capacity_expansions = 0;
         if (cfg.pipeline == "baseline") {
-            mark_edge_surfels(surfels, index_by_key, cfg);
+            mark_edge_surfels(surfels, neighborhoods, cfg);
             patches = extract_all_seed_grown_patches(
-                surfels, index_by_key, cfg, coarse_capacity_expansions);
+                surfels, neighborhoods, cfg, coarse_capacity_expansions);
             coarse_candidate_count = patches.size();
         } else {
             std::vector<Surfel> coarse_surfels = surfels;
             std::vector<Surfel> local_surfels = surfels;
             estimate_surfel_normals(local_surfels, surfel_cloud, std::max(6, cfg.normal_k / 2));
-            mark_edge_surfels(coarse_surfels, index_by_key, cfg);
-            mark_edge_surfels(local_surfels, index_by_key, cfg);
+            mark_edge_surfels(coarse_surfels, neighborhoods, cfg);
+            mark_edge_surfels(local_surfels, neighborhoods, cfg);
 
             std::vector<PlanePatch> coarse_patches =
                 extract_all_seed_grown_patches(
-                    coarse_surfels, index_by_key, cfg, coarse_capacity_expansions);
+                    coarse_surfels, neighborhoods, cfg, coarse_capacity_expansions);
             coarse_candidate_count = coarse_patches.size();
 
             surfels = fuse_multiscale_surfels(coarse_surfels, local_surfels);
@@ -2277,7 +2274,7 @@ int main(int argc, char** argv) {
             local_cfg.max_planes = std::max(cfg.max_planes, 240);
             std::vector<PlanePatch> local_patches =
                 extract_all_seed_grown_patches(
-                    surfels, index_by_key, local_cfg, local_capacity_expansions);
+                    surfels, neighborhoods, local_cfg, local_capacity_expansions);
             local_candidate_count = local_patches.size();
 
             patches = std::move(coarse_patches);
@@ -2302,8 +2299,8 @@ int main(int argc, char** argv) {
         const std::size_t initially_merged_patch_count = patches.size();
         const CompetitionStats competition =
             (cfg.pipeline == "joint" || cfg.pipeline == "topology")
-            ? refine_patch_ownership_joint(patches, surfels, index_by_key, cfg)
-            : refine_patch_ownership(patches, surfels, index_by_key, cfg);
+            ? refine_patch_ownership_joint(patches, surfels, neighborhoods, cfg)
+            : refine_patch_ownership(patches, surfels, neighborhoods, cfg);
         now = Clock::now();
         timings.competition_ms = elapsed_ms(stage_start, now);
         stage_start = now;
@@ -2317,7 +2314,7 @@ int main(int argc, char** argv) {
         timings.assign_margin_ms = elapsed_ms(stage_start, now);
         stage_start = now;
         DenseAssignmentStats dense_assignment = assign_full_points(
-            cloud, patches, surfels, index_by_key, bounds, cfg, true);
+            cloud, patches, surfels, index_by_key, neighborhoods, bounds, cfg, true);
         // Isolated conflicts are often unstable edge normals. Require evidence comparable
         // to a fraction of one deliverable patch and to the cloud size before changing labels.
         const std::size_t minimum_guided_evidence = std::max<std::size_t>(
@@ -2327,7 +2324,8 @@ int main(int argc, char** argv) {
         const bool normal_guidance_applied = topology_guidance_applied ||
             (!cfg.distance_only && dense_assignment.established_guided_points >= minimum_guided_evidence);
         if (!normal_guidance_applied) {
-            assign_full_points(cloud, patches, surfels, index_by_key, bounds, cfg, false);
+            assign_full_points(
+                cloud, patches, surfels, index_by_key, neighborhoods, bounds, cfg, false);
         }
         now = Clock::now();
         timings.dense_assignment_ms = elapsed_ms(stage_start, now);
@@ -2346,7 +2344,7 @@ int main(int argc, char** argv) {
         CornerExtractionResult corner_result;
         if (cfg.corner_mode == "adjacency") {
             corner_result = extract_corners_from_adjacency(
-                cloud, patches, surfels, index_by_key, bounds, cfg);
+                cloud, patches, surfels, neighborhoods, bounds, cfg);
         } else {
             corner_result.corners = extract_corners_filtered(cloud, patches, bounds, cfg);
         }
@@ -2359,7 +2357,7 @@ int main(int argc, char** argv) {
         fs::create_directories(out_dir);
         save_plane_patches(out_dir / "edge_aware_plane_patches.ply", patches);
         save_plane_parameters_csv(out_dir / "plane_parameters.csv", patches);
-        save_feature_edges(out_dir / "feature_edges.ply", surfels, index_by_key, patches);
+        save_feature_edges(out_dir / "feature_edges.ply", surfels, neighborhoods, patches);
         save_corners(out_dir / "extracted_corners.ply", corners);
         if (cfg.corner_mode == "adjacency") {
             save_finite_intersections(
@@ -2384,6 +2382,9 @@ int main(int argc, char** argv) {
             std::cout << "Pipeline: " << cfg.pipeline << "\n";
             std::cout << "Input points: " << cloud->size() << "\n";
             std::cout << "Surfels: " << surfels.size() << "\n";
+            std::cout << "Cached neighbor references/storage MiB: "
+                      << neighborhood_entries << '/'
+                      << static_cast<double>(neighborhood_storage_bytes) / (1024.0 * 1024.0) << "\n";
             std::cout << "Global normal families/reliable surfels: "
                       << global_normals.directions.size() << '/' << global_normals.reliable_surfels << "\n";
             std::cout << "Coarse/local candidate patches: "
