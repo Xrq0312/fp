@@ -238,6 +238,7 @@ static Config parse_args(int argc, char** argv) {
             << "  --output-dir DIR\n"
             << "  --pipeline baseline|multiscale|joint|topology  select an ablation pipeline\n"
             << "  --corner-mode global|adjacency  choose global triples or observed finite intersections\n"
+            << "  --proposal-initial-cap N  diagnostic initial proposal capacity; expands automatically\n"
             << "  --audit-assignments  write per-plane dense-assignment diagnostics\n"
             << "  --distance-only  diagnostic A/B: disable normal-guided dense assignment\n"
             << "  --probe X Y Z  print plane-assignment diagnostics at a point\n"
@@ -271,6 +272,14 @@ static Config parse_args(int argc, char** argv) {
             if (cfg.corner_mode != "global" && cfg.corner_mode != "adjacency") {
                 throw std::runtime_error(
                     "Unknown corner mode: " + cfg.corner_mode + ". Available: global, adjacency.");
+            }
+        } else if (arg == "--proposal-initial-cap") {
+            if (i + 1 >= args.size()) {
+                throw std::runtime_error("Missing value after --proposal-initial-cap.");
+            }
+            cfg.max_planes = std::stoi(args[++i]);
+            if (cfg.max_planes < 1) {
+                throw std::runtime_error("--proposal-initial-cap must be positive.");
             }
         } else if (arg == "--distance-only") {
             cfg.distance_only = true;
@@ -544,7 +553,9 @@ static bool surfel_matches_plane(const Surfel& surfel, const PlanePatch& patch, 
 static std::vector<PlanePatch> extract_seed_grown_patches(
     const std::vector<Surfel>& surfels,
     const std::unordered_map<CellKey, int, CellKeyHash>& index_by_key,
-    const Config& cfg) {
+    const Config& cfg,
+    bool& capacity_exceeded) {
+    capacity_exceeded = false;
     std::vector<int> order(surfels.size());
     std::iota(order.begin(), order.end(), 0);
     std::sort(order.begin(), order.end(), [&](int a, int b) {
@@ -615,13 +626,44 @@ static std::vector<PlanePatch> extract_seed_grown_patches(
         const int patch_id = static_cast<int>(patches.size());
         for (int id : ids) owner[static_cast<std::size_t>(id)] = patch_id;
         patches.push_back(std::move(patch));
-        if (patches.size() >= static_cast<std::size_t>(std::max(cfg.max_planes, 1))) break;
+        if (patches.size() > static_cast<std::size_t>(std::max(cfg.max_planes, 1))) {
+            capacity_exceeded = true;
+            patches.resize(static_cast<std::size_t>(std::max(cfg.max_planes, 1)));
+            break;
+        }
     }
 
     std::sort(patches.begin(), patches.end(), [](const PlanePatch& a, const PlanePatch& b) {
         return a.surfels.size() > b.surfels.size();
     });
     return patches;
+}
+
+static std::vector<PlanePatch> extract_all_seed_grown_patches(
+    const std::vector<Surfel>& surfels,
+    const std::unordered_map<CellKey, int, CellKeyHash>& index_by_key,
+    const Config& cfg,
+    std::size_t& capacity_expansions) {
+    capacity_expansions = 0;
+    Config expanded_cfg = cfg;
+    expanded_cfg.max_planes = std::max(expanded_cfg.max_planes, 1);
+    const std::size_t minimum_patch = static_cast<std::size_t>(std::max(cfg.min_surfels, 6));
+    const std::size_t maximum_possible = std::max<std::size_t>(1, surfels.size() / minimum_patch + 1);
+    while (true) {
+        bool capacity_exceeded = false;
+        std::vector<PlanePatch> patches = extract_seed_grown_patches(
+            surfels, index_by_key, expanded_cfg, capacity_exceeded);
+        if (!capacity_exceeded) return patches;
+
+        ++capacity_expansions;
+        const std::size_t current = static_cast<std::size_t>(expanded_cfg.max_planes);
+        const std::size_t expanded = std::min(maximum_possible, std::max(current + 1, 2 * current));
+        if (expanded <= current) {
+            throw std::runtime_error("Plane proposal capacity could not be expanded safely.");
+        }
+        expanded_cfg.max_planes = static_cast<int>(std::min<std::size_t>(
+            expanded, static_cast<std::size_t>(std::numeric_limits<int>::max())));
+    }
 }
 
 static int closest_global_normal_family(
@@ -2208,9 +2250,12 @@ int main(int argc, char** argv) {
         std::vector<PlanePatch> patches;
         std::size_t coarse_candidate_count = 0;
         std::size_t local_candidate_count = 0;
+        std::size_t coarse_capacity_expansions = 0;
+        std::size_t local_capacity_expansions = 0;
         if (cfg.pipeline == "baseline") {
             mark_edge_surfels(surfels, index_by_key, cfg);
-            patches = extract_seed_grown_patches(surfels, index_by_key, cfg);
+            patches = extract_all_seed_grown_patches(
+                surfels, index_by_key, cfg, coarse_capacity_expansions);
             coarse_candidate_count = patches.size();
         } else {
             std::vector<Surfel> coarse_surfels = surfels;
@@ -2220,7 +2265,8 @@ int main(int argc, char** argv) {
             mark_edge_surfels(local_surfels, index_by_key, cfg);
 
             std::vector<PlanePatch> coarse_patches =
-                extract_seed_grown_patches(coarse_surfels, index_by_key, cfg);
+                extract_all_seed_grown_patches(
+                    coarse_surfels, index_by_key, cfg, coarse_capacity_expansions);
             coarse_candidate_count = coarse_patches.size();
 
             surfels = fuse_multiscale_surfels(coarse_surfels, local_surfels);
@@ -2230,7 +2276,8 @@ int main(int argc, char** argv) {
             local_cfg.smooth_angle_deg = std::min(10.0f, cfg.smooth_angle_deg + 2.0f);
             local_cfg.max_planes = std::max(cfg.max_planes, 240);
             std::vector<PlanePatch> local_patches =
-                extract_seed_grown_patches(surfels, index_by_key, local_cfg);
+                extract_all_seed_grown_patches(
+                    surfels, index_by_key, local_cfg, local_capacity_expansions);
             local_candidate_count = local_patches.size();
 
             patches = std::move(coarse_patches);
@@ -2341,6 +2388,8 @@ int main(int argc, char** argv) {
                       << global_normals.directions.size() << '/' << global_normals.reliable_surfels << "\n";
             std::cout << "Coarse/local candidate patches: "
                       << coarse_candidate_count << '/' << local_candidate_count << "\n";
+            std::cout << "Coarse/local proposal capacity expansions: "
+                      << coarse_capacity_expansions << '/' << local_capacity_expansions << "\n";
             std::cout << "Accepted global-family merges: " << global_family_merges << "\n";
             std::cout << "Grown/merged/competed patches: "
                       << grown_patch_count << '/' << initially_merged_patch_count << '/' << competed_patch_count << "\n";

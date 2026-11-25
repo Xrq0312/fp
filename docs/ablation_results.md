@@ -138,6 +138,15 @@ current fixtures the observed maximum was 2--7 candidates per point, so all
 saved synthetic outputs remained byte-for-byte identical; the change removes a
 latent correctness limit rather than tuning present data.
 
+Proposal generation had a second silent limit: reaching `max_planes` stopped
+the ordered seed traversal immediately, so later disconnected faces could never
+enter competition. The value is now only an initial capacity. If one additional
+valid proposal is found, the capacity doubles and the deterministic extraction
+restarts until the full seed order is exhausted. A forced-capacity regression
+started the stepped-box baseline at one proposal, expanded three times, and
+produced byte-identical plane, edge, and corner outputs to the normal-capacity
+run. No supplied dataset expands under the normal 160/240 initial capacities.
+
 Stage timers show that algorithmic all-model loops are not the dominant wall
 time on `top_down`: a representative 50.92 s Release run spent 25.17 s loading
 the PLY and 18.96 s writing ASCII diagnostics. Proposal generation took 2.79 s,
