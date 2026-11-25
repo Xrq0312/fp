@@ -34,12 +34,18 @@ def parse_step_planes(path: Path) -> list[tuple[tuple[float, float, float], floa
     entities = {int(identifier): body.strip() for identifier, body in ENTITY_RE.findall(text)}
     planes: list[tuple[tuple[float, float, float], float]] = []
     for body in entities.values():
-        if not body.startswith("PLANE"):
+        if not body.startswith("ADVANCED_FACE"):
             continue
         references = [int(value) for value in REF_RE.findall(body)]
         if not references:
             continue
-        placement = entities[references[-1]]
+        surface = entities[references[-1]]
+        if not surface.startswith("PLANE"):
+            continue
+        plane_references = [int(value) for value in REF_RE.findall(surface)]
+        if not plane_references:
+            continue
+        placement = entities[plane_references[-1]]
         if not placement.startswith("AXIS2_PLACEMENT_3D"):
             continue
         placement_refs = [int(value) for value in REF_RE.findall(placement)]
@@ -107,6 +113,7 @@ def evaluate(
 
     return {
         "step_plane_entities": len(truth),
+        "step_planar_faces": len(truth),
         "predicted_patches": len(predictions),
         "matched_patches": matched_predictions,
         "patch_precision_proxy": matched_predictions / len(predictions) if predictions else 0.0,

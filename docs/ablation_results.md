@@ -115,7 +115,9 @@ match the joint stage on every file; `top_left_cut2` changes from 62 to 61 raw
 corner candidates, which is reported as a regression observation rather than an
 accuracy claim. Against `data2.STEP`, all 54 predicted `top_left_cut2` patches
 match an analytic STEP plane within 3 degrees and 0.75 coordinate units, and the
-matched-point fraction is 1.0. Earlier, less conservative topology experiments
+matched-point fraction is 1.0. This is only an infinite-plane precision proxy:
+the finite-face evaluator below shows that one planar annulus is missed.
+Earlier, less conservative topology experiments
 created up to three small transition patches; those variants were rejected and
 are not part of this stage.
 
@@ -207,3 +209,27 @@ Raw corner counts on the two scans without CAD corner truth changed from 19 to
 17 (`top_left_cut`) and remained 16 (`top_down`). Those count changes are not
 treated as accuracy claims. The option remains independently selectable while
 the remaining scan visualizations and boundary metrics are expanded.
+
+## Finite STEP plane-instance evaluation
+
+`evaluate_step_instances.py` follows each planar `ADVANCED_FACE` through its
+outer/inner `EDGE_LOOP` boundaries. Ordinary loops use their ordered vertices;
+the annular face in `data2.STEP` uses paired circular arcs and is represented by
+sampled analytic circles. Clean CAD PLY points and predicted points are assigned
+to finite faces, an instance IoU matrix is built, and one-to-one Hungarian
+matching reports detection and segmentation quality. This avoids both nearest
+infinite-plane double counting and collapsing disconnected coplanar faces.
+
+| Dataset | STEP planar faces | Unique infinite planes | Predicted | Precision | Recall | F1 | Macro IoU | Over / under |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| top_down2 / data1.STEP | 20 | 20 | 20 | 1.000 | 1.000 | 1.000 | 0.9930 | 0 / 0 |
+| top_left_cut2 / data2.STEP | 55 | 52 | 54 | 1.000 | 0.9818 | 0.9908 | 0.9566 | 0 / 0 |
+
+The missing `data2.STEP` instance is a planar annulus at `y=22.5475 mm` with
+outer radius 3.0 mm and inner radius 1.6 mm. It contains 57,613 clean points but
+its best predicted-instance IoU is only 0.0483. The miss is therefore not a
+sparse-output artifact. Its 1.4 mm radial width is almost entirely boundary
+support at the 0.5 mm surfel scale, explaining why non-edge seed growing fails.
+This becomes the next proposal-generation target; the default minimum extent is
+not reduced globally because that would reintroduce transition-plane false
+positives on scans.

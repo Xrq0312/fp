@@ -88,7 +88,11 @@ Two kinds of evidence are kept separate:
    checks, extract vertices incident to three distinct STEP planes and use
    one-to-one matching for corner precision, recall, F1, and localization error.
    Coincident but disconnected STEP faces must not be collapsed when future
-   plane-instance GT labels are generated.
+   plane-instance GT labels are generated. The implemented finite-face evaluator
+   parses outer and inner STEP loops (including circular annuli), labels clean
+   CAD samples, constructs a prediction/truth IoU matrix, and uses one-to-one
+   Hungarian matching to report precision, recall, F1, macro IoU, oversegmentation,
+   and undersegmentation.
 
 Acceptance priorities are: (1) no regression in synthetic plane/corner recall,
 (2) reduced false merge and fragmentation, (3) higher real-data coverage, and

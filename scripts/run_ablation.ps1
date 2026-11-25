@@ -72,6 +72,7 @@ foreach ($variant in $Variants) {
         $quality = $null
         $stepQuality = $null
         $stepCornerQuality = $null
+        $stepInstanceQuality = $null
         if ($dataset.Synthetic) {
             $resultPath = Join-Path $runDir $dataset.Name
             $metricsPath = Join-Path $runDir "metrics.json"
@@ -100,6 +101,16 @@ foreach ($variant in $Variants) {
                     (Join-Path $resultPath "extracted_corners.ply") `
                     --json $stepCornerMetricsPath | Out-Null
                 $stepCornerQuality = Get-Content $stepCornerMetricsPath -Raw | ConvertFrom-Json
+                $stepInstanceMetricsPath = Join-Path $runDir "step_instance_metrics.json"
+                $cleanPath = $dataset.Path
+                $cleanScale = if ($dataset.Name -eq "top_left_cut2") { 1000 } else { 1 }
+                & $python .\tests\evaluate_step_instances.py `
+                    $stepPath `
+                    $cleanPath `
+                    $resultPath `
+                    --input-scale $cleanScale `
+                    --json $stepInstanceMetricsPath | Out-Null
+                $stepInstanceQuality = Get-Content $stepInstanceMetricsPath -Raw | ConvertFrom-Json
             }
         }
 
@@ -137,6 +148,12 @@ foreach ($variant in $Variants) {
             StepCornerRecall = if ($stepCornerQuality) { $stepCornerQuality.corner_recall } else { $null }
             StepCornerF1 = if ($stepCornerQuality) { $stepCornerQuality.corner_f1 } else { $null }
             StepCornerMeanError = if ($stepCornerQuality) { $stepCornerQuality.corner_mean_error } else { $null }
+            StepInstancePrecision = if ($stepInstanceQuality) { $stepInstanceQuality.plane_precision } else { $null }
+            StepInstanceRecall = if ($stepInstanceQuality) { $stepInstanceQuality.plane_recall } else { $null }
+            StepInstanceF1 = if ($stepInstanceQuality) { $stepInstanceQuality.plane_f1 } else { $null }
+            StepInstanceMacroIoU = if ($stepInstanceQuality) { $stepInstanceQuality.instance_macro_iou } else { $null }
+            StepOversegmented = if ($stepInstanceQuality) { $stepInstanceQuality.oversegmented_truth_instances } else { $null }
+            StepUndersegmented = if ($stepInstanceQuality) { $stepInstanceQuality.undersegmented_predictions } else { $null }
         }
     }
 }
