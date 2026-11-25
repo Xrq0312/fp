@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
@@ -139,7 +140,25 @@ struct DenseAssignmentStats {
     std::size_t topology_guided_points = 0;
     std::size_t boundary_rejected_candidates = 0;
     std::size_t boundary_constraints = 0;
+    std::size_t max_candidates_per_point = 0;
     std::vector<TopologyCorrection> corrections;
+};
+
+struct StageTimings {
+    double load_ms = 0.0;
+    double surfel_build_ms = 0.0;
+    double proposal_ms = 0.0;
+    double global_relations_ms = 0.0;
+    double initial_merge_ms = 0.0;
+    double competition_ms = 0.0;
+    double final_merge_ms = 0.0;
+    double assign_margin_ms = 0.0;
+    double dense_assignment_ms = 0.0;
+    double finalize_ms = 0.0;
+    double audit_ms = 0.0;
+    double corners_ms = 0.0;
+    double save_ms = 0.0;
+    double total_ms = 0.0;
 };
 
 struct FinalizeStats {
@@ -1141,6 +1160,9 @@ static DenseAssignmentStats assign_full_points(
         bool inside_tight = false;
     };
 
+    std::vector<DenseCandidate> candidates;
+    candidates.reserve(patches.size());
+
     for (const auto& p : cloud->points) {
         const Eigen::Vector3f q(p.x, p.y, p.z);
         const CellKey key = point_key(p, bounds, cfg.surfel_size);
@@ -1156,14 +1178,13 @@ static DenseAssignmentStats assign_full_points(
             : -1;
         const bool has_local_normal = enable_normal_guidance && local_surfel != nullptr;
 
-        std::array<DenseCandidate, 160> candidates{};
-        std::size_t candidate_count = 0;
+        candidates.clear();
         for (std::size_t i = 0; i < patches.size(); ++i) {
             const float distance = std::abs(patches[i].normal.dot(q) + patches[i].d);
             if (distance > cfg.assign_distance) continue;
             if (!point_inside_patch_envelope(patches[i], q, cfg.assign_margin)) continue;
-            if (candidate_count >= candidates.size()) continue;
-            DenseCandidate& candidate = candidates[candidate_count++];
+            candidates.emplace_back();
+            DenseCandidate& candidate = candidates.back();
             candidate.id = static_cast<int>(i);
             candidate.distance = distance;
             candidate.normal_dot = has_local_normal
@@ -1172,6 +1193,8 @@ static DenseAssignmentStats assign_full_points(
             candidate.inside_tight = point_inside_patch_envelope(
                 patches[i], q, 2.0f * cfg.surfel_size);
         }
+        const std::size_t candidate_count = candidates.size();
+        stats.max_candidates_per_point = std::max(stats.max_candidates_per_point, candidate_count);
         if (candidate_count == 0) continue;
 
         // Only ambiguous points pay for the local support lookup.  The lookup is
@@ -1906,14 +1929,28 @@ static void save_corners(const fs::path& path, const std::vector<CornerCandidate
 
 int main(int argc, char** argv) {
     try {
+        using Clock = std::chrono::steady_clock;
+        const auto program_start = Clock::now();
+        auto stage_start = program_start;
+        const auto elapsed_ms = [](Clock::time_point start, Clock::time_point end) {
+            return std::chrono::duration<double, std::milli>(end - start).count();
+        };
+        StageTimings timings;
+
         Config cfg = parse_args(argc, argv);
         CloudPtr cloud = load_cloud(cfg.input, cfg.input_scale);
         Bounds bounds;
         pcl::getMinMax3D(*cloud, bounds.min_pt, bounds.max_pt);
+        auto now = Clock::now();
+        timings.load_ms = elapsed_ms(stage_start, now);
+        stage_start = now;
 
         std::unordered_map<CellKey, int, CellKeyHash> index_by_key;
         CloudPtr surfel_cloud;
         std::vector<Surfel> surfels = build_surfels(cloud, bounds, cfg, index_by_key, surfel_cloud);
+        now = Clock::now();
+        timings.surfel_build_ms = elapsed_ms(stage_start, now);
+        stage_start = now;
         estimate_surfel_normals(surfels, surfel_cloud, cfg.normal_k);
 
         std::vector<PlanePatch> patches;
@@ -1950,18 +1987,36 @@ int main(int argc, char** argv) {
                 std::make_move_iterator(local_patches.begin()),
                 std::make_move_iterator(local_patches.end()));
         }
+        now = Clock::now();
+        timings.proposal_ms = elapsed_ms(stage_start, now);
+        stage_start = now;
 
         const GlobalNormalStats global_normals = estimate_global_normal_families(surfels, cfg);
+        now = Clock::now();
+        timings.global_relations_ms = elapsed_ms(stage_start, now);
+        stage_start = now;
         const std::size_t grown_patch_count = patches.size();
         std::size_t global_family_merges = merge_patches_adaptive(patches, surfels, cfg, global_normals);
+        now = Clock::now();
+        timings.initial_merge_ms = elapsed_ms(stage_start, now);
+        stage_start = now;
         const std::size_t initially_merged_patch_count = patches.size();
         const CompetitionStats competition =
             (cfg.pipeline == "joint" || cfg.pipeline == "topology")
             ? refine_patch_ownership_joint(patches, surfels, index_by_key, cfg)
             : refine_patch_ownership(patches, surfels, index_by_key, cfg);
+        now = Clock::now();
+        timings.competition_ms = elapsed_ms(stage_start, now);
+        stage_start = now;
         const std::size_t competed_patch_count = patches.size();
         global_family_merges += merge_patches_adaptive(patches, surfels, cfg, global_normals);
+        now = Clock::now();
+        timings.final_merge_ms = elapsed_ms(stage_start, now);
+        stage_start = now;
         cfg.assign_margin = estimate_assign_margin(cloud, patches, cfg);
+        now = Clock::now();
+        timings.assign_margin_ms = elapsed_ms(stage_start, now);
+        stage_start = now;
         DenseAssignmentStats dense_assignment = assign_full_points(
             cloud, patches, surfels, index_by_key, bounds, cfg, true);
         // Isolated conflicts are often unstable edge normals. Require evidence comparable
@@ -1975,12 +2030,24 @@ int main(int argc, char** argv) {
         if (!normal_guidance_applied) {
             assign_full_points(cloud, patches, surfels, index_by_key, bounds, cfg, false);
         }
+        now = Clock::now();
+        timings.dense_assignment_ms = elapsed_ms(stage_start, now);
+        stage_start = now;
         const FinalizeStats finalize_stats = finalize_dense_patches(patches, cfg);
+        now = Clock::now();
+        timings.finalize_ms = elapsed_ms(stage_start, now);
+        stage_start = now;
         const std::vector<AssignmentAuditRow> assignment_audit = cfg.audit_assignments
             ? audit_dense_assignments(patches, surfels, index_by_key, bounds, cfg)
             : std::vector<AssignmentAuditRow>{};
         report_probe(cfg, bounds, surfels, index_by_key, patches, normal_guidance_applied);
+        now = Clock::now();
+        timings.audit_ms = elapsed_ms(stage_start, now);
+        stage_start = now;
         const std::vector<CornerCandidate> corners = extract_corners_filtered(cloud, patches, bounds, cfg);
+        now = Clock::now();
+        timings.corners_ms = elapsed_ms(stage_start, now);
+        stage_start = now;
 
         fs::path out_dir = cfg.output_dir / cfg.input.stem();
         fs::create_directories(out_dir);
@@ -1997,6 +2064,9 @@ int main(int argc, char** argv) {
         if (cfg.audit_assignments) {
             save_assignment_audit(out_dir / "assignment_audit.csv", assignment_audit);
         }
+        now = Clock::now();
+        timings.save_ms = elapsed_ms(stage_start, now);
+        timings.total_ms = elapsed_ms(program_start, now);
 
         if (cfg.verbose) {
             std::size_t output_points = 0;
@@ -2027,6 +2097,8 @@ int main(int argc, char** argv) {
                       << dense_assignment.boundary_rejected_candidates << "\n";
             std::cout << "Active plane-side constraints: "
                       << dense_assignment.boundary_constraints << "\n";
+            std::cout << "Maximum dense candidates per point: "
+                      << dense_assignment.max_candidates_per_point << "\n";
             std::cout << "Safely absorbed small patches/points: "
                       << finalize_stats.absorbed_patches << '/' << finalize_stats.absorbed_points << "\n";
             std::cout << "Discarded sparse patch points: " << finalize_stats.discarded_sparse_points << "\n";
@@ -2034,6 +2106,16 @@ int main(int argc, char** argv) {
             std::cout << "Plane patches: " << patches.size() << "\n";
             std::cout << "Output points: " << output_points << "\n";
             std::cout << "Extracted corners: " << corners.size() << "\n";
+            std::cout << "Timing load/surfel/proposal (ms): "
+                      << timings.load_ms << '/' << timings.surfel_build_ms << '/' << timings.proposal_ms << "\n";
+            std::cout << "Timing global/merge1/competition/merge2 (ms): "
+                      << timings.global_relations_ms << '/' << timings.initial_merge_ms << '/'
+                      << timings.competition_ms << '/' << timings.final_merge_ms << "\n";
+            std::cout << "Timing margin/dense/finalize/audit/corners/save (ms): "
+                      << timings.assign_margin_ms << '/' << timings.dense_assignment_ms << '/'
+                      << timings.finalize_ms << '/' << timings.audit_ms << '/' << timings.corners_ms << '/'
+                      << timings.save_ms << "\n";
+            std::cout << "Timing total (ms): " << timings.total_ms << "\n";
             std::cout << "Saved to " << fs::absolute(out_dir).string() << "\n";
         }
         return 0;
