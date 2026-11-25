@@ -45,7 +45,7 @@ not a reconstruction from Git history.
 | `joint` | alternating multi-label assignment/refit, label cost, model birth/death/merge | Progressive-X, PEARL |
 | `topology` | observed adjacency, one-sided plane support, and conservative dense boundary correction | SED-Net, Progressive-X |
 | `boundary` (planned) | continuous multi-scale boundary confidence | SED-Net |
-| `relations` | robust parallel/orthogonal relation discovery and constrained normal refinement | GlobFit |
+| `--parallel-relations soft|hard` | complete-link parallel relation discovery and centroid-preserving normal refinement; explicit prior only | GlobFit |
 | `--corner-mode adjacency` | observed finite intersections, graph-local triples, SVD conditioning, and two-branch support | SED-Net, GCCao validation pattern |
 | `--edge-residual-proposals` | unexplained persistent-boundary proposals, model-birth benefit, and local occupied support | CPFN, Progressive-X, SED-Net |
 
@@ -84,6 +84,8 @@ Two kinds of evidence are kept separate:
    with noisy dense edge bands measure boundary spill. Report plane
    precision/recall, macro IoU, coverage, over-segmentation, corner
    precision/recall/error, and runtime.
+   A deliberately non-parallel 0.8-degree fixture is a guard against treating
+   geometric proximity as proof of a parallel/orthogonal design relation.
 2. `top_left_cut` and `top_down` are scan regression datasets without checked-in
    instance ground truth. Report coverage, patch count, fragmentation proxies,
    edge/corner counts, fit RMS, deterministic repeatability, and CPU time; raw

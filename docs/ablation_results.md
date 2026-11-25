@@ -290,3 +290,33 @@ file shrinks from 7.18 MB to 2.61 MB and save time falls from roughly 0.53 s to
 from 44.09 s to 27.45 s (38% reduction). The default stays ASCII for human
 inspection and backward compatibility; binary is the recommended production
 setting for multi-million-point results.
+
+## Parallel relation refinement (GlobFit ablation)
+
+`--parallel-relations none|soft|hard` forms deterministic complete-link normal
+clusters whose maximum pairwise spread is at most 20% of the existing merge
+angle (1 degree with the default configuration). Support-weighted family normals
+are applied halfway (`soft`) or exactly (`hard`); each plane keeps its fitted
+centroid and recomputes its offset and envelope. No orthogonality constraint is
+inferred: a near-90-degree angle alone is not evidence that a structure was
+designed orthogonally.
+
+| Dataset / mode | Instance macro IoU | Mean normal error | Mean corner error |
+| --- | ---: | ---: | ---: |
+| top_left_cut2 / none | 0.97129 | 0.03235 deg | 0.01122 mm |
+| top_left_cut2 / soft | 0.97178 | 0.02364 deg | 0.01021 mm |
+| top_left_cut2 / hard | 0.97182 | 0.01825 deg | 0.00865 mm |
+| top_down2 / none | 0.99300 | 0.08080 deg | 0.01026 mm |
+| top_down2 / soft | 0.99396 | 0.04051 deg | 0.00526 mm |
+| top_down2 / hard | 0.99412 | 0.00233 deg | 0.00392 mm |
+
+All STEP plane and corner F1 scores remain 1.0. The hard mode also leaves plane
+and corner counts unchanged on both scans, but that is not sufficient evidence
+that every discovered relation is real. A new synthetic fixture contains two
+planes intentionally separated by 0.8 degrees. `none` recovers them with
+0.00009-degree mean normal error, while `soft` and `hard` incorrectly increase
+the error to 0.200 and 0.400 degrees. Therefore relation refinement is an
+explicit domain-prior option only: `none` remains the general default; `hard`
+is recommended only when manufacturing semantics independently guarantee the
+clustered faces are parallel. This failure also rules out automatic hard
+orthogonal snapping without stronger semantic or repeated-structure evidence.

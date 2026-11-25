@@ -6,6 +6,8 @@ param(
     [string]$CornerMode = "global",
     [switch]$EdgeResidualProposals,
     [switch]$BinaryPlaneOutput,
+    [ValidateSet("none", "soft", "hard")]
+    [string]$ParallelRelations = "none",
     [switch]$IncludeLargeDatasets,
     [switch]$SkipBuild
 )
@@ -23,6 +25,7 @@ $fixtureDir = Join-Path $OutputDir "fixtures"
 New-Item -ItemType Directory -Force -Path $fixtureDir | Out-Null
 $steppedFixture = Join-Path $fixtureDir "stepped_box.ply"
 $crossingFixture = Join-Path $fixtureDir "crossing_planes.ply"
+$nearParallelFixture = Join-Path $fixtureDir "near_parallel_planes.ply"
 $python = Get-ChildItem "$env:LOCALAPPDATA\Programs\Python\Python*\python.exe" -ErrorAction SilentlyContinue |
     Select-Object -First 1 -ExpandProperty FullName
 if (-not $python) {
@@ -30,10 +33,12 @@ if (-not $python) {
 }
 & $python .\tests\generate_stepped_box.py $steppedFixture
 & $python .\tests\generate_crossing_planes.py $crossingFixture
+& $python .\tests\generate_near_parallel_planes.py $nearParallelFixture
 
 $datasets = @(
     [pscustomobject]@{ Name = "stepped_box"; Path = $steppedFixture; Profile = "model-mm"; Synthetic = $true },
-    [pscustomobject]@{ Name = "crossing_planes"; Path = $crossingFixture; Profile = "model-mm"; Synthetic = $true }
+    [pscustomobject]@{ Name = "crossing_planes"; Path = $crossingFixture; Profile = "model-mm"; Synthetic = $true },
+    [pscustomobject]@{ Name = "near_parallel_planes"; Path = $nearParallelFixture; Profile = "model-mm"; Synthetic = $true }
 )
 if ($IncludeLargeDatasets) {
     $datasets += @(
@@ -60,12 +65,13 @@ foreach ($variant in $Variants) {
             "--profile", $dataset.Profile,
             "--output-dir", $runDir,
             "--pipeline", $variant,
-            "--corner-mode", $CornerMode
+            "--corner-mode", $CornerMode,
+            "--parallel-relations", $ParallelRelations
         )
         if ($EdgeResidualProposals) {
             $arguments += "--edge-residual-proposals"
         }
-        if ($BinaryPlaneOutput) {
+        if ($BinaryPlaneOutput -and -not $dataset.Synthetic) {
             $arguments += "--binary-plane-output"
         }
         $watch = [Diagnostics.Stopwatch]::StartNew()
@@ -81,6 +87,7 @@ foreach ($variant in $Variants) {
         $stepQuality = $null
         $stepCornerQuality = $null
         $stepInstanceQuality = $null
+        $geometryQuality = $null
         if ($dataset.Synthetic) {
             $resultPath = Join-Path $runDir $dataset.Name
             $metricsPath = Join-Path $runDir "metrics.json"
@@ -89,6 +96,14 @@ foreach ($variant in $Variants) {
                 ([IO.Path]::ChangeExtension($dataset.Path, ".ground_truth.json")) `
                 $resultPath --json $metricsPath | Out-Null
             $quality = Get-Content $metricsPath -Raw | ConvertFrom-Json
+            if ($dataset.Name -eq "near_parallel_planes") {
+                $geometryMetricsPath = Join-Path $runDir "geometry_metrics.json"
+                & $python .\tests\evaluate_plane_parameters.py `
+                    ([IO.Path]::ChangeExtension($dataset.Path, ".ground_truth.json")) `
+                    (Join-Path $resultPath "plane_parameters.csv") `
+                    --json $geometryMetricsPath | Out-Null
+                $geometryQuality = Get-Content $geometryMetricsPath -Raw | ConvertFrom-Json
+            }
         } elseif ($dataset.Name -in @("top_left_cut2", "top_down2")) {
             $stepPath = if ($dataset.Name -eq "top_left_cut2") {
                 "..\data\data01\data2.STEP"
@@ -162,6 +177,9 @@ foreach ($variant in $Variants) {
             StepInstanceMacroIoU = if ($stepInstanceQuality) { $stepInstanceQuality.instance_macro_iou } else { $null }
             StepOversegmented = if ($stepInstanceQuality) { $stepInstanceQuality.oversegmented_truth_instances } else { $null }
             StepUndersegmented = if ($stepInstanceQuality) { $stepInstanceQuality.undersegmented_predictions } else { $null }
+            NormalMeanError = if ($geometryQuality) { $geometryQuality.normal_mean_error_deg } else { $null }
+            NormalMaxError = if ($geometryQuality) { $geometryQuality.normal_max_error_deg } else { $null }
+            PlaneOffsetMeanError = if ($geometryQuality) { $geometryQuality.offset_mean_error } else { $null }
         }
     }
 }

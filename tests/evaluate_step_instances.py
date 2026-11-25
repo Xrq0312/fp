@@ -245,9 +245,20 @@ def load_ascii_ply_points(path: Path, scale: float) -> np.ndarray:
     return points
 
 
-def load_patch_sizes(path: Path) -> list[int]:
+def load_patch_parameters(
+    path: Path,
+) -> tuple[list[int], list[tuple[tuple[float, float, float], float]]]:
     with path.open("r", encoding="utf-8", newline="") as handle:
-        return [int(row["dense_points"]) for row in csv.DictReader(handle)]
+        rows = list(csv.DictReader(handle))
+    sizes = [int(row["dense_points"]) for row in rows]
+    planes = [
+        (
+            normalize((float(row["nx"]), float(row["ny"]), float(row["nz"]))),
+            float(row["d"]),
+        )
+        for row in rows
+    ]
+    return sizes, planes
 
 
 def hungarian_maximize(values: np.ndarray) -> list[tuple[int, int]]:
@@ -319,7 +330,7 @@ def evaluate(
     unmatched_truth_points = int(np.count_nonzero(truth_labels < 0))
     del clean_points, truth_labels
 
-    patch_sizes = load_patch_sizes(result_dir / "plane_parameters.csv")
+    patch_sizes, predicted_planes = load_patch_parameters(result_dir / "plane_parameters.csv")
     predicted_points = load_ascii_ply_points(result_dir / "edge_aware_plane_patches.ply", 1.0)
     if sum(patch_sizes) != predicted_points.shape[0]:
         raise ValueError("plane_parameters.csv dense counts do not match the result PLY")
@@ -353,6 +364,19 @@ def evaluate(
     fragments_per_truth = np.count_nonzero(prediction_purity >= 0.5, axis=0)
     faces_per_prediction = np.count_nonzero(truth_coverage >= 0.5, axis=1)
     matched_ious = [float(iou[prediction, truth]) for prediction, truth in accepted]
+    normal_errors = []
+    offset_errors = []
+    residual_errors = []
+    for prediction, truth in accepted:
+        predicted_normal, predicted_offset = predicted_planes[prediction]
+        truth_normal = faces[truth].normal
+        dot = max(-1.0, min(1.0, sum(predicted_normal[i] * truth_normal[i] for i in range(3))))
+        sign = 1.0 if dot >= 0.0 else -1.0
+        normal_errors.append(math.degrees(math.acos(abs(dot))))
+        offset_errors.append(abs(predicted_offset - sign * faces[truth].offset))
+        residual_errors.append(
+            abs(sum(predicted_normal[i] * faces[truth].centroid[i] for i in range(3)) + predicted_offset)
+        )
     matched_truth = {truth for _, truth in accepted}
     unmatched_truth = [
         {
@@ -373,6 +397,12 @@ def evaluate(
         "plane_f1": 2.0 * precision * recall / (precision + recall) if precision + recall else 0.0,
         "instance_macro_iou": sum(matched_ious) / len(faces) if faces else 0.0,
         "matched_instance_mean_iou": sum(matched_ious) / len(matched_ious) if matched_ious else 0.0,
+        "normal_mean_error_deg": sum(normal_errors) / len(normal_errors) if normal_errors else None,
+        "normal_max_error_deg": max(normal_errors) if normal_errors else None,
+        "offset_mean_error": sum(offset_errors) / len(offset_errors) if offset_errors else None,
+        "offset_max_error": max(offset_errors) if offset_errors else None,
+        "face_centroid_residual_mean": sum(residual_errors) / len(residual_errors) if residual_errors else None,
+        "face_centroid_residual_max": max(residual_errors) if residual_errors else None,
         "oversegmented_truth_instances": int(np.count_nonzero(fragments_per_truth > 1)),
         "undersegmented_predictions": int(np.count_nonzero(faces_per_prediction > 1)),
         "unmatched_clean_points": unmatched_truth_points,

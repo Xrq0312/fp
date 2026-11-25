@@ -68,6 +68,7 @@ struct Config {
     std::string corner_mode = "global";
     bool edge_residual_proposals = false;
     bool binary_plane_output = false;
+    std::string parallel_relations = "none";
 };
 
 struct Bounds {
@@ -160,6 +161,7 @@ struct StageTimings {
     double initial_merge_ms = 0.0;
     double competition_ms = 0.0;
     double final_merge_ms = 0.0;
+    double relation_refinement_ms = 0.0;
     double assign_margin_ms = 0.0;
     double dense_assignment_ms = 0.0;
     double finalize_ms = 0.0;
@@ -180,6 +182,12 @@ struct ResidualNoveltyStats {
     std::size_t accepted = 0;
     std::size_t rejected = 0;
     double maximum_estimated_novel_points = 0.0;
+};
+
+struct RelationRefinementStats {
+    std::size_t clusters = 0;
+    std::size_t constrained_planes = 0;
+    float maximum_cluster_spread_deg = 0.0f;
 };
 
 struct GlobalNormalStats {
@@ -255,6 +263,7 @@ static Config parse_args(int argc, char** argv) {
             << "  --proposal-initial-cap N  diagnostic initial proposal capacity; expands automatically\n"
             << "  --edge-residual-proposals  propose planes from unexplained persistent boundary surfels\n"
             << "  --binary-plane-output  write the large colored plane PLY in binary format\n"
+            << "  --parallel-relations none|soft|hard  optional global parallel-normal refinement\n"
             << "  --audit-assignments  write per-plane dense-assignment diagnostics\n"
             << "  --distance-only  diagnostic A/B: disable normal-guided dense assignment\n"
             << "  --probe X Y Z  print plane-assignment diagnostics at a point\n"
@@ -301,6 +310,15 @@ static Config parse_args(int argc, char** argv) {
             cfg.edge_residual_proposals = true;
         } else if (arg == "--binary-plane-output") {
             cfg.binary_plane_output = true;
+        } else if (arg == "--parallel-relations") {
+            if (i + 1 >= args.size()) throw std::runtime_error("Missing value after --parallel-relations.");
+            cfg.parallel_relations = args[++i];
+            if (cfg.parallel_relations != "none" && cfg.parallel_relations != "soft" &&
+                cfg.parallel_relations != "hard") {
+                throw std::runtime_error(
+                    "Unknown parallel relation mode: " + cfg.parallel_relations +
+                    ". Available: none, soft, hard.");
+            }
         } else if (arg == "--distance-only") {
             cfg.distance_only = true;
         } else if (arg == "--probe") {
@@ -1615,6 +1633,90 @@ static GlobalNormalStats estimate_global_normal_families(
     return stats;
 }
 
+static RelationRefinementStats refine_parallel_relations(
+    std::vector<PlanePatch>& patches,
+    const std::vector<Surfel>& surfels,
+    const Config& cfg) {
+    RelationRefinementStats stats;
+    if (cfg.parallel_relations == "none" || patches.size() < 2) return stats;
+    const float relation_angle_deg = std::max(0.25f, 0.2f * cfg.merge_angle_deg);
+    const float relation_cos = std::cos(
+        relation_angle_deg / 180.0f * 3.14159265358979323846f);
+    std::vector<std::vector<std::size_t>> clusters;
+    clusters.reserve(patches.size());
+    for (std::size_t patch_id = 0; patch_id < patches.size(); ++patch_id) {
+        clusters.push_back({patch_id});
+    }
+
+    while (true) {
+        std::size_t best_a = clusters.size();
+        std::size_t best_b = clusters.size();
+        float best_spread = std::numeric_limits<float>::max();
+        for (std::size_t a = 0; a < clusters.size(); ++a) {
+            for (std::size_t b = a + 1; b < clusters.size(); ++b) {
+                bool compatible = true;
+                float spread = 0.0f;
+                for (std::size_t first : clusters[a]) {
+                    for (std::size_t second : clusters[b]) {
+                        const float dot = std::clamp(
+                            std::abs(patches[first].normal.dot(patches[second].normal)), 0.0f, 1.0f);
+                        if (dot < relation_cos) {
+                            compatible = false;
+                            break;
+                        }
+                        spread = std::max(
+                            spread,
+                            std::acos(dot) * 180.0f / 3.14159265358979323846f);
+                    }
+                    if (!compatible) break;
+                }
+                if (compatible && spread < best_spread) {
+                    best_spread = spread;
+                    best_a = a;
+                    best_b = b;
+                }
+            }
+        }
+        if (best_a == clusters.size()) break;
+        clusters[best_a].insert(
+            clusters[best_a].end(), clusters[best_b].begin(), clusters[best_b].end());
+        clusters.erase(clusters.begin() + static_cast<std::ptrdiff_t>(best_b));
+    }
+
+    for (const std::vector<std::size_t>& cluster : clusters) {
+        if (cluster.size() < 2) continue;
+        Eigen::Vector3d weighted_normal = Eigen::Vector3d::Zero();
+        const Eigen::Vector3f reference = patches[cluster.front()].normal;
+        float cluster_spread = 0.0f;
+        for (std::size_t patch_id : cluster) {
+            const float sign = reference.dot(patches[patch_id].normal) >= 0.0f ? 1.0f : -1.0f;
+            const double weight = static_cast<double>(std::max<std::size_t>(patches[patch_id].surfels.size(), 1));
+            weighted_normal += weight * sign * patches[patch_id].normal.cast<double>();
+            const float dot = std::clamp(
+                std::abs(reference.dot(patches[patch_id].normal)), 0.0f, 1.0f);
+            cluster_spread = std::max(
+                cluster_spread,
+                std::acos(dot) * 180.0f / 3.14159265358979323846f);
+        }
+        if (weighted_normal.squaredNorm() <= 1e-12) continue;
+        const Eigen::Vector3f family_normal = weighted_normal.normalized().cast<float>();
+        for (std::size_t patch_id : cluster) {
+            PlanePatch& patch = patches[patch_id];
+            const float sign = family_normal.dot(patch.normal) >= 0.0f ? 1.0f : -1.0f;
+            const Eigen::Vector3f target = sign * family_normal;
+            patch.normal = cfg.parallel_relations == "hard"
+                ? target
+                : (patch.normal + target).normalized();
+            patch.d = -patch.normal.dot(patch.centroid);
+            update_patch_envelope(patch, surfels);
+        }
+        ++stats.clusters;
+        stats.constrained_planes += cluster.size();
+        stats.maximum_cluster_spread_deg = std::max(stats.maximum_cluster_spread_deg, cluster_spread);
+    }
+    return stats;
+}
+
 static FinalizeStats finalize_dense_patches(
     std::vector<PlanePatch>& patches,
     const Config& cfg) {
@@ -2659,6 +2761,11 @@ int main(int argc, char** argv) {
         now = Clock::now();
         timings.final_merge_ms = elapsed_ms(stage_start, now);
         stage_start = now;
+        const RelationRefinementStats relation_refinement =
+            refine_parallel_relations(patches, surfels, cfg);
+        now = Clock::now();
+        timings.relation_refinement_ms = elapsed_ms(stage_start, now);
+        stage_start = now;
         cfg.assign_margin = estimate_assign_margin(cloud, patches, cfg);
         now = Clock::now();
         timings.assign_margin_ms = elapsed_ms(stage_start, now);
@@ -2753,6 +2860,10 @@ int main(int argc, char** argv) {
                       << residual_novelty.rejected << '/'
                       << residual_novelty.maximum_estimated_novel_points << "\n";
             std::cout << "Accepted global-family merges: " << global_family_merges << "\n";
+            std::cout << "Parallel relation mode/clusters/planes/max spread deg: "
+                      << cfg.parallel_relations << '/' << relation_refinement.clusters << '/'
+                      << relation_refinement.constrained_planes << '/'
+                      << relation_refinement.maximum_cluster_spread_deg << "\n";
             std::cout << "Grown/merged/competed patches: "
                       << grown_patch_count << '/' << initially_merged_patch_count << '/' << competed_patch_count << "\n";
             std::cout << "Boundary-reassigned surfels: " << competition.moved_surfels << "\n";
@@ -2792,9 +2903,10 @@ int main(int argc, char** argv) {
             }
             std::cout << "Timing load/surfel/proposal (ms): "
                       << timings.load_ms << '/' << timings.surfel_build_ms << '/' << timings.proposal_ms << "\n";
-            std::cout << "Timing global/merge1/competition/merge2 (ms): "
+            std::cout << "Timing global/merge1/competition/merge2/relations (ms): "
                       << timings.global_relations_ms << '/' << timings.initial_merge_ms << '/'
-                      << timings.competition_ms << '/' << timings.final_merge_ms << "\n";
+                      << timings.competition_ms << '/' << timings.final_merge_ms << '/'
+                      << timings.relation_refinement_ms << "\n";
             std::cout << "Timing margin/dense/finalize/audit/corners/save (ms): "
                       << timings.assign_margin_ms << '/' << timings.dense_assignment_ms << '/'
                       << timings.finalize_ms << '/' << timings.audit_ms << '/' << timings.corners_ms << '/'
