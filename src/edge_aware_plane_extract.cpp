@@ -1342,6 +1342,25 @@ static DenseAssignmentStats assign_full_points(
         : std::vector<std::vector<BoundaryConstraint>>(patches.size());
     for (const auto& constraints : boundary_constraints) stats.boundary_constraints += constraints.size();
 
+    // A tiny support fragment can have a locally coherent normal while still
+    // being a spurious boundary model.  Infer which owners are established
+    // from this scene's support distribution, using the same robust lower-tail
+    // rule as the directed boundary constraints.
+    std::vector<float> owner_log_support;
+    owner_log_support.reserve(patches.size());
+    for (const PlanePatch& patch : patches) {
+        owner_log_support.push_back(
+            std::log(static_cast<float>(std::max<std::size_t>(patch.surfels.size(), 1))));
+    }
+    const float owner_median_log_support = median_value(owner_log_support);
+    std::vector<float> owner_support_deviations;
+    owner_support_deviations.reserve(owner_log_support.size());
+    for (float value : owner_log_support) {
+        owner_support_deviations.push_back(std::abs(value - owner_median_log_support));
+    }
+    const float owner_support_sigma = 1.4826f * median_value(std::move(owner_support_deviations));
+    const float owner_authority_floor = owner_median_log_support - 3.0f * owner_support_sigma;
+
     struct DenseCandidate {
         int id = -1;
         float distance = std::numeric_limits<float>::max();
@@ -1365,9 +1384,10 @@ static DenseAssignmentStats assign_full_points(
         const int local_owner = local != index_by_key.end()
             ? labels[static_cast<std::size_t>(local->second)]
             : -1;
-        const int established_local_owner = local_surfel != nullptr && !local_surfel->edge_like
-            ? local_owner
-            : -1;
+        const int established_local_owner = local_surfel != nullptr && !local_surfel->edge_like &&
+                local_owner >= 0 &&
+                owner_log_support[static_cast<std::size_t>(local_owner)] >= owner_authority_floor
+            ? local_owner : -1;
         const bool has_local_normal = enable_normal_guidance && local_surfel != nullptr;
 
         candidates.clear();
@@ -1471,6 +1491,38 @@ static DenseAssignmentStats assign_full_points(
                 if (candidates[distance_best].inside_tight && distance_lacks_real_support) {
                     ++stats.locally_supported_points;
                 }
+            }
+        }
+
+        // A non-edge surfel is an observed, locally smooth piece of one plane.
+        // Do not let a different infinite plane steal its dense points merely
+        // because the two fitted planes are very close near an intersection.
+        // The earlier conservative rule only corrected loose-envelope or
+        // unsupported candidates; that left thin one-cell spill bands whenever
+        // the wrong plane's rectangular envelope and neighborhood overlapped
+        // the true face. This override is deliberately limited to topology
+        // mode and to an established, normal-consistent local owner. Mixed
+        // edge surfels therefore keep the original pointwise decision.
+        if (topology_aware && established_local_owner >= 0 &&
+            candidates[selected].id != established_local_owner &&
+            candidates[selected].normal_dot < edge_cos) {
+            std::size_t owner_candidate = candidate_count;
+            for (std::size_t i = 0; i < candidate_count; ++i) {
+                if (candidates[i].id != established_local_owner) continue;
+                if (candidates[i].normal_dot < smooth_cos) continue;
+                const PlanePatch& owner_patch = patches[static_cast<std::size_t>(candidates[i].id)];
+                const PlanePatch& selected_patch = patches[static_cast<std::size_t>(candidates[selected].id)];
+                const float fit_uncertainty = std::max(
+                    3.0f * std::hypot(owner_patch.rms_distance, selected_patch.rms_distance),
+                    1e-6f * cfg.surfel_size);
+                if (candidates[i].distance > candidates[selected].distance + fit_uncertainty) continue;
+                owner_candidate = i;
+                break;
+            }
+            if (owner_candidate < candidate_count) {
+                selected = owner_candidate;
+                ++stats.normal_guided_points;
+                ++stats.established_guided_points;
             }
         }
 

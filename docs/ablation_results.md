@@ -130,6 +130,36 @@ with concurrent desktop load; the zero-correction `top_down2` case is about 6%
 slower than the recorded joint run after deferring topology checks until the
 ordinary joint candidate has been selected.
 
+### Stable-owner correction for thin boundary spill
+
+A remaining failure mode occurred inside a surfel that was already classified
+as smooth and owned by the correct plane. Near an intersection, a different
+infinite plane could still win dense assignment by a slightly smaller point-to-
+plane distance, even though its normal strongly disagreed with the observed
+surfel normal. This produced the one-cell-wide colored slivers seen in the real
+scan.
+
+Topology mode now restores the observed owner only when all of the following
+hold: the surfel is not edge-like, the selected plane differs by more than the
+20-degree edge angle, the owner agrees within the 8-degree smooth angle, and
+the distance disadvantage is within three combined fitted RMS deviations. A
+scene-adaptive median/MAD lower-tail test prevents tiny support fragments from
+gaining this authority. Thus the rule uses measured fit uncertainty and support
+statistics rather than a dataset-specific distance or plane-size threshold.
+
+On `top_down`, recoverable normal-inconsistent assignments decreased from 5,739
+to 4,437 (1,302 fewer, 22.69%). The largest affected face decreased from 955 to
+183 such assignments. Plane count (20), output coverage, and adjacency corners
+(16) were unchanged. The final four-real-cloud regression retained the prior
+plane counts. Clean STEP instance checks remained 55/55 and 20/20 with no over-
+or under-segmentation; `top_left_cut2` macro IoU changed from 0.971293 to
+0.971183, while `top_down2` was 0.993013. The stepped-box regression remained
+perfect and the crossing-plane macro IoU remained 0.985402.
+
+The red points in `topology_corrections.ply` are a diagnostic overlay showing
+points whose labels were corrected; they are not red labels in the final
+`edge_aware_plane_patches.ply` output.
+
 ## Correctness and performance audit
 
 The dense-assignment candidate buffer was a fixed `std::array<..., 160>` even
