@@ -2,6 +2,8 @@ param(
     [string[]]$Variants = @("baseline", "multiscale", "joint", "topology"),
     [string[]]$DatasetNames = @(),
     [string]$OutputDir = ".\results\ablation",
+    [ValidateSet("global", "adjacency")]
+    [string]$CornerMode = "global",
     [switch]$IncludeLargeDatasets,
     [switch]$SkipBuild
 )
@@ -55,7 +57,8 @@ foreach ($variant in $Variants) {
             $dataset.Path,
             "--profile", $dataset.Profile,
             "--output-dir", $runDir,
-            "--pipeline", $variant
+            "--pipeline", $variant,
+            "--corner-mode", $CornerMode
         )
         $watch = [Diagnostics.Stopwatch]::StartNew()
         $output = & .\build\Release\edge_aware_plane_extract.exe @arguments 2>&1
@@ -68,6 +71,7 @@ foreach ($variant in $Variants) {
 
         $quality = $null
         $stepQuality = $null
+        $stepCornerQuality = $null
         if ($dataset.Synthetic) {
             $resultPath = Join-Path $runDir $dataset.Name
             $metricsPath = Join-Path $runDir "metrics.json"
@@ -76,8 +80,12 @@ foreach ($variant in $Variants) {
                 ([IO.Path]::ChangeExtension($dataset.Path, ".ground_truth.json")) `
                 $resultPath --json $metricsPath | Out-Null
             $quality = Get-Content $metricsPath -Raw | ConvertFrom-Json
-        } elseif ($dataset.Name -eq "top_left_cut2") {
-            $stepPath = "..\data\data01\data2.STEP"
+        } elseif ($dataset.Name -in @("top_left_cut2", "top_down2")) {
+            $stepPath = if ($dataset.Name -eq "top_left_cut2") {
+                "..\data\data01\data2.STEP"
+            } else {
+                "..\data\data01\data1.STEP"
+            }
             if (Test-Path $stepPath) {
                 $resultPath = Join-Path $runDir $dataset.Name
                 $stepMetricsPath = Join-Path $runDir "step_metrics.json"
@@ -86,6 +94,12 @@ foreach ($variant in $Variants) {
                     (Join-Path $resultPath "plane_parameters.csv") `
                     --json $stepMetricsPath | Out-Null
                 $stepQuality = Get-Content $stepMetricsPath -Raw | ConvertFrom-Json
+                $stepCornerMetricsPath = Join-Path $runDir "step_corner_metrics.json"
+                & $python .\tests\evaluate_step_corners.py `
+                    $stepPath `
+                    (Join-Path $resultPath "extracted_corners.ply") `
+                    --json $stepCornerMetricsPath | Out-Null
+                $stepCornerQuality = Get-Content $stepCornerMetricsPath -Raw | ConvertFrom-Json
             }
         }
 
@@ -119,6 +133,10 @@ foreach ($variant in $Variants) {
             StepMatchedPatches = if ($stepQuality) { $stepQuality.matched_patches } else { $null }
             StepPatchPrecision = if ($stepQuality) { $stepQuality.patch_precision_proxy } else { $null }
             StepMatchedPoints = if ($stepQuality) { $stepQuality.matched_point_fraction } else { $null }
+            StepCornerPrecision = if ($stepCornerQuality) { $stepCornerQuality.corner_precision } else { $null }
+            StepCornerRecall = if ($stepCornerQuality) { $stepCornerQuality.corner_recall } else { $null }
+            StepCornerF1 = if ($stepCornerQuality) { $stepCornerQuality.corner_f1 } else { $null }
+            StepCornerMeanError = if ($stepCornerQuality) { $stepCornerQuality.corner_mean_error } else { $null }
         }
     }
 }

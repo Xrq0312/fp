@@ -64,6 +64,7 @@ struct Config {
     Eigen::Vector3f probe{0.0f, 0.0f, 0.0f};
     bool verbose = true;
     std::string pipeline = "baseline";
+    std::string corner_mode = "global";
 };
 
 struct Bounds {
@@ -189,6 +190,25 @@ struct CornerCandidate {
     int support = 0;
 };
 
+struct FinitePlaneIntersection {
+    int plane_a = -1;
+    int plane_b = -1;
+    Eigen::Vector3f origin{0.0f, 0.0f, 0.0f};
+    Eigen::Vector3f direction{1.0f, 0.0f, 0.0f};
+    float min_t = 0.0f;
+    float max_t = 0.0f;
+    float boundary_rms = 0.0f;
+    std::size_t support = 0;
+};
+
+struct CornerExtractionResult {
+    std::vector<CornerCandidate> corners;
+    std::vector<FinitePlaneIntersection> finite_intersections;
+    std::size_t local_triples = 0;
+    std::size_t ill_conditioned_triples = 0;
+    float maximum_accepted_condition = 0.0f;
+};
+
 static float median_value(std::vector<float> values);
 
 static float scale_for_profile(const std::string& profile) {
@@ -217,6 +237,7 @@ static Config parse_args(int argc, char** argv) {
             << "  --profile model-mm|model-m|top-down|top-left-cut2\n"
             << "  --output-dir DIR\n"
             << "  --pipeline baseline|multiscale|joint|topology  select an ablation pipeline\n"
+            << "  --corner-mode global|adjacency  choose global triples or observed finite intersections\n"
             << "  --audit-assignments  write per-plane dense-assignment diagnostics\n"
             << "  --distance-only  diagnostic A/B: disable normal-guided dense assignment\n"
             << "  --probe X Y Z  print plane-assignment diagnostics at a point\n"
@@ -244,6 +265,13 @@ static Config parse_args(int argc, char** argv) {
             }
         } else if (arg == "--audit-assignments") {
             cfg.audit_assignments = true;
+        } else if (arg == "--corner-mode") {
+            if (i + 1 >= args.size()) throw std::runtime_error("Missing value after --corner-mode.");
+            cfg.corner_mode = args[++i];
+            if (cfg.corner_mode != "global" && cfg.corner_mode != "adjacency") {
+                throw std::runtime_error(
+                    "Unknown corner mode: " + cfg.corner_mode + ". Available: global, adjacency.");
+            }
         } else if (arg == "--distance-only") {
             cfg.distance_only = true;
         } else if (arg == "--probe") {
@@ -1616,6 +1644,45 @@ static bool intersection_of_three_planes(const PlanePatch& a, const PlanePatch& 
     return out.allFinite();
 }
 
+static bool intersection_of_two_planes(
+    const PlanePatch& a,
+    const PlanePatch& b,
+    Eigen::Vector3f& origin,
+    Eigen::Vector3f& direction) {
+    direction = a.normal.cross(b.normal);
+    const float direction_norm = direction.norm();
+    if (direction_norm < 1e-5f) return false;
+    direction /= direction_norm;
+
+    Eigen::Matrix3f system;
+    system.row(0) = a.normal.transpose();
+    system.row(1) = b.normal.transpose();
+    system.row(2) = direction.transpose();
+    origin = system.colPivHouseholderQr().solve(Eigen::Vector3f(-a.d, -b.d, 0.0f));
+    return origin.allFinite();
+}
+
+static bool intersection_of_three_planes_svd(
+    const PlanePatch& a,
+    const PlanePatch& b,
+    const PlanePatch& c,
+    Eigen::Vector3f& out,
+    float& condition_number) {
+    Eigen::Matrix3f system;
+    system.row(0) = a.normal.transpose();
+    system.row(1) = b.normal.transpose();
+    system.row(2) = c.normal.transpose();
+    Eigen::JacobiSVD<Eigen::Matrix3f> svd(system, Eigen::ComputeFullU | Eigen::ComputeFullV);
+    const Eigen::Vector3f singular = svd.singularValues();
+    if (singular.x() <= 0.0f || singular.z() <= singular.x() * 1e-4f) {
+        condition_number = std::numeric_limits<float>::infinity();
+        return false;
+    }
+    condition_number = singular.x() / singular.z();
+    out = svd.solve(Eigen::Vector3f(-a.d, -b.d, -c.d));
+    return out.allFinite();
+}
+
 static bool within_bounds(const Eigen::Vector3f& p, const Bounds& bounds, float margin) {
     return p.x() >= bounds.min_pt.x - margin && p.x() <= bounds.max_pt.x + margin &&
            p.y() >= bounds.min_pt.y - margin && p.y() <= bounds.max_pt.y + margin &&
@@ -1696,6 +1763,175 @@ static std::vector<CornerCandidate> extract_corners_filtered(
     }
 
     return merge_corner_candidates(std::move(candidates), merge_radius);
+}
+
+static std::vector<FinitePlaneIntersection> build_finite_plane_intersections(
+    const std::vector<PlanePatch>& patches,
+    const std::vector<Surfel>& surfels,
+    const std::unordered_map<CellKey, int, CellKeyHash>& index_by_key,
+    const Config& cfg) {
+    if (patches.size() < 2 || surfels.empty()) return {};
+    const std::vector<int> labels = build_surfel_labels(patches, surfels.size());
+    const std::size_t plane_count = patches.size();
+    std::vector<std::vector<Eigen::Vector3f>> interface_samples(plane_count * plane_count);
+
+    for (std::size_t surfel_id = 0; surfel_id < surfels.size(); ++surfel_id) {
+        const int label_a = labels[surfel_id];
+        if (label_a < 0) continue;
+        for (int neighbor : surfel_neighbors(static_cast<int>(surfel_id), surfels, index_by_key)) {
+            if (neighbor <= static_cast<int>(surfel_id)) continue;
+            const int label_b = labels[static_cast<std::size_t>(neighbor)];
+            if (label_b < 0 || label_a == label_b) continue;
+            const int a = std::min(label_a, label_b);
+            const int b = std::max(label_a, label_b);
+            interface_samples[static_cast<std::size_t>(a) * plane_count + static_cast<std::size_t>(b)]
+                .push_back(0.5f * (surfels[surfel_id].centroid +
+                    surfels[static_cast<std::size_t>(neighbor)].centroid));
+        }
+    }
+
+    std::vector<FinitePlaneIntersection> intersections;
+    const std::size_t minimum_support = static_cast<std::size_t>(std::max(cfg.min_plane_local_support, 3));
+    const float maximum_boundary_distance = std::max(2.5f * cfg.surfel_size, 2.0f * cfg.coplanar_distance);
+    for (std::size_t a = 0; a < plane_count; ++a) {
+        for (std::size_t b = a + 1; b < plane_count; ++b) {
+            const std::vector<Eigen::Vector3f>& samples = interface_samples[a * plane_count + b];
+            if (samples.size() < minimum_support) continue;
+
+            FinitePlaneIntersection edge;
+            edge.plane_a = static_cast<int>(a);
+            edge.plane_b = static_cast<int>(b);
+            if (!intersection_of_two_planes(patches[a], patches[b], edge.origin, edge.direction)) continue;
+
+            std::vector<float> parameters;
+            parameters.reserve(samples.size());
+            double squared_error = 0.0;
+            for (const Eigen::Vector3f& sample : samples) {
+                const float t = edge.direction.dot(sample - edge.origin);
+                const Eigen::Vector3f projected = edge.origin + t * edge.direction;
+                const float distance = (sample - projected).norm();
+                if (distance > maximum_boundary_distance) continue;
+                parameters.push_back(t);
+                squared_error += static_cast<double>(distance) * static_cast<double>(distance);
+            }
+            if (parameters.size() < minimum_support) continue;
+
+            std::sort(parameters.begin(), parameters.end());
+            edge.min_t = parameters.front();
+            edge.max_t = parameters.back();
+            edge.support = parameters.size();
+            edge.boundary_rms = static_cast<float>(std::sqrt(squared_error / parameters.size()));
+            intersections.push_back(edge);
+        }
+    }
+    return intersections;
+}
+
+static CornerExtractionResult extract_corners_from_adjacency(
+    const CloudPtr& cloud,
+    const std::vector<PlanePatch>& patches,
+    const std::vector<Surfel>& surfels,
+    const std::unordered_map<CellKey, int, CellKeyHash>& index_by_key,
+    const Bounds& bounds,
+    const Config& cfg) {
+    CornerExtractionResult result;
+    result.finite_intersections =
+        build_finite_plane_intersections(patches, surfels, index_by_key, cfg);
+    if (patches.size() < 3 || result.finite_intersections.size() < 2) return result;
+
+    const std::size_t plane_count = patches.size();
+    std::vector<int> edge_by_pair(plane_count * plane_count, -1);
+    std::vector<std::vector<int>> graph(plane_count);
+    for (std::size_t edge_id = 0; edge_id < result.finite_intersections.size(); ++edge_id) {
+        const FinitePlaneIntersection& edge = result.finite_intersections[edge_id];
+        const std::size_t a = static_cast<std::size_t>(edge.plane_a);
+        const std::size_t b = static_cast<std::size_t>(edge.plane_b);
+        edge_by_pair[a * plane_count + b] = static_cast<int>(edge_id);
+        edge_by_pair[b * plane_count + a] = static_cast<int>(edge_id);
+        graph[a].push_back(edge.plane_b);
+        graph[b].push_back(edge.plane_a);
+    }
+
+    std::set<std::array<int, 3>> local_triples;
+    for (std::size_t center = 0; center < graph.size(); ++center) {
+        std::vector<int>& neighbors = graph[center];
+        std::sort(neighbors.begin(), neighbors.end());
+        neighbors.erase(std::unique(neighbors.begin(), neighbors.end()), neighbors.end());
+        for (std::size_t i = 0; i < neighbors.size(); ++i) {
+            for (std::size_t j = i + 1; j < neighbors.size(); ++j) {
+                std::array<int, 3> triple{
+                    static_cast<int>(center), neighbors[i], neighbors[j]
+                };
+                std::sort(triple.begin(), triple.end());
+                local_triples.insert(triple);
+            }
+        }
+    }
+    result.local_triples = local_triples.size();
+
+    pcl::KdTreeFLANN<PointT> support_tree;
+    support_tree.setInputCloud(cloud);
+    const auto nearby_support_count = [&](const Eigen::Vector3f& p, float radius) {
+        PointT probe;
+        probe.x = p.x();
+        probe.y = p.y();
+        probe.z = p.z();
+        std::vector<int> indices;
+        std::vector<float> distances;
+        return support_tree.radiusSearch(probe, radius, indices, distances);
+    };
+
+    const float support_radius = std::max(cfg.corner_support_radius_scale * cfg.surfel_size, 1e-4f);
+    const float merge_radius = std::max(cfg.intersection_merge_scale * cfg.surfel_size, 1e-4f);
+    const float bbox_margin = std::max(3.0f * cfg.surfel_size, cfg.assign_distance);
+    const float envelope_margin = std::max(cfg.assign_margin, cfg.surfel_size * 2.0f);
+    std::vector<CornerCandidate> candidates;
+    for (const std::array<int, 3>& triple : local_triples) {
+        const std::size_t i = static_cast<std::size_t>(triple[0]);
+        const std::size_t j = static_cast<std::size_t>(triple[1]);
+        const std::size_t k = static_cast<std::size_t>(triple[2]);
+        Eigen::Vector3f p;
+        float condition_number = 0.0f;
+        if (!intersection_of_three_planes_svd(
+                patches[i], patches[j], patches[k], p, condition_number)) {
+            ++result.ill_conditioned_triples;
+            continue;
+        }
+        result.maximum_accepted_condition =
+            std::max(result.maximum_accepted_condition, condition_number);
+        if (!within_bounds(p, bounds, bbox_margin)) continue;
+        if (!point_inside_patch_envelope(patches[i], p, envelope_margin) ||
+            !point_inside_patch_envelope(patches[j], p, envelope_margin) ||
+            !point_inside_patch_envelope(patches[k], p, envelope_margin)) {
+            continue;
+        }
+
+        int supported_lines = 0;
+        const std::array<std::pair<std::size_t, std::size_t>, 3> pairs{{
+            {i, j}, {i, k}, {j, k}
+        }};
+        for (const auto& pair : pairs) {
+            const int edge_id = edge_by_pair[pair.first * plane_count + pair.second];
+            if (edge_id < 0) continue;
+            const FinitePlaneIntersection& edge =
+                result.finite_intersections[static_cast<std::size_t>(edge_id)];
+            const float t = edge.direction.dot(p - edge.origin);
+            const float line_margin = std::max(3.0f * cfg.surfel_size, 2.0f * edge.boundary_rms);
+            if (t >= edge.min_t - line_margin && t <= edge.max_t + line_margin) ++supported_lines;
+        }
+        // Two observed boundary branches are sufficient: the third one may be
+        // hidden by occlusion or absent from a partial scan.
+        if (supported_lines < 2) continue;
+
+        const int support = nearby_support_count(p, support_radius);
+        if (support < cfg.min_corner_support) continue;
+        if (nearby_support_count_on_patch(patches[i], p, support_radius) < cfg.min_plane_local_support) continue;
+        if (nearby_support_count_on_patch(patches[j], p, support_radius) < cfg.min_plane_local_support) continue;
+        if (nearby_support_count_on_patch(patches[k], p, support_radius) < cfg.min_plane_local_support) continue;
+        candidates.push_back({p, support});
+    }
+    result.corners = merge_corner_candidates(std::move(candidates), merge_radius);
+    return result;
 }
 
 static void write_color_ply_header(std::ofstream& out, std::size_t vertex_count) {
@@ -1927,6 +2163,22 @@ static void save_corners(const fs::path& path, const std::vector<CornerCandidate
     }
 }
 
+static void save_finite_intersections(
+    const fs::path& path,
+    const std::vector<FinitePlaneIntersection>& intersections) {
+    std::ofstream out(path);
+    if (!out) throw std::runtime_error("Failed to write finite intersections: " + path.string());
+    out << "plane_a,plane_b,support,boundary_rms,start_x,start_y,start_z,end_x,end_y,end_z\n";
+    out << std::setprecision(9);
+    for (const FinitePlaneIntersection& edge : intersections) {
+        const Eigen::Vector3f start = edge.origin + edge.min_t * edge.direction;
+        const Eigen::Vector3f end = edge.origin + edge.max_t * edge.direction;
+        out << edge.plane_a << ',' << edge.plane_b << ',' << edge.support << ',' << edge.boundary_rms << ','
+            << start.x() << ',' << start.y() << ',' << start.z() << ','
+            << end.x() << ',' << end.y() << ',' << end.z() << '\n';
+    }
+}
+
 int main(int argc, char** argv) {
     try {
         using Clock = std::chrono::steady_clock;
@@ -2044,7 +2296,14 @@ int main(int argc, char** argv) {
         now = Clock::now();
         timings.audit_ms = elapsed_ms(stage_start, now);
         stage_start = now;
-        const std::vector<CornerCandidate> corners = extract_corners_filtered(cloud, patches, bounds, cfg);
+        CornerExtractionResult corner_result;
+        if (cfg.corner_mode == "adjacency") {
+            corner_result = extract_corners_from_adjacency(
+                cloud, patches, surfels, index_by_key, bounds, cfg);
+        } else {
+            corner_result.corners = extract_corners_filtered(cloud, patches, bounds, cfg);
+        }
+        const std::vector<CornerCandidate>& corners = corner_result.corners;
         now = Clock::now();
         timings.corners_ms = elapsed_ms(stage_start, now);
         stage_start = now;
@@ -2055,6 +2314,10 @@ int main(int argc, char** argv) {
         save_plane_parameters_csv(out_dir / "plane_parameters.csv", patches);
         save_feature_edges(out_dir / "feature_edges.ply", surfels, index_by_key, patches);
         save_corners(out_dir / "extracted_corners.ply", corners);
+        if (cfg.corner_mode == "adjacency") {
+            save_finite_intersections(
+                out_dir / "finite_plane_intersections.csv", corner_result.finite_intersections);
+        }
         if (cfg.pipeline == "topology") {
             save_topology_corrections(
                 out_dir / "topology_corrections.ply",
@@ -2106,6 +2369,14 @@ int main(int argc, char** argv) {
             std::cout << "Plane patches: " << patches.size() << "\n";
             std::cout << "Output points: " << output_points << "\n";
             std::cout << "Extracted corners: " << corners.size() << "\n";
+            std::cout << "Corner mode: " << cfg.corner_mode << "\n";
+            if (cfg.corner_mode == "adjacency") {
+                std::cout << "Finite intersections/local triples/ill-conditioned/max condition: "
+                          << corner_result.finite_intersections.size() << '/'
+                          << corner_result.local_triples << '/'
+                          << corner_result.ill_conditioned_triples << '/'
+                          << corner_result.maximum_accepted_condition << "\n";
+            }
             std::cout << "Timing load/surfel/proposal (ms): "
                       << timings.load_ms << '/' << timings.surfel_build_ms << '/' << timings.proposal_ms << "\n";
             std::cout << "Timing global/merge1/competition/merge2 (ms): "

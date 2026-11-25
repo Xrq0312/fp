@@ -127,3 +127,64 @@ checks do not require Pillow. Timings are representative Release runs and vary
 with concurrent desktop load; the zero-correction `top_down2` case is about 6%
 slower than the recorded joint run after deferring topology checks until the
 ordinary joint candidate has been selected.
+
+## Correctness and performance audit
+
+The dense-assignment candidate buffer was a fixed `std::array<..., 160>` even
+though the fine proposal pass permits 240 models and the coarse/fine sets are
+concatenated before merging. Candidates beyond index 159 were silently ignored.
+It is now a reusable dynamic buffer reserved to the current model count. On the
+current fixtures the observed maximum was 2--7 candidates per point, so all
+saved synthetic outputs remained byte-for-byte identical; the change removes a
+latent correctness limit rather than tuning present data.
+
+Stage timers show that algorithmic all-model loops are not the dominant wall
+time on `top_down`: a representative 50.92 s Release run spent 25.17 s loading
+the PLY and 18.96 s writing ASCII diagnostics. Proposal generation took 2.79 s,
+dense assignment 2.08 s, corner extraction 1.42 s, and joint competition only
+0.27 s. This rejects the initial assumption that accelerating joint labeling
+must be the first CPU priority. Output format remains unchanged for evaluator
+compatibility. A per-plane KDTree experiment preserved results exactly but made
+the real corner stage slower (1.42 s to 1.91 s) because tree construction
+dominated the small number of accepted triple queries; it was removed.
+
+## Stage 4: observed finite intersections and adjacency corners
+
+The optional `--corner-mode adjacency` constructs a plane graph from pairs of
+differently labelled surfels in neighboring grid cells. For each non-parallel
+pair, observed interface samples are projected onto the analytic plane-plane
+intersection. Samples inconsistent with that line are rejected and the
+remaining parameter range defines a finite observed intersection. Corner
+hypotheses come only from graph wedges (two observed pairwise intersections),
+not all plane triples. Requiring only two branches preserves corners whose third
+edge is occluded. A relative SVD singular-value test rejects ill-conditioned
+three-plane systems before solving them.
+
+The first experiment trimmed 5% from both ends of every observed line. It
+recalled only 8/16 stepped-box corners because the trim shortened long edges by
+2.5--3.5 mm near their vertices. This density- and length-dependent rule was
+removed. Interface samples already pass a perpendicular line-distance test;
+the existing local point and per-plane support tests remain the outlier guard.
+The corrected version recovers 16/16 stepped-box corners with precision and
+recall 1.0 and 0.00023 mm mean error. It reduces the considered hypotheses from
+165 global triples to 56 graph-local triples.
+
+Two supplied clean PLY files are CAD samples and provide independent STEP
+validation rather than mere regression data: `top_down2` corresponds to
+`data1.STEP`, and `top_left_cut2` to `data2.STEP`. A new evaluator extracts STEP
+vertices incident to at least three distinct analytic planes and performs
+one-to-one corner matching.
+
+| Dataset / mode | STEP planar corners | Predicted | Precision | Recall | F1 | Mean error (mm) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| top_down2 / global | 32 | 32 | 1.000 | 1.000 | 1.000 | 0.01026 |
+| top_down2 / adjacency | 32 | 32 | 1.000 | 1.000 | 1.000 | 0.01026 |
+| top_left_cut2 / global | 48 | 61 | 0.738 | 0.938 | 0.826 | 0.05071 |
+| top_left_cut2 / adjacency | 48 | 48 | 1.000 | 1.000 | 1.000 | 0.01111 |
+
+The adjacency method therefore removed 13 false corners and recovered three
+missed STEP corners on `top_left_cut2`; it did not trade precision for recall.
+Raw corner counts on the two scans without CAD corner truth changed from 19 to
+17 (`top_left_cut`) and remained 16 (`top_down`). Those count changes are not
+treated as accuracy claims. The option remains independently selectable while
+the remaining scan visualizations and boundary metrics are expanded.

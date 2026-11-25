@@ -46,7 +46,7 @@ not a reconstruction from Git history.
 | `topology` | observed adjacency, one-sided plane support, and conservative dense boundary correction | SED-Net, Progressive-X |
 | `boundary` (planned) | continuous multi-scale boundary confidence | SED-Net |
 | `relations` | robust parallel/orthogonal relation discovery and constrained normal refinement | GlobFit |
-| `enhanced` | adjacency-driven corner extraction with conditioning and three-boundary support | SED-Net, GCCao validation pattern |
+| `--corner-mode adjacency` | observed finite intersections, graph-local triples, SVD conditioning, and two-branch support | SED-Net, GCCao validation pattern |
 
 The neural components of CPFN and SED-Net are not copied: no training data or
 GPU runtime is introduced. Their transferable principles are used instead:
@@ -79,12 +79,16 @@ Two kinds of evidence are kept separate:
    with noisy dense edge bands measure boundary spill. Report plane
    precision/recall, macro IoU, coverage, over-segmentation, corner
    precision/recall/error, and runtime.
-2. The four supplied real point clouds have no checked-in instance ground truth.
-   They are regression datasets. Report coverage, patch count, fragmentation
-   proxies, edge/corner counts, fit RMS, deterministic repeatability, and CPU
-   time. These numbers must not be described as accuracy or recall. Where the
-   coordinate frame agrees, compare fitted equations against analytic STEP
-   planes as an independent geometry check.
+2. `top_left_cut` and `top_down` are scan regression datasets without checked-in
+   instance ground truth. Report coverage, patch count, fragmentation proxies,
+   edge/corner counts, fit RMS, deterministic repeatability, and CPU time; raw
+   counts must not be described as accuracy or recall.
+3. `top_left_cut2` and `top_down2` are clean CAD samples corresponding to
+   `data2.STEP` and `data1.STEP`, respectively. In addition to plane-equation
+   checks, extract vertices incident to three distinct STEP planes and use
+   one-to-one matching for corner precision, recall, F1, and localization error.
+   Coincident but disconnected STEP faces must not be collapsed when future
+   plane-instance GT labels are generated.
 
 Acceptance priorities are: (1) no regression in synthetic plane/corner recall,
 (2) reduced false merge and fragmentation, (3) higher real-data coverage, and
