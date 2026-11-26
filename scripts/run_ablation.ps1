@@ -8,6 +8,7 @@ param(
     [switch]$BinaryPlaneOutput,
     [ValidateSet("none", "soft", "hard")]
     [string]$ParallelRelations = "none",
+    [switch]$FiniteBoundaryPostprocess,
     [switch]$IncludeLargeDatasets,
     [switch]$SkipBuild
 )
@@ -73,6 +74,9 @@ foreach ($variant in $Variants) {
         }
         if ($BinaryPlaneOutput -and -not $dataset.Synthetic) {
             $arguments += "--binary-plane-output"
+        }
+        if ($FiniteBoundaryPostprocess) {
+            $arguments += "--finite-boundary-postprocess"
         }
         $watch = [Diagnostics.Stopwatch]::StartNew()
         $output = & .\build\Release\edge_aware_plane_extract.exe @arguments 2>&1

@@ -15,6 +15,7 @@
 #include <set>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -69,6 +70,7 @@ struct Config {
     bool edge_residual_proposals = false;
     bool binary_plane_output = false;
     std::string parallel_relations = "none";
+    bool finite_boundary_postprocess = false;
 };
 
 struct Bounds {
@@ -165,6 +167,7 @@ struct StageTimings {
     double assign_margin_ms = 0.0;
     double dense_assignment_ms = 0.0;
     double finalize_ms = 0.0;
+    double boundary_postprocess_ms = 0.0;
     double audit_ms = 0.0;
     double corners_ms = 0.0;
     double save_ms = 0.0;
@@ -231,6 +234,19 @@ struct CornerExtractionResult {
     float maximum_accepted_condition = 0.0f;
 };
 
+struct FiniteBoundaryPostprocessStats {
+    std::size_t finite_intersections = 0;
+    std::size_t directed_constraints = 0;
+    std::size_t trusted_geometry_points = 0;
+    std::size_t support_cells = 0;
+    std::size_t boundary_candidate_points = 0;
+    std::size_t finite_competitors = 0;
+    std::size_t margin_rejected_points = 0;
+    std::size_t corrected_points = 0;
+    std::size_t rejected_without_local_support = 0;
+    std::vector<TopologyCorrection> corrections;
+};
+
 static float median_value(std::vector<float> values);
 
 static float scale_for_profile(const std::string& profile) {
@@ -264,6 +280,7 @@ static Config parse_args(int argc, char** argv) {
             << "  --edge-residual-proposals  propose planes from unexplained persistent boundary surfels\n"
             << "  --binary-plane-output  write the large colored plane PLY in binary format\n"
             << "  --parallel-relations none|soft|hard  optional global parallel-normal refinement\n"
+            << "  --finite-boundary-postprocess  correct dense points beyond observed finite intersections\n"
             << "  --audit-assignments  write per-plane dense-assignment diagnostics\n"
             << "  --distance-only  diagnostic A/B: disable normal-guided dense assignment\n"
             << "  --probe X Y Z  print plane-assignment diagnostics at a point\n"
@@ -319,6 +336,8 @@ static Config parse_args(int argc, char** argv) {
                     "Unknown parallel relation mode: " + cfg.parallel_relations +
                     ". Available: none, soft, hard.");
             }
+        } else if (arg == "--finite-boundary-postprocess") {
+            cfg.finite_boundary_postprocess = true;
         } else if (arg == "--distance-only") {
             cfg.distance_only = true;
         } else if (arg == "--probe") {
@@ -1337,7 +1356,8 @@ static DenseAssignmentStats assign_full_points(
     const int support_radius = 2;
     const std::vector<int> labels = build_surfel_labels(patches, surfels.size());
     const bool topology_aware = cfg.pipeline == "topology";
-    const std::vector<std::vector<BoundaryConstraint>> boundary_constraints = topology_aware
+    const bool dense_boundary_guidance = topology_aware && !cfg.finite_boundary_postprocess;
+    const std::vector<std::vector<BoundaryConstraint>> boundary_constraints = dense_boundary_guidance
         ? build_boundary_constraints(patches, surfels, neighborhoods, cfg)
         : std::vector<std::vector<BoundaryConstraint>>(patches.size());
     for (const auto& constraints : boundary_constraints) stats.boundary_constraints += constraints.size();
@@ -1527,7 +1547,7 @@ static DenseAssignmentStats assign_full_points(
         }
 
         const auto crossed_neighbor = [&](const DenseCandidate& candidate) {
-            if (!topology_aware || established_local_owner == candidate.id) return -1;
+            if (!dense_boundary_guidance || established_local_owner == candidate.id) return -1;
             float largest_violation = 0.0f;
             int crossed = -1;
             for (const BoundaryConstraint& constraint :
@@ -2211,6 +2231,344 @@ static std::vector<FinitePlaneIntersection> build_finite_plane_intersections(
     return intersections;
 }
 
+static FiniteBoundaryPostprocessStats correct_points_from_raw_geometry(
+    const CloudPtr& cloud,
+    std::vector<PlanePatch>& patches,
+    const std::vector<Surfel>& surfels,
+    const SurfelNeighborhoods& neighborhoods,
+    const Config& cfg) {
+    FiniteBoundaryPostprocessStats stats;
+    if (patches.size() < 2 || cloud->empty()) return stats;
+
+    // Existing adjacency is used only as a cheap pair proposal.  Every decision
+    // below -- trusted support, crossing/termination, and finite-face cost -- is
+    // rebuilt from the raw coordinates without consulting their current labels.
+    const std::vector<FinitePlaneIntersection> intersections =
+        build_finite_plane_intersections(patches, surfels, neighborhoods, cfg);
+    stats.finite_intersections = intersections.size();
+    if (intersections.empty()) return stats;
+
+    struct GridKey {
+        int u = 0;
+        int v = 0;
+        bool operator==(const GridKey& other) const { return u == other.u && v == other.v; }
+    };
+    struct GridKeyHash {
+        std::size_t operator()(const GridKey& key) const {
+            return static_cast<std::size_t>(key.u) * 73856093u ^
+                static_cast<std::size_t>(key.v) * 19349663u;
+        }
+    };
+    struct RawSupportGrid {
+        Eigen::Vector3f axis_u{1.0f, 0.0f, 0.0f};
+        Eigen::Vector3f axis_v{0.0f, 1.0f, 0.0f};
+        float fit_sigma = 0.0f;
+        float point_sigma = 0.0f;
+        std::unordered_set<GridKey, GridKeyHash> occupied;
+    };
+
+    const float grid_size = 0.5f * cfg.surfel_size;
+    const float envelope_margin = 2.0f * cfg.surfel_size;
+    std::vector<RawSupportGrid> grids(patches.size());
+    for (std::size_t patch_id = 0; patch_id < patches.size(); ++patch_id) {
+        plane_basis(patches[patch_id], grids[patch_id].axis_u, grids[patch_id].axis_v);
+        grids[patch_id].fit_sigma = std::max(
+            patches[patch_id].rms_distance, 1e-4f * cfg.surfel_size);
+        grids[patch_id].point_sigma = std::max(
+            grids[patch_id].fit_sigma, 0.05f * cfg.surfel_size);
+        grids[patch_id].occupied.reserve(
+            std::max<std::size_t>(patches[patch_id].surfels.size() * 4, 16));
+    }
+
+    const auto support_key = [&](std::size_t patch_id, const Eigen::Vector3f& q) {
+        const RawSupportGrid& grid = grids[patch_id];
+        const Eigen::Vector3f centered = q - patches[patch_id].centroid;
+        return GridKey{
+            static_cast<int>(std::floor(centered.dot(grid.axis_u) / grid_size)),
+            static_cast<int>(std::floor(centered.dot(grid.axis_v) / grid_size))
+        };
+    };
+    const auto inside_envelope_fast = [&](std::size_t patch_id, const Eigen::Vector3f& q) {
+        const PlanePatch& patch = patches[patch_id];
+        const RawSupportGrid& grid = grids[patch_id];
+        const Eigen::Vector3f centered = q - patch.centroid;
+        const float u = centered.dot(grid.axis_u);
+        const float v = centered.dot(grid.axis_v);
+        return u >= patch.min_u - envelope_margin && u <= patch.max_u + envelope_margin &&
+            v >= patch.min_v - envelope_margin && v <= patch.max_v + envelope_margin;
+    };
+
+    // A raw point contributes to a support region only when exactly one plane
+    // explains it within model uncertainty.  Points near an intersection remain
+    // deliberately unlabelled, creating an uncertainty band rather than a fake
+    // boundary observation.
+    for (const PointT& point : cloud->points) {
+        const Eigen::Vector3f q(point.x, point.y, point.z);
+        std::size_t best = patches.size();
+        float best_z = std::numeric_limits<float>::infinity();
+        float second_z = std::numeric_limits<float>::infinity();
+        for (std::size_t patch_id = 0; patch_id < patches.size(); ++patch_id) {
+            if (!inside_envelope_fast(patch_id, q)) continue;
+            const float residual = std::abs(patches[patch_id].normal.dot(q) + patches[patch_id].d);
+            const float z = residual / grids[patch_id].point_sigma;
+            if (z < best_z) {
+                second_z = best_z;
+                best_z = z;
+                best = patch_id;
+            } else if (z < second_z) {
+                second_z = z;
+            }
+        }
+        if (best == patches.size() || best_z > 3.0f ||
+            second_z < 3.0f || second_z < best_z + 1.5f) {
+            continue;
+        }
+        grids[best].occupied.insert(support_key(best, q));
+        ++stats.trusted_geometry_points;
+    }
+    for (const RawSupportGrid& grid : grids) stats.support_cells += grid.occupied.size();
+
+    const auto cell_center = [&](std::size_t patch_id, const GridKey& key) {
+        return patches[patch_id].centroid +
+            (static_cast<float>(key.u) + 0.5f) * grid_size * grids[patch_id].axis_u +
+            (static_cast<float>(key.v) + 0.5f) * grid_size * grids[patch_id].axis_v;
+    };
+    struct RawBoundarySegment {
+        int owner = -1;
+        int other = -1;
+        const FinitePlaneIntersection* edge = nullptr;
+        float min_t = 0.0f;
+        float max_t = 0.0f;
+        float expected_sign = 1.0f;
+        float side_tolerance = 0.0f;
+    };
+    std::vector<std::vector<RawBoundarySegment>> constraints(patches.size());
+    // Evidence for a finite intersection must actually approach the line.
+    // A broad surfel-neighborhood band bridges separate terraces and creates
+    // a mathematically valid but physically unobserved infinite-plane crossing.
+    // Two occupancy cells retain tolerance for sampling gaps without spanning
+    // a distinct nearby surface.
+    const float local_band = 2.0f * grid_size;
+    const float endpoint_margin = 4.0f * cfg.surfel_size;
+
+    for (const FinitePlaneIntersection& edge : intersections) {
+        const auto side_bins = [&](int plane_id, int other_id) {
+            std::unordered_map<int, std::uint8_t> bins;
+            const PlanePatch& plane = patches[static_cast<std::size_t>(plane_id)];
+            const PlanePatch& other = patches[static_cast<std::size_t>(other_id)];
+            const float sine = plane.normal.cross(other.normal).norm();
+            if (sine <= 1e-4f) return bins;
+            const float ambiguity_band = std::max(
+                3.0f * std::hypot(
+                    grids[static_cast<std::size_t>(plane_id)].point_sigma,
+                    grids[static_cast<std::size_t>(other_id)].point_sigma) / sine,
+                grid_size);
+            for (const GridKey& key : grids[static_cast<std::size_t>(plane_id)].occupied) {
+                const Eigen::Vector3f q = cell_center(static_cast<std::size_t>(plane_id), key);
+                const float t = edge.direction.dot(q - edge.origin);
+                if (t < edge.min_t - endpoint_margin || t > edge.max_t + endpoint_margin) continue;
+                const float side = (other.normal.dot(q) + other.d) / sine;
+                if (std::abs(side) > local_band || std::abs(side) <= ambiguity_band) continue;
+                bins[static_cast<int>(std::floor(t / grid_size))] |= side > 0.0f ? 1 : 2;
+            }
+            return bins;
+        };
+
+        const std::unordered_map<int, std::uint8_t> bins_a =
+            side_bins(edge.plane_a, edge.plane_b);
+        const std::unordered_map<int, std::uint8_t> bins_b =
+            side_bins(edge.plane_b, edge.plane_a);
+        const int minimum_bin = static_cast<int>(std::floor((edge.min_t - endpoint_margin) / grid_size));
+        const int maximum_bin = static_cast<int>(std::floor((edge.max_t + endpoint_margin) / grid_size));
+
+        const auto add_segments = [&](int owner, int other,
+                const std::unordered_map<int, std::uint8_t>& owner_bins,
+                const std::unordered_map<int, std::uint8_t>& other_bins) {
+            const float sine = patches[static_cast<std::size_t>(owner)].normal.cross(
+                patches[static_cast<std::size_t>(other)].normal).norm();
+            if (sine <= 1e-4f) return;
+            const float side_tolerance = std::max(
+                3.0f * std::hypot(
+                    grids[static_cast<std::size_t>(owner)].fit_sigma,
+                    grids[static_cast<std::size_t>(other)].fit_sigma) / sine,
+                1e-6f * cfg.surfel_size);
+            int run_begin = 0;
+            int run_end = -1;
+            std::uint8_t run_sign = 0;
+            const auto flush_run = [&]() {
+                if (run_sign == 0 || run_end - run_begin + 1 < 2) return;
+                constraints[static_cast<std::size_t>(owner)].push_back({
+                    owner,
+                    other,
+                    &edge,
+                    static_cast<float>(run_begin) * grid_size,
+                    static_cast<float>(run_end + 1) * grid_size,
+                    run_sign == 1 ? 1.0f : -1.0f,
+                    side_tolerance
+                });
+                ++stats.directed_constraints;
+            };
+            for (int bin = minimum_bin; bin <= maximum_bin; ++bin) {
+                std::uint8_t owner_evidence = 0;
+                std::uint8_t other_evidence = 0;
+                for (int offset = -1; offset <= 1; ++offset) {
+                    const auto owner_value = owner_bins.find(bin + offset);
+                    if (owner_value != owner_bins.end()) owner_evidence |= owner_value->second;
+                    const auto other_value = other_bins.find(bin + offset);
+                    if (other_value != other_bins.end()) other_evidence |= other_value->second;
+                }
+                const std::uint8_t state =
+                    other_evidence != 0 && (owner_evidence == 1 || owner_evidence == 2)
+                    ? owner_evidence : 0;
+                if (state == run_sign && state != 0) {
+                    run_end = bin;
+                    continue;
+                }
+                flush_run();
+                run_sign = state;
+                run_begin = bin;
+                run_end = bin;
+            }
+            flush_run();
+        };
+        add_segments(edge.plane_a, edge.plane_b, bins_a, bins_b);
+        add_segments(edge.plane_b, edge.plane_a, bins_b, bins_a);
+    }
+    if (stats.directed_constraints == 0) return stats;
+
+    const auto support_distance = [&](std::size_t plane_id, const Eigen::Vector3f& q) {
+        const RawSupportGrid& grid = grids[plane_id];
+        const PlanePatch& patch = patches[plane_id];
+        const Eigen::Vector3f centered = q - patch.centroid;
+        const float u = centered.dot(grid.axis_u) / grid_size;
+        const float v = centered.dot(grid.axis_v) / grid_size;
+        const int base_u = static_cast<int>(std::floor(u));
+        const int base_v = static_cast<int>(std::floor(v));
+        float best = std::numeric_limits<float>::infinity();
+        constexpr int maximum_ring = 8;
+        for (int du = -maximum_ring; du <= maximum_ring; ++du) {
+            for (int dv = -maximum_ring; dv <= maximum_ring; ++dv) {
+                if (grid.occupied.find({base_u + du, base_v + dv}) == grid.occupied.end()) continue;
+                const float delta_u = u - (static_cast<float>(base_u + du) + 0.5f);
+                const float delta_v = v - (static_cast<float>(base_v + dv) + 0.5f);
+                best = std::min(best, std::sqrt(delta_u * delta_u + delta_v * delta_v) * grid_size);
+            }
+        }
+        return std::max(0.0f, best - 0.70710678f * grid_size);
+    };
+    const auto finite_energy = [&](std::size_t plane_id, const Eigen::Vector3f& q, float& lateral) {
+        lateral = support_distance(plane_id, q);
+        if (!std::isfinite(lateral)) return std::numeric_limits<float>::infinity();
+        const float residual = std::abs(patches[plane_id].normal.dot(q) + patches[plane_id].d);
+        const float normal_term = residual / grids[plane_id].point_sigma;
+        // Both terms are orthogonal components of the same Euclidean distance
+        // to a finite planar support.  Scaling the lateral term by the much
+        // coarser occupancy cell would systematically favor an infinite plane
+        // just beyond its observed boundary.
+        const float lateral_term = lateral / grids[plane_id].point_sigma;
+        return normal_term * normal_term + lateral_term * lateral_term;
+    };
+    const auto violation = [&](const Eigen::Vector3f& q, const RawBoundarySegment& segment) {
+        const PlanePatch& owner = patches[static_cast<std::size_t>(segment.owner)];
+        const PlanePatch& other = patches[static_cast<std::size_t>(segment.other)];
+        const float residual = owner.normal.dot(q) + owner.d;
+        const Eigen::Vector3f projected = q - residual * owner.normal;
+        const float t = segment.edge->direction.dot(projected - segment.edge->origin);
+        if (t < segment.min_t || t > segment.max_t) return 0.0f;
+        const float sine = owner.normal.cross(other.normal).norm();
+        if (sine <= 1e-4f) return 0.0f;
+        const float side = (other.normal.dot(projected) + other.d) / sine;
+        // A directed half-space is valid only in the local cross-section that
+        // observed this boundary.  Extending it across a concave face or a
+        // face with a hole lets one side of the hole erase the opposite side.
+        if (std::abs(side) > local_band) return 0.0f;
+        return std::max(0.0f, -segment.expected_sign * side - segment.side_tolerance);
+    };
+
+    std::vector<std::vector<PointT>> incoming(patches.size());
+    for (std::size_t owner = 0; owner < patches.size(); ++owner) {
+        if (constraints[owner].empty()) continue;
+        CloudPtr retained(new CloudT);
+        retained->reserve(patches[owner].output->size());
+        for (const PointT& point : patches[owner].output->points) {
+            const Eigen::Vector3f q(point.x, point.y, point.z);
+            float largest_owner_violation = 0.0f;
+            for (const RawBoundarySegment& segment : constraints[owner]) {
+                largest_owner_violation = std::max(
+                    largest_owner_violation, violation(q, segment));
+            }
+            if (largest_owner_violation <= 0.0f) {
+                retained->push_back(point);
+                continue;
+            }
+            ++stats.boundary_candidate_points;
+
+            float owner_lateral = 0.0f;
+            float owner_energy = finite_energy(owner, q, owner_lateral);
+            // Raster cells deliberately cover a finite area and can otherwise
+            // hide sub-cell spill.  An independently observed termination is
+            // a sharper lower bound on distance to the owner's finite support.
+            owner_lateral = std::max(owner_lateral, largest_owner_violation);
+            const float owner_residual = std::abs(
+                patches[owner].normal.dot(q) + patches[owner].d);
+            owner_energy = std::pow(owner_residual / grids[owner].point_sigma, 2.0f) +
+                std::pow(owner_lateral / grids[owner].point_sigma, 2.0f);
+            int destination = static_cast<int>(owner);
+            float best_energy = owner_energy;
+            for (std::size_t target_id = 0; target_id < patches.size(); ++target_id) {
+                if (target_id == owner || !inside_envelope_fast(target_id, q)) continue;
+                const float residual = std::abs(
+                    patches[target_id].normal.dot(q) + patches[target_id].d);
+                if (residual > cfg.assign_distance ||
+                    residual / grids[target_id].point_sigma > 4.0f) {
+                    continue;
+                }
+                float target_lateral = 0.0f;
+                const float target_energy = finite_energy(target_id, q, target_lateral);
+                if (!std::isfinite(target_energy) || target_lateral > 2.0f * grid_size) {
+                    ++stats.rejected_without_local_support;
+                    continue;
+                }
+                ++stats.finite_competitors;
+                if (target_energy >= best_energy) continue;
+                bool target_is_feasible = true;
+                for (const RawBoundarySegment& target_segment : constraints[target_id]) {
+                    if (violation(q, target_segment) > 0.0f) {
+                        target_is_feasible = false;
+                        break;
+                    }
+                }
+                if (!target_is_feasible) continue;
+                destination = static_cast<int>(target_id);
+                best_energy = target_energy;
+            }
+            if (best_energy + 1e-4f >= owner_energy) {
+                if (destination != static_cast<int>(owner)) ++stats.margin_rejected_points;
+                destination = static_cast<int>(owner);
+            }
+            if (destination == static_cast<int>(owner)) {
+                retained->push_back(point);
+            } else {
+                incoming[static_cast<std::size_t>(destination)].push_back(point);
+                stats.corrections.push_back({point, static_cast<int>(owner), destination});
+                ++stats.corrected_points;
+            }
+        }
+        retained->width = static_cast<std::uint32_t>(retained->size());
+        retained->height = 1;
+        retained->is_dense = true;
+        patches[owner].output = retained;
+    }
+    for (std::size_t patch_id = 0; patch_id < patches.size(); ++patch_id) {
+        patches[patch_id].output->insert(
+            patches[patch_id].output->end(), incoming[patch_id].begin(), incoming[patch_id].end());
+        patches[patch_id].output->width = static_cast<std::uint32_t>(patches[patch_id].output->size());
+        patches[patch_id].output->height = 1;
+        patches[patch_id].output->is_dense = true;
+    }
+    return stats;
+}
+
 static CornerExtractionResult extract_corners_from_adjacency(
     const CloudPtr& cloud,
     const std::vector<PlanePatch>& patches,
@@ -2843,6 +3201,13 @@ int main(int argc, char** argv) {
         now = Clock::now();
         timings.finalize_ms = elapsed_ms(stage_start, now);
         stage_start = now;
+        const FiniteBoundaryPostprocessStats boundary_postprocess = cfg.finite_boundary_postprocess
+            ? correct_points_from_raw_geometry(
+                cloud, patches, surfels, neighborhoods, cfg)
+            : FiniteBoundaryPostprocessStats{};
+        now = Clock::now();
+        timings.boundary_postprocess_ms = elapsed_ms(stage_start, now);
+        stage_start = now;
         const std::vector<AssignmentAuditRow> assignment_audit = cfg.audit_assignments
             ? audit_dense_assignments(patches, surfels, index_by_key, bounds, cfg)
             : std::vector<AssignmentAuditRow>{};
@@ -2881,6 +3246,12 @@ int main(int argc, char** argv) {
                 out_dir / "topology_corrections.ply",
                 out_dir / "topology_corrections.csv",
                 dense_assignment.corrections);
+        }
+        if (cfg.finite_boundary_postprocess) {
+            save_topology_corrections(
+                out_dir / "finite_boundary_corrections.ply",
+                out_dir / "finite_boundary_corrections.csv",
+                boundary_postprocess.corrections);
         }
         if (cfg.audit_assignments) {
             save_assignment_audit(out_dir / "assignment_audit.csv", assignment_audit);
@@ -2941,6 +3312,16 @@ int main(int argc, char** argv) {
             std::cout << "Safely absorbed small patches/points: "
                       << finalize_stats.absorbed_patches << '/' << finalize_stats.absorbed_points << "\n";
             std::cout << "Discarded sparse patch points: " << finalize_stats.discarded_sparse_points << "\n";
+            std::cout << "Finite-boundary postprocess intersections/segments/trusted/cells/candidates/competitors/corrections/rejected: "
+                      << boundary_postprocess.finite_intersections << '/'
+                      << boundary_postprocess.directed_constraints << '/'
+                      << boundary_postprocess.trusted_geometry_points << '/'
+                      << boundary_postprocess.support_cells << '/'
+                      << boundary_postprocess.boundary_candidate_points << '/'
+                      << boundary_postprocess.finite_competitors << '/'
+                      << boundary_postprocess.corrected_points << '/'
+                      << (boundary_postprocess.rejected_without_local_support +
+                          boundary_postprocess.margin_rejected_points) << "\n";
             std::cout << "Assignment margin: " << cfg.assign_margin << "\n";
             std::cout << "Plane patches: " << patches.size() << "\n";
             std::cout << "Output points: " << output_points << "\n";
@@ -2959,9 +3340,10 @@ int main(int argc, char** argv) {
                       << timings.global_relations_ms << '/' << timings.initial_merge_ms << '/'
                       << timings.competition_ms << '/' << timings.final_merge_ms << '/'
                       << timings.relation_refinement_ms << "\n";
-            std::cout << "Timing margin/dense/finalize/audit/corners/save (ms): "
+            std::cout << "Timing margin/dense/finalize/boundary/audit/corners/save (ms): "
                       << timings.assign_margin_ms << '/' << timings.dense_assignment_ms << '/'
-                      << timings.finalize_ms << '/' << timings.audit_ms << '/' << timings.corners_ms << '/'
+                      << timings.finalize_ms << '/' << timings.boundary_postprocess_ms << '/'
+                      << timings.audit_ms << '/' << timings.corners_ms << '/'
                       << timings.save_ms << "\n";
             std::cout << "Timing total (ms): " << timings.total_ms << "\n";
             std::cout << "Saved to " << fs::absolute(out_dir).string() << "\n";

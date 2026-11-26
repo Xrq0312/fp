@@ -48,6 +48,7 @@ not a reconstruction from Git history.
 | `--parallel-relations soft|hard` | complete-link parallel relation discovery and centroid-preserving normal refinement; explicit prior only | GlobFit |
 | `--corner-mode adjacency` | observed finite intersections, graph-local triples, SVD conditioning, and two-branch support | SED-Net, GCCao validation pattern |
 | `--edge-residual-proposals` | unexplained persistent-boundary proposals, model-birth benefit, and local occupied support | CPFN, Progressive-X, SED-Net |
+| `--finite-boundary-postprocess` | raw-cloud multi-plane support, segmented pairwise intersections, and synchronous finite-plane competition | finite-support geometry, PEARL-style multi-label competition |
 
 The neural components of CPFN and SED-Net are not copied: no training data or
 GPU runtime is introduced. Their transferable principles are used instead:
@@ -74,6 +75,39 @@ plane proposals; this project does not currently detect cylinders.
   joint labeling. `--binary-plane-output` preserves the colored result exactly
   while avoiding tens of seconds of ASCII formatting; ASCII remains the
   compatibility default.
+
+## Raw-geometry finite-boundary postprocess
+
+The optional final postprocess deliberately does not use the current dense
+labels as boundary evidence. It has three stages:
+
+1. Every raw point competes against the geometrically plausible final planes.
+   A point enters a plane's 2-D occupied support grid only when its best
+   normalized residual is below 3, the runner-up is above 3, and their gap is
+   at least 1.5. Ambiguous intersection points remain unlabelled.
+2. Existing surfel adjacency is used only to propose plane pairs and a finite
+   line interval. Raw occupied cells then independently verify, per line bin,
+   whether a face terminates or crosses the line. Directed constraints are
+   segmented along the line and are valid only inside a local cross-section;
+   this is required for concave faces and faces with holes.
+3. Every point beyond a verified local boundary competes synchronously against
+   all geometrically plausible finite supports. The energy uses the same
+   physical scale for the orthogonal plane residual and in-plane distance to
+   occupied support. All accepted moves are buffered and applied together, so
+   results do not depend on pair traversal order.
+
+Fitted-plane uncertainty and raw-point observation noise are separate. The
+former controls intersection location; the latter controls point-to-plane
+competition. Missing support never proves a boundary: both faces must provide
+near-line raw evidence before a directed segment is created. The current pair
+proposal still comes from the surfel adjacency graph, but no existing point
+label is used to decide trusted support, termination side, target score, or a
+label update.
+
+The option replaces the older topology half-space correction during dense
+assignment, while retaining the established local-normal safeguard. This makes
+the ablation a true final-stage correction rather than applying the same rule
+twice. It remains opt-in pending broader scan ground truth.
 
 ## Evaluation protocol
 

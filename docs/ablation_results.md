@@ -350,3 +350,55 @@ explicit domain-prior option only: `none` remains the general default; `hard`
 is recommended only when manufacturing semantics independently guarantee the
 clustered faces are parallel. This failure also rules out automatic hard
 orthogonal snapping without stronger semantic or repeated-structure evidence.
+
+## Stage 6: label-independent finite-boundary correction
+
+`--finite-boundary-postprocess` implements the final-stage architecture
+"multi-plane support, pairwise boundary analysis, multi-finite-plane joint
+correction." Trusted support cells are rebuilt from raw coordinates by a
+best/second-best plane competition and do not use dense labels. Pairwise
+intersections are verified and segmented with those cells. Boundary candidates
+then compete against every locally plausible finite plane and are updated
+synchronously.
+
+Two failed variants explain the safeguards in the retained implementation:
+
+- A dense-label/fine-normal boundary vote moved 2,270 `top_left_cut2` points
+  from plane 3 to plane 5. STEP correspondence showed 2,251 belonged to the
+  source plane, confirming the circular-label failure. This implementation was
+  removed rather than hidden behind another threshold.
+- Applying an observed side as a global half-space corrected 84 points on the
+  crossing fixture but incorrectly moved 180 points on the perfect stepped box
+  (macro IoU 1.0000 to 0.9915). The top face contains an opening: a constraint
+  from one side of the hole cannot clip the opposite side. Restricting each
+  segmented constraint to its observed local cross-section restores all 180
+  points and preserves the crossing improvement.
+
+The finite-distance energy uses
+`plane_residual^2 + in_plane_support_distance^2` in a common observation-noise
+scale. The fitted-plane RMS is kept separately for intersection uncertainty;
+using that very small RMS as point noise rejected all 233 noisy crossing
+candidates even though their boundary was correctly found.
+
+| Dataset | Baseline macro IoU | Enabled macro IoU | Candidates / corrections | Added boundary time | Result |
+| --- | ---: | ---: | ---: | ---: | --- |
+| crossing_planes | 0.96918 | 0.97499 | 233 / 84 | 4.8 ms | improved noisy edge bands |
+| stepped_box | 1.00000 | 1.00000 | 0 / 0 | 46.9 ms | exact regression preserved |
+| top_left_cut2 / data2.STEP | 0.97118 | 0.97120 | 223 / 88 | 2.13 s | 55/55 faces, F1 1.0 |
+| top_down2 / data1.STEP | 0.99301 | 0.99301 | 3 / 0 | 2.05 s | 20/20 faces, F1 1.0 |
+
+Both remaining scan files were also run, rather than testing only the clean CAD
+samples. `top_left_cut` produced 2,760 local candidates and 847 synchronous
+corrections in 2.73 s over 12.64 million points; `top_down` produced 404
+candidates and 86 corrections in 1.00 s over 5.70 million points. Those scans
+are not aligned with the supplied STEP coordinate frames, so the counts are
+reported only as regression diagnostics and not as accuracy claims.
+
+On `top_left_cut2`, the older in-assignment topology rule made 293 changes. The
+new final-stage option disables that rule and makes 88 independently supported
+changes; the former 2,270-point 3-to-5 failure is absent. On `top_down2`, three
+points crossed a proposed boundary but no finite target achieved lower energy,
+so all labels were retained. This conservative no-change behavior is intentional
+for occlusion and missing-data cases. The method remains independently enabled
+for ablation rather than becoming the default pipeline until aligned boundary
+ground truth is available for the two real scans.
