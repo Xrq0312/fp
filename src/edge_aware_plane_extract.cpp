@@ -21,6 +21,9 @@
 
 #include <Eigen/Dense>
 
+#include <CGAL/Exact_predicates_inexact_constructions_kernel.h>
+#include <CGAL/vcm_estimate_normals.h>
+
 #include <pcl/common/common.h>
 #include <pcl/conversions.h>
 #include <pcl/features/normal_3d.h>
@@ -35,6 +38,8 @@ namespace fs = std::filesystem;
 using PointT = pcl::PointXYZ;
 using CloudT = pcl::PointCloud<PointT>;
 using CloudPtr = CloudT::Ptr;
+
+using CgalKernel = CGAL::Exact_predicates_inexact_constructions_kernel;
 
 struct Config {
     fs::path input;
@@ -72,6 +77,7 @@ struct Config {
     std::string parallel_relations = "none";
     bool finite_boundary_postprocess = false;
     bool finite_support_region_optimization = false;
+    std::string region_normal_estimator = "pca";
 };
 
 struct Bounds {
@@ -264,6 +270,13 @@ struct FiniteSupportRegionDecision {
     float to_residual = 0.0f;
     float from_normal_dot = 0.0f;
     float to_normal_dot = 0.0f;
+    float node_retain_energy = 0.0f;
+    float node_target_energy = 0.0f;
+    bool candidate_from_missing_support = false;
+    bool candidate_from_normal_conflict = false;
+    bool owner_observation_ambiguous = false;
+    bool accepted_by_residual = false;
+    bool accepted_by_normal = false;
 };
 
 struct FiniteSupportRegionStats {
@@ -318,6 +331,7 @@ static Config parse_args(int argc, char** argv) {
             << "  --parallel-relations none|soft|hard  optional global parallel-normal refinement\n"
             << "  --finite-boundary-postprocess  correct dense points beyond observed finite intersections\n"
             << "  --finite-support-region-optimization  optimize connected finite-support competition regions\n"
+            << "  --region-normal-estimator pca|pca-vcm-consensus  finite-region normal evidence mode\n"
             << "  --audit-assignments  write per-plane dense-assignment diagnostics\n"
             << "  --distance-only  diagnostic A/B: disable normal-guided dense assignment\n"
             << "  --probe X Y Z  print plane-assignment diagnostics at a point\n"
@@ -377,6 +391,14 @@ static Config parse_args(int argc, char** argv) {
             cfg.finite_boundary_postprocess = true;
         } else if (arg == "--finite-support-region-optimization") {
             cfg.finite_support_region_optimization = true;
+        } else if (arg == "--region-normal-estimator") {
+            if (i + 1 >= args.size()) throw std::runtime_error("--region-normal-estimator requires a value");
+            cfg.region_normal_estimator = args[++i];
+            if (cfg.region_normal_estimator != "pca" &&
+                cfg.region_normal_estimator != "pca-vcm-consensus") {
+                throw std::runtime_error(
+                    "--region-normal-estimator must be pca or pca-vcm-consensus");
+            }
         } else if (arg == "--distance-only") {
             cfg.distance_only = true;
         } else if (arg == "--probe") {
@@ -401,6 +423,10 @@ static Config parse_args(int argc, char** argv) {
         throw std::runtime_error(
             "--finite-boundary-postprocess and --finite-support-region-optimization "
             "are independent ablations and cannot be enabled together.");
+    }
+    if (!cfg.finite_support_region_optimization && cfg.region_normal_estimator != "pca") {
+        throw std::runtime_error(
+            "The VCM consensus mode requires --finite-support-region-optimization.");
     }
     if (cfg.pipeline != "baseline") {
         // Fine residual faces are real deliverables, not sparse leftovers.  The
@@ -1445,8 +1471,12 @@ static DenseAssignmentStats assign_full_points(
     const int support_radius = 2;
     const std::vector<int> labels = build_surfel_labels(patches, surfels.size());
     const bool topology_aware = cfg.pipeline == "topology";
-    const bool dense_boundary_guidance = topology_aware && !cfg.finite_boundary_postprocess &&
-        !cfg.finite_support_region_optimization;
+    // Region optimization is a true final-stage postprocess: it must start
+    // from the same dense assignment as the topology baseline.  Disabling the
+    // embedded guidance here silently changed the ablation input (notably on
+    // crossing_planes) even when the region optimizer made zero corrections.
+    // The older finite-boundary pass remains a replacement ablation.
+    const bool dense_boundary_guidance = topology_aware && !cfg.finite_boundary_postprocess;
     const std::vector<std::vector<BoundaryConstraint>> boundary_constraints = dense_boundary_guidance
         ? build_boundary_constraints(patches, surfels, neighborhoods, cfg)
         : std::vector<std::vector<BoundaryConstraint>>(patches.size());
@@ -2838,6 +2868,11 @@ static FiniteSupportRegionStats optimize_finite_support_regions(
         float owner_support = std::numeric_limits<float>::infinity();
         float normal_confidence = 0.0f;
         Eigen::Vector3f normal{0.0f, 0.0f, 0.0f};
+        float validation_normal_confidence = 0.0f;
+        Eigen::Vector3f validation_normal{0.0f, 0.0f, 0.0f};
+        bool candidate_from_missing_support = false;
+        bool candidate_from_normal_conflict = false;
+        bool owner_observation_ambiguous = false;
     };
     struct FineKey {
         int x = 0;
@@ -2913,6 +2948,40 @@ static FiniteSupportRegionStats optimize_finite_support_regions(
     };
     std::unordered_map<FineNormalKey, FineNormalAccumulator, FineNormalKeyHash>
         fine_normal_accumulators;
+    std::unordered_map<CellKey, FineNormalEstimate, CellKeyHash> vcm_normal_by_surfel;
+    if (cfg.region_normal_estimator == "pca-vcm-consensus") {
+        std::vector<CgalKernel::Point_3> points;
+        points.reserve(surfels.size());
+        for (const Surfel& surfel : surfels) {
+            points.emplace_back(
+                static_cast<double>(surfel.centroid.x()),
+                static_cast<double>(surfel.centroid.y()),
+                static_cast<double>(surfel.centroid.z()));
+        }
+        std::vector<std::array<double, 6>> covariance;
+        CGAL::compute_vcm(
+            points, covariance,
+            2.0 * static_cast<double>(cfg.surfel_size),
+            static_cast<double>(cfg.surfel_size));
+        vcm_normal_by_surfel.reserve(surfels.size());
+        for (std::size_t i = 0; i < surfels.size() && i < covariance.size(); ++i) {
+            const std::array<double, 6>& value = covariance[i];
+            Eigen::Matrix3d matrix;
+            matrix << value[0], value[1], value[2],
+                value[1], value[3], value[4],
+                value[2], value[4], value[5];
+            Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> solver(matrix);
+            FineNormalEstimate estimate;
+            if (solver.info() == Eigen::Success) {
+                const Eigen::Vector3d eigenvalues = solver.eigenvalues().cwiseMax(0.0);
+                const double largest = std::max(eigenvalues[2], 1e-12);
+                estimate.normal = solver.eigenvectors().col(2).cast<float>().normalized();
+                estimate.confidence = static_cast<float>(std::clamp(
+                    (eigenvalues[2] - eigenvalues[1]) / largest, 0.0, 1.0));
+            }
+            vcm_normal_by_surfel.emplace(surfels[i].key, estimate);
+        }
+    }
     fine_normal_accumulators.reserve(std::max<std::size_t>(surfels.size() * 4, 16));
     for (const PointT& point : cloud->points) {
         FineNormalAccumulator& accumulator = fine_normal_accumulators[fine_normal_key(point)];
@@ -2990,6 +3059,23 @@ static FiniteSupportRegionStats optimize_finite_support_regions(
         normal = estimate.normal;
         confidence = estimate.confidence;
     };
+    const auto validation_normal = [&](
+            const PointT& point, Eigen::Vector3f& normal, float& confidence) {
+        if (cfg.region_normal_estimator != "pca-vcm-consensus") {
+            normal.setZero();
+            confidence = 0.0f;
+            return;
+        }
+        const auto found = vcm_normal_by_surfel.find(
+            point_key(point, bounds, cfg.surfel_size));
+        if (found == vcm_normal_by_surfel.end()) {
+            normal.setZero();
+            confidence = 0.0f;
+            return;
+        }
+        normal = found->second.normal;
+        confidence = found->second.confidence;
+    };
     const auto finite_energy = [&](std::size_t plane_id, const Eigen::Vector3f& q,
             const Eigen::Vector3f& normal, float normal_confidence, float& lateral) {
         lateral = support_distance(plane_id, q);
@@ -3029,6 +3115,9 @@ static FiniteSupportRegionStats optimize_finite_support_regions(
             Eigen::Vector3f local_normal;
             float normal_confidence = 0.0f;
             point_normal(point, local_normal, normal_confidence);
+            Eigen::Vector3f local_validation_normal;
+            float validation_normal_confidence = 0.0f;
+            validation_normal(point, local_validation_normal, validation_normal_confidence);
             if (normal_confidence <= 0.10f) ++stats.mixed_surfel_points;
             float unused_lateral = 0.0f;
             const float owner_energy = finite_energy(
@@ -3037,6 +3126,8 @@ static FiniteSupportRegionStats optimize_finite_support_regions(
                 ? std::abs(local_normal.dot(patches[owner].normal)) : 1.0f;
             int best_alternative = -1;
             float best_alternative_energy = std::numeric_limits<float>::infinity();
+            bool best_support_inconsistent = false;
+            bool best_normal_inconsistent = false;
             for (std::size_t target = 0; target < patches.size(); ++target) {
                 if (target == owner || !inside_envelope(target, q)) continue;
                 const float residual = std::abs(patches[target].normal.dot(q) + patches[target].d);
@@ -3057,8 +3148,18 @@ static FiniteSupportRegionStats optimize_finite_support_regions(
                 // finite plane does not own this point.
                 const bool support_inconsistent = owner_support >= grid_size &&
                     !owner_is_ambiguous;
-                const bool geometry_inconsistent = normal_confidence >= 0.20f &&
+                bool geometry_inconsistent = normal_confidence >= 0.20f &&
                     owner_normal_dot < edge_cos && target_normal_dot >= smooth_cos;
+                if (geometry_inconsistent &&
+                    cfg.region_normal_estimator == "pca-vcm-consensus") {
+                    const float validation_owner_dot = validation_normal_confidence > 0.0f
+                        ? std::abs(local_validation_normal.dot(patches[owner].normal)) : 1.0f;
+                    const float validation_target_dot = validation_normal_confidence > 0.0f
+                        ? std::abs(local_validation_normal.dot(patches[target].normal)) : 0.0f;
+                    geometry_inconsistent = validation_normal_confidence >= 0.20f &&
+                        validation_owner_dot < edge_cos &&
+                        validation_target_dot >= smooth_cos;
+                }
                 if (!support_inconsistent && !geometry_inconsistent) {
                     continue;
                 }
@@ -3073,6 +3174,8 @@ static FiniteSupportRegionStats optimize_finite_support_regions(
                 if (target_energy < best_alternative_energy) {
                     best_alternative = static_cast<int>(target);
                     best_alternative_energy = target_energy;
+                    best_support_inconsistent = support_inconsistent;
+                    best_normal_inconsistent = geometry_inconsistent;
                 }
             }
             if (best_alternative < 0) continue;
@@ -3107,6 +3210,11 @@ static FiniteSupportRegionStats optimize_finite_support_regions(
             evidence.owner_support = owner_support;
             evidence.normal_confidence = normal_confidence;
             evidence.normal = local_normal;
+            evidence.validation_normal_confidence = validation_normal_confidence;
+            evidence.validation_normal = local_validation_normal;
+            evidence.candidate_from_missing_support = best_support_inconsistent;
+            evidence.candidate_from_normal_conflict = best_normal_inconsistent;
+            evidence.owner_observation_ambiguous = owner_is_ambiguous;
             node.points.push_back(std::move(evidence));
             if (normal_confidence > 0.0f) {
                 node.normal += normal_confidence * canonical_normal(local_normal);
@@ -3380,8 +3488,20 @@ static FiniteSupportRegionStats optimize_finite_support_regions(
                         patches[static_cast<std::size_t>(destination)].normal)) : 1.0f;
                 const bool residual_decisive =
                     target_residual + residual_uncertainty < owner_residual;
-                const bool normal_decisive = evidence.normal_confidence >= 0.20f &&
+                bool normal_decisive = evidence.normal_confidence >= 0.20f &&
                     target_normal_dot >= smooth_cos && owner_normal_dot < edge_cos;
+                if (normal_decisive &&
+                    cfg.region_normal_estimator == "pca-vcm-consensus") {
+                    const float validation_owner_dot = evidence.validation_normal_confidence > 0.0f
+                        ? std::abs(evidence.validation_normal.dot(
+                            patches[static_cast<std::size_t>(evidence.owner)].normal)) : 1.0f;
+                    const float validation_target_dot = evidence.validation_normal_confidence > 0.0f
+                        ? std::abs(evidence.validation_normal.dot(
+                            patches[static_cast<std::size_t>(destination)].normal)) : 0.0f;
+                    normal_decisive = evidence.validation_normal_confidence >= 0.20f &&
+                        validation_target_dot >= smooth_cos &&
+                        validation_owner_dot < edge_cos;
+                }
                 if (!residual_decisive && !normal_decisive) {
                     ++stats.local_geometry_rejections;
                     continue;
@@ -3400,7 +3520,14 @@ static FiniteSupportRegionStats optimize_finite_support_regions(
                         owner_residual,
                         target_residual,
                         owner_normal_dot,
-                        target_normal_dot
+                        target_normal_dot,
+                        node.unary[static_cast<std::size_t>(from_index)],
+                        node.unary[static_cast<std::size_t>(to_index)],
+                        evidence.candidate_from_missing_support,
+                        evidence.candidate_from_normal_conflict,
+                        evidence.owner_observation_ambiguous,
+                        residual_decisive,
+                        normal_decisive
                     }, evidence.point_index});
             }
         }
@@ -3691,7 +3818,10 @@ static void save_finite_support_region_decisions(
     if (!csv) throw std::runtime_error("Failed to write finite-support decisions: " + csv_path.string());
     csv << "x,y,z,from_plane,to_plane,component,from_energy,to_energy,"
            "from_support_distance,to_support_distance,normal_confidence,"
-           "from_residual,to_residual,from_normal_dot,to_normal_dot\n";
+           "from_residual,to_residual,from_normal_dot,to_normal_dot,"
+           "node_retain_energy,node_target_energy,candidate_from_missing_support,"
+           "candidate_from_normal_conflict,owner_observation_ambiguous,"
+           "accepted_by_residual,accepted_by_normal\n";
     csv << std::setprecision(9);
     for (const FiniteSupportRegionDecision& decision : decisions) {
         csv << decision.point.x << ',' << decision.point.y << ',' << decision.point.z << ','
@@ -3700,7 +3830,13 @@ static void save_finite_support_region_decisions(
             << decision.from_support_distance << ',' << decision.to_support_distance << ','
             << decision.normal_confidence << ','
             << decision.from_residual << ',' << decision.to_residual << ','
-            << decision.from_normal_dot << ',' << decision.to_normal_dot << '\n';
+            << decision.from_normal_dot << ',' << decision.to_normal_dot << ','
+            << decision.node_retain_energy << ',' << decision.node_target_energy << ','
+            << static_cast<int>(decision.candidate_from_missing_support) << ','
+            << static_cast<int>(decision.candidate_from_normal_conflict) << ','
+            << static_cast<int>(decision.owner_observation_ambiguous) << ','
+            << static_cast<int>(decision.accepted_by_residual) << ','
+            << static_cast<int>(decision.accepted_by_normal) << '\n';
     }
 }
 
@@ -4298,6 +4434,8 @@ int main(int argc, char** argv) {
                       << support_regions.local_geometry_rejections << '/'
                       << support_regions.support_preservation_rejections << '/'
                       << support_regions.corrected_points << "\n";
+            std::cout << "Finite-support region normal mode: "
+                      << cfg.region_normal_estimator << "\n";
             std::cout << "Assignment margin: " << cfg.assign_margin << "\n";
             std::cout << "Plane patches: " << patches.size() << "\n";
             std::cout << "Output points: " << output_points << "\n";

@@ -119,7 +119,9 @@ assignment and before sparse-patch finalization. It is mutually exclusive with
 `--finite-boundary-postprocess`, so each method remains independently
 ablatable.
 
-The stage is deliberately label-independent when constructing evidence:
+The stage is deliberately label-independent when constructing evidence. It is
+an additive final postprocess over the ordinary topology dense assignment; the
+postprocess switch no longer changes its own baseline input:
 
 1. Raw points compete against every locally plausible plane by normalized
    residual. Only a unique winner creates an occupied 2-D support cell.
@@ -138,6 +140,14 @@ The stage is deliberately label-independent when constructing evidence:
    least the joint fitted-noise uncertainty or a confident local PCA normal
    supports the target and rejects the owner. Insufficient evidence retains the
    original label. All accepted destinations are then applied synchronously.
+
+An optional `--region-normal-estimator pca-vcm-consensus` mode computes CGAL
+VCM normals on the extraction surfel centroids and accepts a normal-only
+candidate only when both the fine raw-point PCA estimate and VCM satisfy the
+existing smooth-target/sharp-owner tests. Its VCM offset and convolution radii
+are derived from `surfel_size`; no dataset-specific threshold is added. The
+mode is intended as a conservative evidence cross-check, not a replacement for
+fine-scale PCA.
 
 Sub-threshold plane candidates stay available as destinations, allowing raw
 support to rescue a small real face. Their outgoing points remain under the
@@ -182,3 +192,22 @@ Acceptance priorities are: (1) no regression in synthetic plane/corner recall,
 (2) reduced false merge and fragmentation, (3) higher real-data coverage, and
 (4) bounded CPU cost. A stage is not enabled by default until it passes its
 ablation against all available datasets.
+
+## Current operator decision
+
+The controlled CGAL comparison found that `Alpha_shape_2` and
+`alpha_expansion_graphcut` produced byte-identical labels to the occupied grid
+and monotone ICM respectively, while standalone VCM caused substantially more
+harmful relabels. Those experimental paths are documented but are not retained
+in production code. PCA+VCM consensus is retained because it reduced the
+STEP-audited harmful moves from 34 to 1 while preserving 55/55
+`top_left_cut2`, 20/20 `top_down2`, corner F1 1.0, stepped_box IoU 1.0,
+near_parallel_planes IoU 1.0, and the best crossing_planes IoU 0.985402.
+
+The recommended general pipeline is `topology` plus
+`--edge-residual-proposals`. Region optimization remains off by default. When
+the application values false-relabel protection over maximum correction
+recall, enable `--finite-support-region-optimization` with
+`--region-normal-estimator pca-vcm-consensus`. The ordinary PCA mode remains
+available for research because it yields slightly higher aggregate IoU but has
+lower pointwise correction precision.

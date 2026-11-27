@@ -10,6 +10,8 @@ param(
     [string]$ParallelRelations = "none",
     [switch]$FiniteBoundaryPostprocess,
     [switch]$FiniteSupportRegionOptimization,
+    [ValidateSet("pca", "pca-vcm-consensus")]
+    [string]$RegionNormalEstimator = "pca",
     [switch]$IncludeLargeDatasets,
     [switch]$SkipBuild
 )
@@ -81,6 +83,7 @@ foreach ($variant in $Variants) {
         }
         if ($FiniteSupportRegionOptimization) {
             $arguments += "--finite-support-region-optimization"
+            $arguments += @("--region-normal-estimator", $RegionNormalEstimator)
         }
         $watch = [Diagnostics.Stopwatch]::StartNew()
         $output = & .\build\Release\edge_aware_plane_extract.exe @arguments 2>&1

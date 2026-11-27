@@ -6,6 +6,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 find_package(PCL CONFIG REQUIRED COMPONENTS common io filters kdtree features segmentation)
+find_package(CGAL CONFIG REQUIRED)
 find_package(OpenMP)
 
 add_executable(pointcloud_corner_compare
@@ -46,6 +47,7 @@ target_link_libraries(pointcloud_corner_compare
 target_link_libraries(edge_aware_plane_extract
     PRIVATE
         ${PCL_LIBRARIES}
+        CGAL::CGAL
 )
 
 if(OpenMP_CXX_FOUND)

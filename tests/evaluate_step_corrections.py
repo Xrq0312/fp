@@ -101,6 +101,7 @@ def main() -> None:
     parser.add_argument("--target-result", type=Path)
     parser.add_argument("--json", type=Path)
     parser.add_argument("--ply", type=Path)
+    parser.add_argument("--csv", type=Path)
     args = parser.parse_args()
 
     with args.corrections_csv.open("r", encoding="utf-8", newline="") as handle:
@@ -138,6 +139,7 @@ def main() -> None:
     threshold_sweep: dict[str, Counter[str]] = defaultdict(Counter)
     id_mismatches: Counter[str] = Counter()
     categories: list[str] = []
+    audited_rows: list[dict[str, object]] = []
     for row_id, (row, truth_face) in enumerate(zip(rows, truth)):
         csv_source = int(row["from_plane"])
         csv_target = int(row["to_plane"])
@@ -162,6 +164,15 @@ def main() -> None:
         else:
             category = "unchanged"
         categories.append(category)
+        audited_rows.append({
+            **row,
+            "truth_face": int(truth_face),
+            "source_final_plane": source,
+            "target_final_plane": target,
+            "source_truth_face": source_truth,
+            "target_truth_face": target_truth,
+            "audit_category": category,
+        })
         counts[category] += 1
         pair_counts[f"{csv_source}->{csv_target}"][category] += 1
         for field in (
@@ -233,6 +244,13 @@ def main() -> None:
     if args.ply:
         args.ply.parent.mkdir(parents=True, exist_ok=True)
         write_audit_ply(args.ply, points, categories)
+    if args.csv:
+        args.csv.parent.mkdir(parents=True, exist_ok=True)
+        fieldnames = list(audited_rows[0].keys()) if audited_rows else ["audit_category"]
+        with args.csv.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(audited_rows)
     print(payload, end="")
 
 

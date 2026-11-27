@@ -457,9 +457,131 @@ not ground-truth accuracy. Binary PLY support was added to the projection
 renderer so the baseline, corrected labels, and red correction overlay can be
 inspected without producing a second multi-hundred-megabyte ASCII result.
 
-This stage remains opt-in. It improves both clean STEP validations in the paired
-run and preserves the synthetic guards, but its roughly 9--12 second raw-grid
-cost is substantial and the two real scans still lack aligned point-instance
-ground truth. The narrow `--finite-boundary-postprocess` remains the recommended
-option for verified local edge spill; connected-region optimization is the
-recommended research option for broad triangular spill.
+This table is retained as the historical Stage 7 result. The follow-up below
+found two configuration confounders: the run omitted the Stage 5 residual-edge
+proposal, and enabling either postprocessor disabled the embedded topology
+assignment. The final recommendation therefore uses the unified additive
+ablation in Stage 8 rather than this replacement-mode result.
+
+## Stage 8: unified attribution and CGAL operator comparison
+
+### Configuration reconciliation
+
+All final comparisons use the same executable, `topology` pipeline,
+`--edge-residual-proposals`, binary output for large clouds, and unchanged
+profile parameters. The missing 55th `top_left_cut2` face was STEP face 24, the
+planar annulus already identified in Stage 5. Omitting the residual-edge
+proposal produced 54 planes before either postprocessor ran; this, rather than
+Stage 6/7, explains the apparent loss of the historical 55/55 result.
+
+For completeness, the same-build 54-plane check was:
+
+| Configuration | Planes | Instance macro IoU | Corner F1 |
+| --- | ---: | ---: | ---: |
+| no postprocess | 54 | 0.95646304 | 0.82569 |
+| Stage 6 finite-boundary replacement | 54 | 0.95648712 | 0.81818 |
+| Stage 7 region replacement | 54 | 0.95650756 | 0.85185 |
+
+Thus Stage 7 did exceed the same-build Stage 6 in both IoU and corner F1, but
+neither result is comparable with the old 55-plane Stage 6 row. With the
+residual-edge proposal restored, all tested variants recover 55/55 faces and
+corner F1 1.0.
+
+The second confounder was control flow. At `a3f5363`, enabling Stage 7 disabled
+the embedded topology guidance during dense assignment. On `crossing_planes`,
+that removed 233 already-correct topology assignments; Stage 7 then made zero
+new changes, so IoU fell from 0.985402 to 0.969178 without the region optimizer
+actually rejecting or relabeling a point. Stage 7 now runs as a true additive
+final postprocess over the same dense labels as the no-postprocess baseline.
+Stage 6 retains its historical replacement semantics for independent ablation.
+
+| Dataset | No postprocess | Stage 6 replacement | Stage 7 additive PCA | Stage 7 additive PCA+VCM |
+| --- | ---: | ---: | ---: | ---: |
+| top_left_cut2 macro IoU | 0.97118257 | 0.97120066 | **0.97121635** | 0.97120910 |
+| top_left_cut2 corner F1 | 1.00000 | 1.00000 | 1.00000 | 1.00000 |
+| crossing_planes macro IoU | **0.98540206** | 0.97499040 | **0.98540206** | **0.98540206** |
+| stepped_box macro IoU | 1.00000 | 1.00000 | 1.00000 | 1.00000 |
+| near_parallel_planes macro IoU | 1.00000 | not required | 1.00000 | 1.00000 |
+| top_down2 macro IoU | 0.993013 historical | 0.993013 historical | 0.993119 historical | 0.99309268 |
+
+The final PCA+VCM run keeps 20/20 `top_down2` faces and corner F1 1.0. Its
+`top_left_cut2` wall time was 57.40 s versus 42.81 s for extraction without a
+region postprocess; the ordinary PCA region run was 56.06 s on the same host.
+VCM adds about 1.3 s in this run and is therefore retained only as an opt-in
+high-precision validator.
+
+### Pointwise attribution of the 35 harmful moves
+
+The correction CSV now records node retain/target unary energy, whether a point
+entered through missing finite support or normal conflict, whether its owner
+cell was raw-geometry ambiguous, and whether the final acceptance came from
+residual or normal evidence. `evaluate_step_corrections.py --csv` joins these
+fields with the exact STEP truth assignment. The original 54-plane Stage 7
+audit gives the following complete accounting:
+
+- 16 harmful points are pair 1-to-4 in component 12 and 15 are pair 2-to-4 in
+  component 24. The other four are one point each in 8-to-0, 1-to-17, 0-to-53,
+  and 1-to-21. This concentration rules out traversal-order noise.
+- All 35 were created and finally accepted by the PCA normal path; none had a
+  target residual that beat the source by fitted-noise uncertainty. Median
+  source/target residuals were about 0.0008/0.0168 mm, while median normal dots
+  were about 0.627/0.992.
+- 34/35 lie in an owner cell marked ambiguous by raw multi-plane competition.
+  They were admitted through normal conflict, not missing-support evidence. The
+  remaining point had both missing-support and normal-conflict evidence.
+- The two large connected components already preferred the wrong target in
+  their unary terms (13 points: 381.82 versus 89.06; 15 points: 177.69 versus
+  88.85). Four isolated harmful cases had infinite retain energy. Therefore
+  changing ICM traversal cannot repair the principal error: the mixed local PCA
+  normal has already biased candidate generation and unary construction.
+- The final geometry check used `residual_decisive OR normal_decisive`, so the
+  same contaminated normal was able to override a much better source residual.
+  This is the direct failure mechanism. Treating every ambiguous cell as
+  immutable was rejected because the same audit contains 138 valid normal-only
+  corrections in ambiguous cells.
+
+The fault is consequently shared by fine-scale normal evidence and the final
+geometric veto, not by a specific plane id or a half-space width. The finite
+support grid correctly represented uncertainty for 34 points, but uncertainty
+alone could not stop a separate normal-only proposal. The added VCM consensus
+requires two geometrically different normal estimators to pass the existing
+smooth/edge tests; it introduces no new correction distance or angle threshold.
+
+### Independent CGAL comparisons
+
+Each CGAL operator was first substituted independently on the same 55-plane
+replacement-mode Stage 7 input. Output PLY and correction-CSV hashes were also
+compared, so an equal aggregate score is not mistaken for a different solution.
+
+| Normal/support/solver | IoU | Corrections | Beneficial / harmful / same / unresolved | Conclusion |
+| --- | ---: | ---: | ---: | --- |
+| PCA / grid / ICM | 0.97121851 | 275 | 225 / 34 / 8 / 8 | reference |
+| CGAL VCM / grid / ICM | 0.97106850 | 857 | 102 / 745 / 6 / 4 | reject standalone VCM |
+| PCA / Alpha_shape_2 / ICM | 0.97121851 | 275 | 225 / 34 / 8 / 8 | byte-identical; no gain |
+| PCA / grid / alpha-expansion | 0.97121851 | 275 | 225 / 34 / 8 / 8 | byte-identical; no gain |
+| PCA+VCM consensus / grid / ICM | 0.97119900 | 37 | 30 / 1 / 2 / 4 | conservative validation |
+
+`Alpha_shape_2` classified no queried point differently from the existing
+occupied-cell distance in this experiment and cost additional time. CGAL
+alpha-expansion selected exactly the same labels as monotone ICM in all 26
+eligible components (the remaining components were outside the binary
+homogeneous comparison), showing that solver suboptimality was not the cause.
+Standalone VCM at the extraction surfel scale mixed boundary evidence more
+aggressively and was clearly harmful. These three modes were removed after the
+comparison. Only PCA+VCM consensus is retained.
+
+After the additive control-flow fix, the retained consensus makes 167
+`top_left_cut2` changes: 144 beneficial, 1 harmful, 18 instance-neutral, and 4
+unresolved. Its decisive correction precision is 99.31%, compared with 87.73%
+for additive PCA (243 beneficial and 34 harmful among 306 changes). It preserves
+the best synthetic results and improves over both the no-postprocess and Stage
+6 `top_left_cut2` IoU, although ordinary PCA retains the highest aggregate IoU
+by 0.00000725. The recommended default remains the topology pipeline with
+residual-edge proposals and no region postprocess; use PCA+VCM consensus when
+minimizing harmful relabels is more important than recovering every marginal
+boundary point. Ordinary PCA region optimization remains an explicit research
+mode, not the default.
+
+Reproducible outputs are under `results/final_additive_*`; the original 35-row
+point audit is under
+`results/unified_stage7_diagnostic/topology/top_left_cut2/`.
