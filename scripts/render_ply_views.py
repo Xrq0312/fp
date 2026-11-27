@@ -177,6 +177,63 @@ def sample_ascii(
     return sample
 
 
+def sample_binary_little_endian(
+    path: Path,
+    count: int,
+    props: List[Tuple[str, str]],
+    offset: int,
+    sample_limit: int,
+    scale: float,
+    seed: int,
+    crop: Optional[Tuple[float, float, float, float, float, float]],
+) -> List[Point]:
+    formats = {
+        "char": "b", "int8": "b", "uchar": "B", "uint8": "B",
+        "short": "h", "int16": "h", "ushort": "H", "uint16": "H",
+        "int": "i", "int32": "i", "uint": "I", "uint32": "I",
+        "float": "f", "float32": "f", "double": "d", "float64": "d",
+    }
+    try:
+        record = struct.Struct("<" + "".join(formats[data_type] for data_type, _ in props))
+    except KeyError as error:
+        raise RuntimeError(f"unsupported binary PLY property type: {error.args[0]}") from error
+    indices = {name: index for index, (_data_type, name) in enumerate(props)}
+    if not all(axis in indices for axis in ("x", "y", "z")):
+        raise RuntimeError(f"binary PLY has no xyz properties: {path}")
+    rng = random.Random(seed)
+    sample: List[Point] = []
+    accepted = 0
+    with path.open("rb") as fh:
+        fh.seek(offset)
+        for _ in range(count):
+            payload = fh.read(record.size)
+            if len(payload) != record.size:
+                raise RuntimeError(f"truncated binary PLY: {path}")
+            values = record.unpack(payload)
+            x = float(values[indices["x"]]) * scale
+            y = float(values[indices["y"]]) * scale
+            z = float(values[indices["z"]]) * scale
+            if crop is not None and not (
+                crop[0] <= x <= crop[1]
+                and crop[2] <= y <= crop[3]
+                and crop[4] <= z <= crop[5]
+            ):
+                continue
+            color = tuple(
+                int(values[indices[name]]) if name in indices else 210
+                for name in ("red", "green", "blue")
+            )
+            point = (x, y, z, color)
+            if len(sample) < sample_limit:
+                sample.append(point)
+            else:
+                j = rng.randrange(accepted + 1)
+                if j < sample_limit:
+                    sample[j] = point
+            accepted += 1
+    return sample
+
+
 def load_points(
     path: Path,
     sample_limit: int,
@@ -184,10 +241,14 @@ def load_points(
     seed: int,
     crop: Optional[Tuple[float, float, float, float, float, float]],
 ) -> List[Point]:
-    fmt, vertex_count, _props, _offset = parse_header(path)
-    if fmt != "ascii":
-        raise RuntimeError(f"{path} is {fmt}; this lightweight renderer expects ascii PLY")
-    return sample_ascii(path, vertex_count, sample_limit, scale, seed, crop)
+    fmt, vertex_count, props, offset = parse_header(path)
+    if fmt == "ascii":
+        return sample_ascii(path, vertex_count, sample_limit, scale, seed, crop)
+    if fmt == "binary_little_endian":
+        return sample_binary_little_endian(
+            path, vertex_count, props, offset, sample_limit, scale, seed, crop
+        )
+    raise RuntimeError(f"unsupported PLY format {fmt}: {path}")
 
 
 def bounds(points: Iterable[Point]):

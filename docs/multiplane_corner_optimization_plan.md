@@ -49,6 +49,7 @@ not a reconstruction from Git history.
 | `--corner-mode adjacency` | observed finite intersections, graph-local triples, SVD conditioning, and two-branch support | SED-Net, GCCao validation pattern |
 | `--edge-residual-proposals` | unexplained persistent-boundary proposals, model-birth benefit, and local occupied support | CPFN, Progressive-X, SED-Net |
 | `--finite-boundary-postprocess` | raw-cloud multi-plane support, segmented pairwise intersections, and synchronous finite-plane competition | finite-support geometry, PEARL-style multi-label competition |
+| `--finite-support-region-optimization` | label-independent finite support, connected multi-plane competition regions, and residual/normal-validated synchronous relabeling | finite-support geometry, SED-Net boundary awareness, PEARL-style joint labeling |
 
 The neural components of CPFN and SED-Net are not copied: no training data or
 GPU runtime is introduced. Their transferable principles are used instead:
@@ -108,6 +109,48 @@ The option replaces the older topology half-space correction during dense
 assignment, while retaining the established local-normal safeguard. This makes
 the ablation a true final-stage correction rather than applying the same rule
 twice. It remains opt-in pending broader scan ground truth.
+
+## Connected finite-support region optimization
+
+The narrow intersection-band postprocess cannot recover a triangular or
+scan-line-connected spill that extends far from the observed line. The optional
+`--finite-support-region-optimization` stage therefore runs after dense
+assignment and before sparse-patch finalization. It is mutually exclusive with
+`--finite-boundary-postprocess`, so each method remains independently
+ablatable.
+
+The stage is deliberately label-independent when constructing evidence:
+
+1. Raw points compete against every locally plausible plane by normalized
+   residual. Only a unique winner creates an occupied 2-D support cell.
+   Multi-plane observations form an uncertainty mask, not positive support for
+   every nearby plane. Isolated sampling holes are filled only when bracketed
+   in both in-plane directions; concavities and larger holes remain empty.
+2. Dense points with unsupported current ownership or a decisive fine-scale
+   normal conflict form 0.25 mm spatial nodes. Nodes are keyed by an unordered
+   competing-plane pair, not by the current owner. Every candidate label is
+   revalidated for every point in the node.
+3. Neighbor edges are suppressed across a measured sharp normal change. The
+   remaining components use a single-count Potts energy and monotone
+   synchronous ICM, eliminating traversal-order changes and label oscillation.
+4. The graph proposes a connected relabeling, but cannot override conclusive
+   point geometry. A point changes only when the target residual wins by at
+   least the joint fitted-noise uncertainty or a confident local PCA normal
+   supports the target and rejects the owner. Insufficient evidence retains the
+   original label. All accepted destinations are then applied synchronously.
+
+Sub-threshold plane candidates stay available as destinations, allowing raw
+support to rescue a small real face. Their outgoing points remain under the
+existing all-or-nothing finalizer, which keeps the two ablations separate.
+An established plane is also protected from being pushed below the normal
+output-support criterion solely by this postprocess.
+
+After relabeling, strict-majority dense ownership is projected back to the
+original surfel cells. Mixed cells remain unlabelled. Feature-edge output and
+adjacency-based corner extraction consume these final labels, preventing stale
+orange edges or stale topology after dense-only corrections. The output plane
+CSV records `pre_finalize_plane_id`, so correction CSV ids remain traceable
+after sparse candidates are absorbed.
 
 ## Evaluation protocol
 

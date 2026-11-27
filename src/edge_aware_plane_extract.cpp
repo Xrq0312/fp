@@ -71,6 +71,7 @@ struct Config {
     bool binary_plane_output = false;
     std::string parallel_relations = "none";
     bool finite_boundary_postprocess = false;
+    bool finite_support_region_optimization = false;
 };
 
 struct Bounds {
@@ -122,6 +123,7 @@ struct PlanePatch {
     float extent_v = 0.0f;
     float rms_distance = 0.0f;
     bool requires_local_support = false;
+    int pre_finalize_plane_id = -1;
 };
 
 struct BoundaryConstraint {
@@ -168,6 +170,7 @@ struct StageTimings {
     double dense_assignment_ms = 0.0;
     double finalize_ms = 0.0;
     double boundary_postprocess_ms = 0.0;
+    double support_region_ms = 0.0;
     double audit_ms = 0.0;
     double corners_ms = 0.0;
     double save_ms = 0.0;
@@ -247,6 +250,39 @@ struct FiniteBoundaryPostprocessStats {
     std::vector<TopologyCorrection> corrections;
 };
 
+struct FiniteSupportRegionDecision {
+    PointT point;
+    int from_plane = -1;
+    int to_plane = -1;
+    int component = -1;
+    float from_energy = 0.0f;
+    float to_energy = 0.0f;
+    float from_support_distance = 0.0f;
+    float to_support_distance = 0.0f;
+    float normal_confidence = 0.0f;
+    float from_residual = 0.0f;
+    float to_residual = 0.0f;
+    float from_normal_dot = 0.0f;
+    float to_normal_dot = 0.0f;
+};
+
+struct FiniteSupportRegionStats {
+    std::size_t trusted_geometry_points = 0;
+    std::size_t occupied_support_cells = 0;
+    std::size_t ambiguous_observation_cells = 0;
+    std::size_t inferred_sampling_gap_cells = 0;
+    std::size_t support_inconsistent_points = 0;
+    std::size_t competition_nodes = 0;
+    std::size_t competition_components = 0;
+    std::size_t optimized_components = 0;
+    std::size_t retained_components = 0;
+    std::size_t mixed_surfel_points = 0;
+    std::size_t local_geometry_rejections = 0;
+    std::size_t support_preservation_rejections = 0;
+    std::size_t corrected_points = 0;
+    std::vector<FiniteSupportRegionDecision> decisions;
+};
+
 static float median_value(std::vector<float> values);
 
 static float scale_for_profile(const std::string& profile) {
@@ -281,6 +317,7 @@ static Config parse_args(int argc, char** argv) {
             << "  --binary-plane-output  write the large colored plane PLY in binary format\n"
             << "  --parallel-relations none|soft|hard  optional global parallel-normal refinement\n"
             << "  --finite-boundary-postprocess  correct dense points beyond observed finite intersections\n"
+            << "  --finite-support-region-optimization  optimize connected finite-support competition regions\n"
             << "  --audit-assignments  write per-plane dense-assignment diagnostics\n"
             << "  --distance-only  diagnostic A/B: disable normal-guided dense assignment\n"
             << "  --probe X Y Z  print plane-assignment diagnostics at a point\n"
@@ -338,6 +375,8 @@ static Config parse_args(int argc, char** argv) {
             }
         } else if (arg == "--finite-boundary-postprocess") {
             cfg.finite_boundary_postprocess = true;
+        } else if (arg == "--finite-support-region-optimization") {
+            cfg.finite_support_region_optimization = true;
         } else if (arg == "--distance-only") {
             cfg.distance_only = true;
         } else if (arg == "--probe") {
@@ -358,6 +397,11 @@ static Config parse_args(int argc, char** argv) {
         }
     }
     if (cfg.input.empty()) throw std::runtime_error("Missing input PLY path.");
+    if (cfg.finite_boundary_postprocess && cfg.finite_support_region_optimization) {
+        throw std::runtime_error(
+            "--finite-boundary-postprocess and --finite-support-region-optimization "
+            "are independent ablations and cannot be enabled together.");
+    }
     if (cfg.pipeline != "baseline") {
         // Fine residual faces are real deliverables, not sparse leftovers.  The
         // stricter proposal validation remains the primary false-positive guard.
@@ -871,6 +915,51 @@ static std::vector<int> build_surfel_labels(const std::vector<PlanePatch>& patch
     return labels;
 }
 
+static std::vector<int> build_final_surfel_labels(
+    const std::vector<PlanePatch>& patches,
+    std::size_t surfel_count,
+    const std::unordered_map<CellKey, int, CellKeyHash>& index_by_key,
+    const Bounds& bounds,
+    float surfel_size) {
+    // Boyer-Moore finds a possible strict majority without allocating a
+    // surfel-by-plane matrix. A second pass verifies it. Mixed cells remain
+    // unknown instead of inheriting the pre-optimization owner.
+    std::vector<int> candidate(surfel_count, -1);
+    std::vector<int> balance(surfel_count, 0);
+    std::vector<std::uint32_t> total(surfel_count, 0);
+    for (std::size_t plane_id = 0; plane_id < patches.size(); ++plane_id) {
+        for (const PointT& point : patches[plane_id].output->points) {
+            const auto found = index_by_key.find(point_key(point, bounds, surfel_size));
+            if (found == index_by_key.end()) continue;
+            const std::size_t surfel_id = static_cast<std::size_t>(found->second);
+            ++total[surfel_id];
+            if (balance[surfel_id] == 0) {
+                candidate[surfel_id] = static_cast<int>(plane_id);
+                balance[surfel_id] = 1;
+            } else if (candidate[surfel_id] == static_cast<int>(plane_id)) {
+                ++balance[surfel_id];
+            } else {
+                --balance[surfel_id];
+            }
+        }
+    }
+    std::vector<std::uint32_t> candidate_count(surfel_count, 0);
+    for (std::size_t plane_id = 0; plane_id < patches.size(); ++plane_id) {
+        for (const PointT& point : patches[plane_id].output->points) {
+            const auto found = index_by_key.find(point_key(point, bounds, surfel_size));
+            if (found == index_by_key.end()) continue;
+            const std::size_t surfel_id = static_cast<std::size_t>(found->second);
+            if (candidate[surfel_id] == static_cast<int>(plane_id)) {
+                ++candidate_count[surfel_id];
+            }
+        }
+    }
+    for (std::size_t surfel_id = 0; surfel_id < surfel_count; ++surfel_id) {
+        if (candidate_count[surfel_id] * 2 <= total[surfel_id]) candidate[surfel_id] = -1;
+    }
+    return candidate;
+}
+
 static std::vector<std::vector<BoundaryConstraint>> build_boundary_constraints(
     const std::vector<PlanePatch>& patches,
     const std::vector<Surfel>& surfels,
@@ -1356,7 +1445,8 @@ static DenseAssignmentStats assign_full_points(
     const int support_radius = 2;
     const std::vector<int> labels = build_surfel_labels(patches, surfels.size());
     const bool topology_aware = cfg.pipeline == "topology";
-    const bool dense_boundary_guidance = topology_aware && !cfg.finite_boundary_postprocess;
+    const bool dense_boundary_guidance = topology_aware && !cfg.finite_boundary_postprocess &&
+        !cfg.finite_support_region_optimization;
     const std::vector<std::vector<BoundaryConstraint>> boundary_constraints = dense_boundary_guidance
         ? build_boundary_constraints(patches, surfels, neighborhoods, cfg)
         : std::vector<std::vector<BoundaryConstraint>>(patches.size());
@@ -2173,9 +2263,11 @@ static std::vector<FinitePlaneIntersection> build_finite_plane_intersections(
     const std::vector<PlanePatch>& patches,
     const std::vector<Surfel>& surfels,
     const SurfelNeighborhoods& neighborhoods,
-    const Config& cfg) {
+    const Config& cfg,
+    const std::vector<int>* final_labels = nullptr) {
     if (patches.size() < 2 || surfels.empty()) return {};
-    const std::vector<int> labels = build_surfel_labels(patches, surfels.size());
+    const std::vector<int> labels = final_labels != nullptr
+        ? *final_labels : build_surfel_labels(patches, surfels.size());
     const std::size_t plane_count = patches.size();
     std::vector<std::vector<Eigen::Vector3f>> interface_samples(plane_count * plane_count);
 
@@ -2569,16 +2661,829 @@ static FiniteBoundaryPostprocessStats correct_points_from_raw_geometry(
     return stats;
 }
 
+static FiniteSupportRegionStats optimize_finite_support_regions(
+    const CloudPtr& cloud,
+    std::vector<PlanePatch>& patches,
+    const std::vector<Surfel>& surfels,
+    const Bounds& bounds,
+    const Config& cfg) {
+    FiniteSupportRegionStats stats;
+    if (patches.size() < 2 || cloud->empty()) return stats;
+
+    struct GridKey {
+        int u = 0;
+        int v = 0;
+        bool operator==(const GridKey& other) const { return u == other.u && v == other.v; }
+    };
+    struct GridKeyHash {
+        std::size_t operator()(const GridKey& key) const {
+            return static_cast<std::size_t>(key.u) * 73856093u ^
+                static_cast<std::size_t>(key.v) * 19349663u;
+        }
+    };
+    struct SupportDomain {
+        Eigen::Vector3f axis_u{1.0f, 0.0f, 0.0f};
+        Eigen::Vector3f axis_v{0.0f, 1.0f, 0.0f};
+        float point_sigma = 0.0f;
+        std::unordered_set<GridKey, GridKeyHash> occupied;
+        std::unordered_set<GridKey, GridKeyHash> ambiguous;
+        std::unordered_set<GridKey, GridKeyHash> sampling_gaps;
+    };
+
+    // The support raster is finer than the extraction surfel, but its physical
+    // scale is unchanged from the existing raw-geometry audit.  No boundary or
+    // half-space tolerance is enlarged by this option.
+    const float grid_size = 0.5f * cfg.surfel_size;
+    const float envelope_margin = 2.0f * cfg.surfel_size;
+    std::vector<SupportDomain> domains(patches.size());
+    for (std::size_t plane_id = 0; plane_id < patches.size(); ++plane_id) {
+        plane_basis(patches[plane_id], domains[plane_id].axis_u, domains[plane_id].axis_v);
+        domains[plane_id].point_sigma = std::max(
+            patches[plane_id].rms_distance, 0.05f * cfg.surfel_size);
+        domains[plane_id].occupied.reserve(
+            std::max<std::size_t>(patches[plane_id].surfels.size() * 4, 16));
+        domains[plane_id].ambiguous.reserve(
+            std::max<std::size_t>(patches[plane_id].surfels.size(), 16));
+    }
+    const auto inside_envelope = [&](std::size_t plane_id, const Eigen::Vector3f& q) {
+        const Eigen::Vector3f centered = q - patches[plane_id].centroid;
+        const float u = centered.dot(domains[plane_id].axis_u);
+        const float v = centered.dot(domains[plane_id].axis_v);
+        return u >= patches[plane_id].min_u - envelope_margin &&
+            u <= patches[plane_id].max_u + envelope_margin &&
+            v >= patches[plane_id].min_v - envelope_margin &&
+            v <= patches[plane_id].max_v + envelope_margin;
+    };
+    const auto support_key = [&](std::size_t plane_id, const Eigen::Vector3f& q) {
+        const Eigen::Vector3f centered = q - patches[plane_id].centroid;
+        return GridKey{
+            static_cast<int>(std::floor(centered.dot(domains[plane_id].axis_u) / grid_size)),
+            static_cast<int>(std::floor(centered.dot(domains[plane_id].axis_v) / grid_size))
+        };
+    };
+
+    // Only residual-unique raw observations create support.  Dense output
+    // labels are deliberately unavailable here, preventing circular evidence.
+    for (const PointT& point : cloud->points) {
+        const Eigen::Vector3f q(point.x, point.y, point.z);
+        std::size_t best = patches.size();
+        float best_z = std::numeric_limits<float>::infinity();
+        float second_z = std::numeric_limits<float>::infinity();
+        std::vector<std::size_t> plausible;
+        for (std::size_t plane_id = 0; plane_id < patches.size(); ++plane_id) {
+            if (!inside_envelope(plane_id, q)) continue;
+            const float residual = std::abs(
+                patches[plane_id].normal.dot(q) + patches[plane_id].d);
+            const float z = residual / domains[plane_id].point_sigma;
+            if (z <= 3.0f) plausible.push_back(plane_id);
+            if (z < best_z) {
+                second_z = best_z;
+                best_z = z;
+                best = plane_id;
+            } else if (z < second_z) {
+                second_z = z;
+            }
+        }
+        if (best == patches.size() || best_z > 3.0f ||
+            second_z < 3.0f || second_z < best_z + 1.5f) {
+            for (std::size_t plane_id : plausible) {
+                domains[plane_id].ambiguous.insert(support_key(plane_id, q));
+            }
+            continue;
+        }
+        domains[best].occupied.insert(support_key(best, q));
+        ++stats.trusted_geometry_points;
+    }
+
+    // Fill only isolated, bracketed one-cell sampling gaps.  Larger empty
+    // components, concave exterior regions, and holes are retained as true
+    // unsupported space; this is intentionally not a morphological closing.
+    for (SupportDomain& domain : domains) {
+        stats.occupied_support_cells += domain.occupied.size();
+        stats.ambiguous_observation_cells += domain.ambiguous.size();
+        std::unordered_set<GridKey, GridKeyHash> candidates;
+        candidates.reserve(domain.occupied.size());
+        for (const GridKey& key : domain.occupied) {
+            for (int du = -1; du <= 1; ++du) {
+                for (int dv = -1; dv <= 1; ++dv) {
+                    if (du == 0 && dv == 0) continue;
+                    const GridKey candidate{key.u + du, key.v + dv};
+                    if (domain.occupied.find(candidate) == domain.occupied.end()) {
+                        candidates.insert(candidate);
+                    }
+                }
+            }
+        }
+        for (const GridKey& key : candidates) {
+            int neighbors = 0;
+            for (int du = -1; du <= 1; ++du) {
+                for (int dv = -1; dv <= 1; ++dv) {
+                    if (du == 0 && dv == 0) continue;
+                    if (domain.occupied.find({key.u + du, key.v + dv}) != domain.occupied.end()) {
+                        ++neighbors;
+                    }
+                }
+            }
+            const bool bracket_u =
+                domain.occupied.find({key.u - 1, key.v}) != domain.occupied.end() &&
+                domain.occupied.find({key.u + 1, key.v}) != domain.occupied.end();
+            const bool bracket_v =
+                domain.occupied.find({key.u, key.v - 1}) != domain.occupied.end() &&
+                domain.occupied.find({key.u, key.v + 1}) != domain.occupied.end();
+            if (neighbors >= 6 && bracket_u && bracket_v) {
+                domain.sampling_gaps.insert(key);
+            }
+        }
+        stats.inferred_sampling_gap_cells += domain.sampling_gaps.size();
+    }
+
+    const auto support_distance = [&](std::size_t plane_id, const Eigen::Vector3f& q) {
+        const GridKey base = support_key(plane_id, q);
+        const SupportDomain& domain = domains[plane_id];
+        float best = std::numeric_limits<float>::infinity();
+        // Component admission only distinguishes direct/one-cell support from
+        // unsupported space. Searching farther does not change feasibility and
+        // dominates CPU time on multi-million-point clouds.
+        constexpr int maximum_ring = 2;
+        for (int du = -maximum_ring; du <= maximum_ring; ++du) {
+            for (int dv = -maximum_ring; dv <= maximum_ring; ++dv) {
+                const GridKey key{base.u + du, base.v + dv};
+                // Ambiguous observations are an uncertainty mask, not positive
+                // support for every nearby plane. Treating them as occupied
+                // lets an infinite competing plane grow through a real edge.
+                // They are consulted separately when deciding whether missing
+                // owner support is conclusive.
+                if (domain.occupied.find(key) == domain.occupied.end() &&
+                    domain.sampling_gaps.find(key) == domain.sampling_gaps.end()) {
+                    continue;
+                }
+                const float delta_u = static_cast<float>(du);
+                const float delta_v = static_cast<float>(dv);
+                best = std::min(best,
+                    std::sqrt(delta_u * delta_u + delta_v * delta_v) * grid_size);
+            }
+        }
+        return best;
+    };
+    const float smooth_cos = std::cos(
+        cfg.smooth_angle_deg / 180.0f * 3.14159265358979323846f);
+    const float edge_cos = std::cos(
+        cfg.edge_angle_deg / 180.0f * 3.14159265358979323846f);
+
+    struct PointEvidence {
+        PointT point;
+        std::size_t point_index = 0;
+        int owner = -1;
+        std::vector<int> labels;
+        float owner_support = std::numeric_limits<float>::infinity();
+        float normal_confidence = 0.0f;
+        Eigen::Vector3f normal{0.0f, 0.0f, 0.0f};
+    };
+    struct FineKey {
+        int x = 0;
+        int y = 0;
+        int z = 0;
+        int plane_a = -1;
+        int plane_b = -1;
+        bool operator==(const FineKey& other) const {
+            return x == other.x && y == other.y && z == other.z &&
+                plane_a == other.plane_a && plane_b == other.plane_b;
+        }
+    };
+    struct FineKeyHash {
+        std::size_t operator()(const FineKey& key) const {
+            std::size_t h = static_cast<std::size_t>(key.x) * 73856093u;
+            h ^= static_cast<std::size_t>(key.y) * 19349663u;
+            h ^= static_cast<std::size_t>(key.z) * 83492791u;
+            h ^= static_cast<std::size_t>(key.plane_a + 1) * 2654435761u;
+            h ^= static_cast<std::size_t>(key.plane_b + 1) * 2246822519u;
+            return h;
+        }
+    };
+    struct RegionNode {
+        FineKey key;
+        int plane_a = -1;
+        int plane_b = -1;
+        int majority_owner = -1;
+        std::vector<PointEvidence> points;
+        std::vector<int> labels;
+        std::vector<int> neighbors;
+        std::vector<float> unary;
+        Eigen::Vector3f normal{0.0f, 0.0f, 0.0f};
+        float normal_confidence = 0.0f;
+    };
+
+    struct FineNormalKey {
+        int x = 0;
+        int y = 0;
+        int z = 0;
+        bool operator==(const FineNormalKey& other) const {
+            return x == other.x && y == other.y && z == other.z;
+        }
+    };
+    struct FineNormalKeyHash {
+        std::size_t operator()(const FineNormalKey& key) const {
+            return static_cast<std::size_t>(key.x) * 73856093u ^
+                static_cast<std::size_t>(key.y) * 19349663u ^
+                static_cast<std::size_t>(key.z) * 83492791u;
+        }
+    };
+    struct FineNormalAccumulator {
+        double sx = 0.0;
+        double sy = 0.0;
+        double sz = 0.0;
+        double sxx = 0.0;
+        double sxy = 0.0;
+        double sxz = 0.0;
+        double syy = 0.0;
+        double syz = 0.0;
+        double szz = 0.0;
+        std::size_t count = 0;
+    };
+    struct FineNormalEstimate {
+        Eigen::Vector3f normal{0.0f, 0.0f, 0.0f};
+        float confidence = 0.0f;
+    };
+    const auto fine_normal_key = [&](const PointT& point) {
+        return FineNormalKey{
+            static_cast<int>(std::floor((point.x - bounds.min_pt.x) / grid_size)),
+            static_cast<int>(std::floor((point.y - bounds.min_pt.y) / grid_size)),
+            static_cast<int>(std::floor((point.z - bounds.min_pt.z) / grid_size))
+        };
+    };
+    std::unordered_map<FineNormalKey, FineNormalAccumulator, FineNormalKeyHash>
+        fine_normal_accumulators;
+    fine_normal_accumulators.reserve(std::max<std::size_t>(surfels.size() * 4, 16));
+    for (const PointT& point : cloud->points) {
+        FineNormalAccumulator& accumulator = fine_normal_accumulators[fine_normal_key(point)];
+        const double x = point.x;
+        const double y = point.y;
+        const double z = point.z;
+        accumulator.sx += x;
+        accumulator.sy += y;
+        accumulator.sz += z;
+        accumulator.sxx += x * x;
+        accumulator.sxy += x * y;
+        accumulator.sxz += x * z;
+        accumulator.syy += y * y;
+        accumulator.syz += y * z;
+        accumulator.szz += z * z;
+        ++accumulator.count;
+    }
+    std::unordered_map<FineNormalKey, FineNormalEstimate, FineNormalKeyHash> fine_normal_cache;
+    fine_normal_cache.reserve(fine_normal_accumulators.size());
+    const auto point_normal = [&](const PointT& point, Eigen::Vector3f& normal, float& confidence) {
+        const FineNormalKey key = fine_normal_key(point);
+        const auto cached = fine_normal_cache.find(key);
+        if (cached != fine_normal_cache.end()) {
+            normal = cached->second.normal;
+            confidence = cached->second.confidence;
+            return;
+        }
+        FineNormalAccumulator aggregate;
+        for (int dx = -1; dx <= 1; ++dx) {
+            for (int dy = -1; dy <= 1; ++dy) {
+                for (int dz = -1; dz <= 1; ++dz) {
+                    const auto found = fine_normal_accumulators.find(
+                        {key.x + dx, key.y + dy, key.z + dz});
+                    if (found == fine_normal_accumulators.end()) continue;
+                    const FineNormalAccumulator& value = found->second;
+                    aggregate.sx += value.sx;
+                    aggregate.sy += value.sy;
+                    aggregate.sz += value.sz;
+                    aggregate.sxx += value.sxx;
+                    aggregate.sxy += value.sxy;
+                    aggregate.sxz += value.sxz;
+                    aggregate.syy += value.syy;
+                    aggregate.syz += value.syz;
+                    aggregate.szz += value.szz;
+                    aggregate.count += value.count;
+                }
+            }
+        }
+        FineNormalEstimate estimate;
+        if (aggregate.count >= 6) {
+            const double inverse_count = 1.0 / static_cast<double>(aggregate.count);
+            const Eigen::Vector3d mean(
+                aggregate.sx * inverse_count,
+                aggregate.sy * inverse_count,
+                aggregate.sz * inverse_count);
+            Eigen::Matrix3d covariance;
+            covariance <<
+                aggregate.sxx * inverse_count, aggregate.sxy * inverse_count, aggregate.sxz * inverse_count,
+                aggregate.sxy * inverse_count, aggregate.syy * inverse_count, aggregate.syz * inverse_count,
+                aggregate.sxz * inverse_count, aggregate.syz * inverse_count, aggregate.szz * inverse_count;
+            covariance -= mean * mean.transpose();
+            Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> solver(covariance);
+            if (solver.info() == Eigen::Success) {
+                const Eigen::Vector3d eigenvalues = solver.eigenvalues().cwiseMax(0.0);
+                const double largest = std::max(eigenvalues[2], 1e-12);
+                const double line_support = eigenvalues[1] / largest;
+                const double planarity = (eigenvalues[1] - eigenvalues[0]) / largest;
+                if (line_support >= 0.05 && planarity > 0.0) {
+                    estimate.normal = solver.eigenvectors().col(0).cast<float>().normalized();
+                    estimate.confidence = static_cast<float>(std::clamp(planarity, 0.0, 1.0));
+                }
+            }
+        }
+        fine_normal_cache.emplace(key, estimate);
+        normal = estimate.normal;
+        confidence = estimate.confidence;
+    };
+    const auto finite_energy = [&](std::size_t plane_id, const Eigen::Vector3f& q,
+            const Eigen::Vector3f& normal, float normal_confidence, float& lateral) {
+        lateral = support_distance(plane_id, q);
+        if (!std::isfinite(lateral)) return std::numeric_limits<float>::infinity();
+        const float residual = std::abs(patches[plane_id].normal.dot(q) + patches[plane_id].d);
+        const float residual_term = residual / domains[plane_id].point_sigma;
+        const float lateral_term = lateral / domains[plane_id].point_sigma;
+        float normal_term = 0.0f;
+        if (normal_confidence > 0.0f) {
+            const float disagreement = 1.0f - std::abs(normal.dot(patches[plane_id].normal));
+            normal_term = 16.0f * normal_confidence * disagreement * disagreement;
+        }
+        return residual_term * residual_term + lateral_term * lateral_term + normal_term;
+    };
+
+    std::vector<RegionNode> nodes;
+    std::unordered_map<FineKey, int, FineKeyHash> node_by_key;
+    const float origin_x = bounds.min_pt.x;
+    const float origin_y = bounds.min_pt.y;
+    const float origin_z = bounds.min_pt.z;
+    for (std::size_t owner = 0; owner < patches.size(); ++owner) {
+        const CloudT& output = *patches[owner].output;
+        // Keep sub-threshold candidates available as destinations so that
+        // independent support can rescue a real small face. Their outgoing
+        // points remain under the existing finalizer's all-or-nothing
+        // absorption rule; consuming them here would conflate two ablations
+        // and let a weak candidate manufacture a large region component.
+        if (output.size() < static_cast<std::size_t>(std::max(cfg.min_output_points, 1))) {
+            continue;
+        }
+        for (std::size_t point_index = 0; point_index < output.size(); ++point_index) {
+            const PointT& point = output.points[point_index];
+            const Eigen::Vector3f q(point.x, point.y, point.z);
+            const float owner_support = support_distance(owner, q);
+            const bool owner_is_ambiguous = domains[owner].ambiguous.find(
+                support_key(owner, q)) != domains[owner].ambiguous.end();
+            Eigen::Vector3f local_normal;
+            float normal_confidence = 0.0f;
+            point_normal(point, local_normal, normal_confidence);
+            if (normal_confidence <= 0.10f) ++stats.mixed_surfel_points;
+            float unused_lateral = 0.0f;
+            const float owner_energy = finite_energy(
+                owner, q, local_normal, normal_confidence, unused_lateral);
+            const float owner_normal_dot = normal_confidence > 0.0f
+                ? std::abs(local_normal.dot(patches[owner].normal)) : 1.0f;
+            int best_alternative = -1;
+            float best_alternative_energy = std::numeric_limits<float>::infinity();
+            for (std::size_t target = 0; target < patches.size(); ++target) {
+                if (target == owner || !inside_envelope(target, q)) continue;
+                const float residual = std::abs(patches[target].normal.dot(q) + patches[target].d);
+                if (residual > cfg.assign_distance) continue;
+                float target_support = 0.0f;
+                const float target_energy = finite_energy(
+                    target, q, local_normal, normal_confidence, target_support);
+                if (!std::isfinite(target_energy) || target_support > grid_size) continue;
+                const float target_normal_dot = normal_confidence > 0.0f
+                    ? std::abs(local_normal.dot(patches[target].normal)) : 1.0f;
+                // Grid distances are quantized. A point one full cell away
+                // from trusted owner support is already outside the observed
+                // finite support core; using a strict greater-than discarded
+                // exactly the scan-line bands seen in the two reported ROIs.
+                // Lack of unique support inside an ambiguous intersection
+                // corridor is inconclusive. Away from that corridor, however,
+                // a one-cell gap is independent evidence that the current
+                // finite plane does not own this point.
+                const bool support_inconsistent = owner_support >= grid_size &&
+                    !owner_is_ambiguous;
+                const bool geometry_inconsistent = normal_confidence >= 0.20f &&
+                    owner_normal_dot < edge_cos && target_normal_dot >= smooth_cos;
+                if (!support_inconsistent && !geometry_inconsistent) {
+                    continue;
+                }
+                // A dimensionless retention prior represents uncertainty, not
+                // a geometric distance or half-space expansion. Every graph
+                // label must improve the pointwise finite-support explanation;
+                // connectivity only stabilizes a set of already plausible
+                // moves and cannot drag a clearly worse plane across an edge.
+                // No independent target advantage is required at this stage;
+                // the component energy makes the final retain/change decision.
+                if (target_energy > owner_energy + 1.0f) continue;
+                if (target_energy < best_alternative_energy) {
+                    best_alternative = static_cast<int>(target);
+                    best_alternative_energy = target_energy;
+                }
+            }
+            if (best_alternative < 0) continue;
+            ++stats.support_inconsistent_points;
+            const int plane_a = std::min(static_cast<int>(owner), best_alternative);
+            const int plane_b = std::max(static_cast<int>(owner), best_alternative);
+            FineKey key{
+                static_cast<int>(std::floor((point.x - origin_x) / grid_size)),
+                static_cast<int>(std::floor((point.y - origin_y) / grid_size)),
+                static_cast<int>(std::floor((point.z - origin_z) / grid_size)),
+                plane_a,
+                plane_b
+            };
+            auto inserted = node_by_key.emplace(key, static_cast<int>(nodes.size()));
+            if (inserted.second) {
+                RegionNode node;
+                node.key = key;
+                node.plane_a = plane_a;
+                node.plane_b = plane_b;
+                node.labels.push_back(-1);  // retain every point's existing owner
+                node.labels.push_back(plane_a);
+                node.labels.push_back(plane_b);
+                nodes.push_back(std::move(node));
+            }
+            RegionNode& node = nodes[static_cast<std::size_t>(inserted.first->second)];
+            PointEvidence evidence;
+            evidence.point = point;
+            evidence.point_index = point_index;
+            evidence.owner = static_cast<int>(owner);
+            evidence.labels.push_back(best_alternative);
+            evidence.labels.push_back(static_cast<int>(owner));
+            evidence.owner_support = owner_support;
+            evidence.normal_confidence = normal_confidence;
+            evidence.normal = local_normal;
+            node.points.push_back(std::move(evidence));
+            if (normal_confidence > 0.0f) {
+                node.normal += normal_confidence * canonical_normal(local_normal);
+            }
+            node.normal_confidence += normal_confidence;
+        }
+    }
+    stats.competition_nodes = nodes.size();
+    if (nodes.empty()) return stats;
+
+    struct SpatialKey {
+        int x = 0;
+        int y = 0;
+        int z = 0;
+        bool operator==(const SpatialKey& other) const {
+            return x == other.x && y == other.y && z == other.z;
+        }
+    };
+    struct SpatialKeyHash {
+        std::size_t operator()(const SpatialKey& key) const {
+            return static_cast<std::size_t>(key.x) * 73856093u ^
+                static_cast<std::size_t>(key.y) * 19349663u ^
+                static_cast<std::size_t>(key.z) * 83492791u;
+        }
+    };
+    std::unordered_map<SpatialKey, std::vector<int>, SpatialKeyHash> nodes_by_cell;
+    nodes_by_cell.reserve(nodes.size());
+    for (std::size_t node_id = 0; node_id < nodes.size(); ++node_id) {
+        RegionNode& node = nodes[node_id];
+        std::sort(node.labels.begin(), node.labels.end());
+        node.labels.erase(std::unique(node.labels.begin(), node.labels.end()), node.labels.end());
+        std::size_t count_a = 0;
+        std::size_t count_b = 0;
+        for (const PointEvidence& evidence : node.points) {
+            if (evidence.owner == node.plane_a) ++count_a;
+            if (evidence.owner == node.plane_b) ++count_b;
+        }
+        node.majority_owner = count_a >= count_b ? node.plane_a : node.plane_b;
+        node.normal_confidence /= static_cast<float>(std::max<std::size_t>(node.points.size(), 1));
+        if (node.normal.norm() > 1e-6f) node.normal.normalize();
+        nodes_by_cell[{node.key.x, node.key.y, node.key.z}].push_back(static_cast<int>(node_id));
+    }
+    for (std::size_t node_id = 0; node_id < nodes.size(); ++node_id) {
+        RegionNode& node = nodes[node_id];
+        for (int dx = -1; dx <= 1; ++dx) {
+            for (int dy = -1; dy <= 1; ++dy) {
+                for (int dz = -1; dz <= 1; ++dz) {
+                    if (dx == 0 && dy == 0 && dz == 0) continue;
+                    const auto found = nodes_by_cell.find(
+                        {node.key.x + dx, node.key.y + dy, node.key.z + dz});
+                    if (found == nodes_by_cell.end()) continue;
+                    for (int neighbor : found->second) {
+                        if (neighbor == static_cast<int>(node_id)) continue;
+                        const RegionNode& other = nodes[static_cast<std::size_t>(neighbor)];
+                        if (node.plane_a != other.plane_a || node.plane_b != other.plane_b) continue;
+                        if (node.normal_confidence >= 0.20f &&
+                            other.normal_confidence >= 0.20f &&
+                            std::abs(node.normal.dot(other.normal)) < edge_cos) {
+                            continue;
+                        }
+                        node.neighbors.push_back(neighbor);
+                    }
+                }
+            }
+        }
+        std::sort(node.neighbors.begin(), node.neighbors.end());
+        node.neighbors.erase(
+            std::unique(node.neighbors.begin(), node.neighbors.end()), node.neighbors.end());
+        node.unary.reserve(node.labels.size());
+        for (int label : node.labels) {
+            double energy = 0.0;
+            for (const PointEvidence& evidence : node.points) {
+                const Eigen::Vector3f q(evidence.point.x, evidence.point.y, evidence.point.z);
+                float lateral = 0.0f;
+                const int evaluated_label = label < 0 ? evidence.owner : label;
+                const bool feasible = label < 0 ||
+                    std::find(evidence.labels.begin(), evidence.labels.end(), label) !=
+                        evidence.labels.end();
+                if (!feasible) {
+                    energy = std::numeric_limits<double>::infinity();
+                    break;
+                }
+                energy += finite_energy(
+                    static_cast<std::size_t>(evaluated_label), q, evidence.normal,
+                    evidence.normal_confidence, lateral);
+                if (label >= 0 && label != evidence.owner) energy += 0.25;
+            }
+            energy /= static_cast<double>(std::max<std::size_t>(node.points.size(), 1));
+            node.unary.push_back(static_cast<float>(energy));
+        }
+    }
+
+    std::vector<int> component_of(nodes.size(), -1);
+    std::vector<std::vector<int>> components;
+    for (std::size_t seed = 0; seed < nodes.size(); ++seed) {
+        if (component_of[seed] >= 0) continue;
+        const int component_id = static_cast<int>(components.size());
+        components.emplace_back();
+        std::queue<int> pending;
+        pending.push(static_cast<int>(seed));
+        component_of[seed] = component_id;
+        while (!pending.empty()) {
+            const int node_id = pending.front();
+            pending.pop();
+            components.back().push_back(node_id);
+            for (int neighbor : nodes[static_cast<std::size_t>(node_id)].neighbors) {
+                if (component_of[static_cast<std::size_t>(neighbor)] >= 0) continue;
+                component_of[static_cast<std::size_t>(neighbor)] = component_id;
+                pending.push(neighbor);
+            }
+        }
+    }
+    stats.competition_components = components.size();
+
+    std::vector<std::vector<int>> destinations(patches.size());
+    std::vector<std::size_t> original_sizes(patches.size(), 0);
+    for (std::size_t plane_id = 0; plane_id < patches.size(); ++plane_id) {
+        original_sizes[plane_id] = patches[plane_id].output->size();
+        destinations[plane_id].assign(patches[plane_id].output->size(), static_cast<int>(plane_id));
+    }
+    struct PendingDecision {
+        FiniteSupportRegionDecision decision;
+        std::size_t point_index = 0;
+    };
+    std::vector<PendingDecision> pending_decisions;
+    const auto label_index = [](const RegionNode& node, int label) {
+        const auto found = std::lower_bound(node.labels.begin(), node.labels.end(), label);
+        return found != node.labels.end() && *found == label
+            ? static_cast<int>(std::distance(node.labels.begin(), found)) : -1;
+    };
+    const auto effective_label = [&](int node_id, int label) {
+        return label < 0
+            ? nodes[static_cast<std::size_t>(node_id)].majority_owner : label;
+    };
+    const auto node_cost = [&](int node_id, int label, const std::vector<int>& labeling) {
+        const RegionNode& node = nodes[static_cast<std::size_t>(node_id)];
+        const int index = label_index(node, label);
+        if (index < 0) return std::numeric_limits<float>::infinity();
+        float cost = node.unary[static_cast<std::size_t>(index)];
+        for (int neighbor : node.neighbors) {
+            if (component_of[static_cast<std::size_t>(neighbor)] !=
+                component_of[static_cast<std::size_t>(node_id)]) {
+                continue;
+            }
+            if (effective_label(neighbor, labeling[static_cast<std::size_t>(neighbor)]) ==
+                effective_label(node_id, label)) {
+                continue;
+            }
+            const RegionNode& other = nodes[static_cast<std::size_t>(neighbor)];
+            const float confidence = std::min(node.normal_confidence, other.normal_confidence);
+            const float alignment = node.normal.norm() > 0.5f && other.normal.norm() > 0.5f
+                ? std::abs(node.normal.dot(other.normal)) : 0.0f;
+            cost += 0.35f * confidence * alignment * alignment;
+        }
+        return cost;
+    };
+    const auto total_energy = [&](
+            const std::vector<int>& component,
+            const std::vector<int>& labeling) {
+        double energy = 0.0;
+        for (int node_id : component) {
+            const RegionNode& node = nodes[static_cast<std::size_t>(node_id)];
+            const int label = labeling[static_cast<std::size_t>(node_id)];
+            const int index = label_index(node, label);
+            if (index < 0) return std::numeric_limits<double>::infinity();
+            energy += node.unary[static_cast<std::size_t>(index)];
+            for (int neighbor : node.neighbors) {
+                if (neighbor <= node_id ||
+                    component_of[static_cast<std::size_t>(neighbor)] !=
+                        component_of[static_cast<std::size_t>(node_id)] ||
+                    effective_label(neighbor, labeling[static_cast<std::size_t>(neighbor)]) ==
+                        effective_label(node_id, label)) {
+                    continue;
+                }
+                const RegionNode& other = nodes[static_cast<std::size_t>(neighbor)];
+                const float confidence = std::min(node.normal_confidence, other.normal_confidence);
+                const float alignment = node.normal.norm() > 0.5f && other.normal.norm() > 0.5f
+                    ? std::abs(node.normal.dot(other.normal)) : 0.0f;
+                energy += 0.35 * confidence * alignment * alignment;
+            }
+        }
+        return energy;
+    };
+
+    for (std::size_t component_id = 0; component_id < components.size(); ++component_id) {
+        const std::vector<int>& component = components[component_id];
+        if (component.size() < 2) {
+            ++stats.retained_components;
+            continue;
+        }
+        std::vector<int> labels(nodes.size(), -1);
+        const std::vector<int> original = labels;
+        for (int iteration = 0; iteration < 8; ++iteration) {
+            std::vector<int> next = labels;
+            std::size_t changed = 0;
+            for (int node_id : component) {
+                const RegionNode& node = nodes[static_cast<std::size_t>(node_id)];
+                int best_label = labels[static_cast<std::size_t>(node_id)];
+                float best_cost = node_cost(node_id, best_label, labels);
+                for (int candidate : node.labels) {
+                    const float cost = node_cost(node_id, candidate, labels);
+                    if (cost + 1e-6f < best_cost) {
+                        best_cost = cost;
+                        best_label = candidate;
+                    }
+                }
+                next[static_cast<std::size_t>(node_id)] = best_label;
+                if (best_label != labels[static_cast<std::size_t>(node_id)]) ++changed;
+            }
+            if (total_energy(component, next) + 1e-9 >= total_energy(component, labels)) break;
+            labels.swap(next);
+            if (changed == 0) break;
+        }
+        const double original_energy = total_energy(component, original);
+        const double optimized_energy = total_energy(component, labels);
+        std::size_t changed_nodes = 0;
+        for (int node_id : component) {
+            if (labels[static_cast<std::size_t>(node_id)] !=
+                original[static_cast<std::size_t>(node_id)]) {
+                ++changed_nodes;
+            }
+        }
+        // Require a connected multi-cell move and an aggregate gain above
+        // numerical/model uncertainty; otherwise retain every point's owner.
+        const double required_gain = 0.25 * std::sqrt(static_cast<double>(component.size()));
+        if (changed_nodes < 2 || optimized_energy + required_gain >= original_energy) {
+            ++stats.retained_components;
+            continue;
+        }
+        const std::size_t pending_before = pending_decisions.size();
+        for (int node_id : component) {
+            RegionNode& node = nodes[static_cast<std::size_t>(node_id)];
+            const int destination = labels[static_cast<std::size_t>(node_id)];
+            if (destination < 0) continue;
+            const int from_index = label_index(node, -1);
+            const int to_index = label_index(node, destination);
+            // Pairwise coherence may break a near tie, but it must never drag
+            // a locally worse fine cell across a sharp finite boundary. This
+            // veto is applied after graph construction/optimization, so weak
+            // candidates still keep a competition component connected.
+            if (to_index < 0 || from_index < 0 ||
+                node.unary[static_cast<std::size_t>(to_index)] + 1e-6f >=
+                    node.unary[static_cast<std::size_t>(from_index)]) {
+                continue;
+            }
+            for (const PointEvidence& evidence : node.points) {
+                if (destination == evidence.owner) continue;
+                const Eigen::Vector3f q(evidence.point.x, evidence.point.y, evidence.point.z);
+                float owner_support = 0.0f;
+                float target_support = 0.0f;
+                const float owner_energy = finite_energy(
+                    static_cast<std::size_t>(evidence.owner), q, evidence.normal,
+                    evidence.normal_confidence, owner_support);
+                const float target_energy = finite_energy(
+                    static_cast<std::size_t>(destination), q, evidence.normal,
+                    evidence.normal_confidence, target_support);
+                const float owner_residual = std::abs(
+                    patches[static_cast<std::size_t>(evidence.owner)].normal.dot(q) +
+                    patches[static_cast<std::size_t>(evidence.owner)].d);
+                const float target_residual = std::abs(
+                    patches[static_cast<std::size_t>(destination)].normal.dot(q) +
+                    patches[static_cast<std::size_t>(destination)].d);
+                const float residual_uncertainty = std::hypot(
+                    domains[static_cast<std::size_t>(evidence.owner)].point_sigma,
+                    domains[static_cast<std::size_t>(destination)].point_sigma);
+                const float owner_normal_dot = evidence.normal_confidence > 0.0f
+                    ? std::abs(evidence.normal.dot(
+                        patches[static_cast<std::size_t>(evidence.owner)].normal)) : 1.0f;
+                const float target_normal_dot = evidence.normal_confidence > 0.0f
+                    ? std::abs(evidence.normal.dot(
+                        patches[static_cast<std::size_t>(destination)].normal)) : 1.0f;
+                const bool residual_decisive =
+                    target_residual + residual_uncertainty < owner_residual;
+                const bool normal_decisive = evidence.normal_confidence >= 0.20f &&
+                    target_normal_dot >= smooth_cos && owner_normal_dot < edge_cos;
+                if (!residual_decisive && !normal_decisive) {
+                    ++stats.local_geometry_rejections;
+                    continue;
+                }
+                destinations[static_cast<std::size_t>(evidence.owner)][evidence.point_index] = destination;
+                pending_decisions.push_back({{
+                        evidence.point,
+                        evidence.owner,
+                        destination,
+                        static_cast<int>(component_id),
+                        owner_energy,
+                        target_energy,
+                        owner_support,
+                        target_support,
+                        evidence.normal_confidence,
+                        owner_residual,
+                        target_residual,
+                        owner_normal_dot,
+                        target_normal_dot
+                    }, evidence.point_index});
+            }
+        }
+        if (pending_decisions.size() > pending_before) {
+            ++stats.optimized_components;
+        } else {
+            ++stats.retained_components;
+        }
+    }
+
+    // A postprocessor must not destroy an otherwise deliverable model merely
+    // because its boundary is locally contested. Evaluate all moves
+    // synchronously, then roll back outgoing moves from an established plane
+    // if they would push its final support below the normal output criterion.
+    // This is a conservative evidence rule, not a preference for plane count:
+    // sub-threshold models remain eligible as destinations and still follow
+    // the unchanged finalization policy.
+    const std::size_t minimum_points = static_cast<std::size_t>(
+        std::max(cfg.min_output_points, 1));
+    std::vector<std::size_t> final_sizes = original_sizes;
+    for (std::size_t owner = 0; owner < destinations.size(); ++owner) {
+        for (int destination : destinations[owner]) {
+            if (destination == static_cast<int>(owner)) continue;
+            --final_sizes[owner];
+            ++final_sizes[static_cast<std::size_t>(destination)];
+        }
+    }
+    bool support_changed = true;
+    while (support_changed) {
+        support_changed = false;
+        for (std::size_t owner = 0; owner < destinations.size(); ++owner) {
+            if (original_sizes[owner] < minimum_points || final_sizes[owner] >= minimum_points) {
+                continue;
+            }
+            for (int& destination : destinations[owner]) {
+                if (destination == static_cast<int>(owner)) continue;
+                --final_sizes[static_cast<std::size_t>(destination)];
+                ++final_sizes[owner];
+                destination = static_cast<int>(owner);
+                ++stats.support_preservation_rejections;
+            }
+            support_changed = true;
+        }
+    }
+    for (PendingDecision& pending : pending_decisions) {
+        const FiniteSupportRegionDecision& decision = pending.decision;
+        if (destinations[static_cast<std::size_t>(decision.from_plane)][pending.point_index] !=
+            decision.to_plane) {
+            continue;
+        }
+        stats.decisions.push_back(std::move(pending.decision));
+        ++stats.corrected_points;
+    }
+
+    std::vector<CloudPtr> rebuilt(patches.size());
+    for (CloudPtr& output : rebuilt) output.reset(new CloudT);
+    for (std::size_t owner = 0; owner < patches.size(); ++owner) {
+        for (std::size_t point_id = 0; point_id < patches[owner].output->size(); ++point_id) {
+            const int destination = destinations[owner][point_id];
+            rebuilt[static_cast<std::size_t>(destination)]->push_back(
+                patches[owner].output->points[point_id]);
+        }
+    }
+    for (std::size_t plane_id = 0; plane_id < patches.size(); ++plane_id) {
+        rebuilt[plane_id]->width = static_cast<std::uint32_t>(rebuilt[plane_id]->size());
+        rebuilt[plane_id]->height = 1;
+        rebuilt[plane_id]->is_dense = true;
+        patches[plane_id].output = rebuilt[plane_id];
+    }
+    return stats;
+}
+
 static CornerExtractionResult extract_corners_from_adjacency(
     const CloudPtr& cloud,
     const std::vector<PlanePatch>& patches,
     const std::vector<Surfel>& surfels,
     const SurfelNeighborhoods& neighborhoods,
     const Bounds& bounds,
-    const Config& cfg) {
+    const Config& cfg,
+    const std::vector<int>* final_labels = nullptr) {
     CornerExtractionResult result;
     result.finite_intersections =
-        build_finite_plane_intersections(patches, surfels, neighborhoods, cfg);
+        build_finite_plane_intersections(patches, surfels, neighborhoods, cfg, final_labels);
     if (patches.size() < 3 || result.finite_intersections.size() < 2) return result;
 
     const std::size_t plane_count = patches.size();
@@ -2771,14 +3676,43 @@ static void save_topology_corrections(
     }
 }
 
+static void save_finite_support_region_decisions(
+    const fs::path& ply_path,
+    const fs::path& csv_path,
+    const std::vector<FiniteSupportRegionDecision>& decisions) {
+    std::ofstream ply(ply_path);
+    if (!ply) throw std::runtime_error("Failed to write finite-support decisions: " + ply_path.string());
+    write_color_ply_header(ply, decisions.size());
+    for (const FiniteSupportRegionDecision& decision : decisions) {
+        ply << decision.point.x << ' ' << decision.point.y << ' ' << decision.point.z
+            << " 255 48 48\n";
+    }
+    std::ofstream csv(csv_path);
+    if (!csv) throw std::runtime_error("Failed to write finite-support decisions: " + csv_path.string());
+    csv << "x,y,z,from_plane,to_plane,component,from_energy,to_energy,"
+           "from_support_distance,to_support_distance,normal_confidence,"
+           "from_residual,to_residual,from_normal_dot,to_normal_dot\n";
+    csv << std::setprecision(9);
+    for (const FiniteSupportRegionDecision& decision : decisions) {
+        csv << decision.point.x << ',' << decision.point.y << ',' << decision.point.z << ','
+            << decision.from_plane << ',' << decision.to_plane << ',' << decision.component << ','
+            << decision.from_energy << ',' << decision.to_energy << ','
+            << decision.from_support_distance << ',' << decision.to_support_distance << ','
+            << decision.normal_confidence << ','
+            << decision.from_residual << ',' << decision.to_residual << ','
+            << decision.from_normal_dot << ',' << decision.to_normal_dot << '\n';
+    }
+}
+
 static void save_plane_parameters_csv(const fs::path& path, const std::vector<PlanePatch>& patches) {
     std::ofstream out(path);
     if (!out) throw std::runtime_error("Failed to write plane parameters: " + path.string());
-    out << "plane_id,surfels,dense_points,nx,ny,nz,d,cx,cy,cz,extent_u,extent_v,rms_distance\n";
+    out << "plane_id,pre_finalize_plane_id,surfels,dense_points,nx,ny,nz,d,cx,cy,cz,extent_u,extent_v,rms_distance\n";
     out << std::setprecision(9);
     for (std::size_t i = 0; i < patches.size(); ++i) {
         const PlanePatch& patch = patches[i];
-        out << i << ',' << patch.surfels.size() << ',' << patch.output->size() << ','
+        out << i << ',' << patch.pre_finalize_plane_id << ','
+            << patch.surfels.size() << ',' << patch.output->size() << ','
             << patch.normal.x() << ',' << patch.normal.y() << ',' << patch.normal.z() << ',' << patch.d << ','
             << patch.centroid.x() << ',' << patch.centroid.y() << ',' << patch.centroid.z() << ','
             << patch.extent_u << ',' << patch.extent_v << ',' << patch.rms_distance << '\n';
@@ -2970,8 +3904,10 @@ static void save_feature_edges(
     const fs::path& path,
     const std::vector<Surfel>& surfels,
     const SurfelNeighborhoods& neighborhoods,
-    const std::vector<PlanePatch>& patches) {
-    const std::vector<int> labels = build_surfel_labels(patches, surfels.size());
+    const std::vector<PlanePatch>& patches,
+    const std::vector<int>* final_labels = nullptr) {
+    const std::vector<int> labels = final_labels != nullptr
+        ? *final_labels : build_surfel_labels(patches, surfels.size());
 
     const auto is_feature_edge = [&](std::size_t i) {
         if (labels[i] < 0) return false;
@@ -3194,8 +4130,21 @@ int main(int argc, char** argv) {
             assign_full_points(
                 cloud, patches, surfels, index_by_key, neighborhoods, bounds, cfg, false);
         }
+        for (std::size_t patch_id = 0; patch_id < patches.size(); ++patch_id) {
+            patches[patch_id].pre_finalize_plane_id = static_cast<int>(patch_id);
+        }
         now = Clock::now();
         timings.dense_assignment_ms = elapsed_ms(stage_start, now);
+        stage_start = now;
+        // Region competition must see every extracted model. Filtering or
+        // absorbing a small plane first irreversibly removes a legitimate
+        // finite-support alternative and biases the ablation.
+        const FiniteSupportRegionStats support_regions = cfg.finite_support_region_optimization
+            ? optimize_finite_support_regions(
+                cloud, patches, surfels, bounds, cfg)
+            : FiniteSupportRegionStats{};
+        now = Clock::now();
+        timings.support_region_ms = elapsed_ms(stage_start, now);
         stage_start = now;
         const FinalizeStats finalize_stats = finalize_dense_patches(patches, cfg);
         now = Clock::now();
@@ -3208,6 +4157,12 @@ int main(int argc, char** argv) {
         now = Clock::now();
         timings.boundary_postprocess_ms = elapsed_ms(stage_start, now);
         stage_start = now;
+        const std::vector<int> final_surfel_labels = cfg.finite_support_region_optimization
+            ? build_final_surfel_labels(
+                patches, surfels.size(), index_by_key, bounds, cfg.surfel_size)
+            : std::vector<int>{};
+        const std::vector<int>* final_surfel_labels_ptr =
+            cfg.finite_support_region_optimization ? &final_surfel_labels : nullptr;
         const std::vector<AssignmentAuditRow> assignment_audit = cfg.audit_assignments
             ? audit_dense_assignments(patches, surfels, index_by_key, bounds, cfg)
             : std::vector<AssignmentAuditRow>{};
@@ -3218,7 +4173,7 @@ int main(int argc, char** argv) {
         CornerExtractionResult corner_result;
         if (cfg.corner_mode == "adjacency") {
             corner_result = extract_corners_from_adjacency(
-                cloud, patches, surfels, neighborhoods, bounds, cfg);
+                cloud, patches, surfels, neighborhoods, bounds, cfg, final_surfel_labels_ptr);
         } else {
             corner_result.corners = extract_corners_filtered(cloud, patches, bounds, cfg);
         }
@@ -3235,7 +4190,9 @@ int main(int argc, char** argv) {
         if (cfg.edge_residual_proposals) {
             save_proposal_diagnostics(out_dir / "proposal_diagnostics.csv", patches, surfels);
         }
-        save_feature_edges(out_dir / "feature_edges.ply", surfels, neighborhoods, patches);
+        save_feature_edges(
+            out_dir / "feature_edges.ply", surfels, neighborhoods, patches,
+            final_surfel_labels_ptr);
         save_corners(out_dir / "extracted_corners.ply", corners);
         if (cfg.corner_mode == "adjacency") {
             save_finite_intersections(
@@ -3252,6 +4209,12 @@ int main(int argc, char** argv) {
                 out_dir / "finite_boundary_corrections.ply",
                 out_dir / "finite_boundary_corrections.csv",
                 boundary_postprocess.corrections);
+        }
+        if (cfg.finite_support_region_optimization) {
+            save_finite_support_region_decisions(
+                out_dir / "finite_support_region_corrections.ply",
+                out_dir / "finite_support_region_corrections.csv",
+                support_regions.decisions);
         }
         if (cfg.audit_assignments) {
             save_assignment_audit(out_dir / "assignment_audit.csv", assignment_audit);
@@ -3322,6 +4285,19 @@ int main(int argc, char** argv) {
                       << boundary_postprocess.corrected_points << '/'
                       << (boundary_postprocess.rejected_without_local_support +
                           boundary_postprocess.margin_rejected_points) << "\n";
+            std::cout << "Finite-support regions trusted/occupied/gap-fill/inconsistent/nodes/components/optimized/retained/mixed/local-reject/support-guard/corrections: "
+                      << support_regions.trusted_geometry_points << '/'
+                      << support_regions.occupied_support_cells << '/'
+                      << support_regions.inferred_sampling_gap_cells << '/'
+                      << support_regions.support_inconsistent_points << '/'
+                      << support_regions.competition_nodes << '/'
+                      << support_regions.competition_components << '/'
+                      << support_regions.optimized_components << '/'
+                      << support_regions.retained_components << '/'
+                      << support_regions.mixed_surfel_points << '/'
+                      << support_regions.local_geometry_rejections << '/'
+                      << support_regions.support_preservation_rejections << '/'
+                      << support_regions.corrected_points << "\n";
             std::cout << "Assignment margin: " << cfg.assign_margin << "\n";
             std::cout << "Plane patches: " << patches.size() << "\n";
             std::cout << "Output points: " << output_points << "\n";
@@ -3340,9 +4316,10 @@ int main(int argc, char** argv) {
                       << timings.global_relations_ms << '/' << timings.initial_merge_ms << '/'
                       << timings.competition_ms << '/' << timings.final_merge_ms << '/'
                       << timings.relation_refinement_ms << "\n";
-            std::cout << "Timing margin/dense/finalize/boundary/audit/corners/save (ms): "
+            std::cout << "Timing margin/dense/support-region/finalize/boundary/audit/corners/save (ms): "
                       << timings.assign_margin_ms << '/' << timings.dense_assignment_ms << '/'
-                      << timings.finalize_ms << '/' << timings.boundary_postprocess_ms << '/'
+                      << timings.support_region_ms << '/' << timings.finalize_ms << '/'
+                      << timings.boundary_postprocess_ms << '/'
                       << timings.audit_ms << '/' << timings.corners_ms << '/'
                       << timings.save_ms << "\n";
             std::cout << "Timing total (ms): " << timings.total_ms << "\n";

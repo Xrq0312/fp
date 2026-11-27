@@ -402,3 +402,64 @@ so all labels were retained. This conservative no-change behavior is intentional
 for occlusion and missing-data cases. The method remains independently enabled
 for ablation rather than becoming the default pipeline until aligned boundary
 ground truth is available for the two real scans.
+
+## Stage 7: connected finite-support region optimization
+
+The reported `top_left_cut` failures were connected triangular/scan-line
+regions, not only sub-millimetre crossing bands. An experimental
+`--finite-support-region-optimization` switch now builds raw-cloud finite
+support domains, finds connected local plane competitions, and applies a
+synchronous graph proposal followed by a pointwise residual/normal validation.
+It is mutually exclusive with `--finite-boundary-postprocess`.
+
+Several intermediate variants were rejected:
+
+- Treating an ambiguous raw observation as occupied support for every plausible
+  plane moved 18,908 `top_left_cut2` points. STEP point auditing classified only
+  1,466 as beneficial and 17,338 as harmful; instance macro IoU fell from the
+  historical 0.97118 baseline to 0.96797.
+- Allowing pairwise smoothness to override a locally worse unary score created
+  coherent but geometrically wrong regions. The graph now only resolves a
+  connected proposal; a final residual/noise or confident-normal test has veto
+  authority.
+- Letting a weak sub-threshold source model create outgoing graph components
+  conflated region optimization with the existing sparse-patch absorber. Such
+  candidates remain valid destinations but their original points are left to
+  the baseline finalizer.
+
+The following table is a paired run from the same executable and extraction
+result. It must not be mixed with older rows above whose proposal stage produced
+55 rather than 54 `top_left_cut2` patches.
+
+| Dataset | Same-build baseline | Region optimization | Corrections | Added wall time | Result |
+| --- | ---: | ---: | ---: | ---: | --- |
+| stepped_box | macro IoU 1.000000 | 1.000000 | 0 | about 0.26 s | exact planes and 16/16 corners preserved |
+| crossing_planes | macro IoU 0.969178 | 0.969178 | 0 | about 0.03 s | independent region ablation; narrow-band method remains better here |
+| near_parallel_planes | macro IoU 1.000000 | 1.000000 | 0 | about 0.05 s | no cross-plane propagation |
+| top_left_cut2 / data2.STEP | macro IoU 0.956463 | 0.956508 | 290 | about 9.5 s | 54/55 face recall unchanged; corner F1 0.82569 to 0.85185 |
+| top_down2 / data1.STEP | macro IoU 0.993013 | 0.993119 | 16 | about 11.5 s | 20/20 faces and corner F1 1.0 preserved |
+| top_left_cut | no aligned instance GT | no aligned instance GT | 889 | about 9.1 s | target multi-face pairs corrected; accuracy not claimed |
+| top_down | no aligned instance GT | no aligned instance GT | 180 | about 12.0 s | conservative scan regression only |
+
+For `top_left_cut2`, an exact-coordinate correction audit maps the baseline and
+optimized final patch owners independently through the STEP one-to-one instance
+matching. Of 290 synchronous moves, 239 are beneficial, 35 harmful, 8 keep the
+same STEP-instance interpretation, and 8 fall outside the evaluator tolerance.
+The decisive correction precision is therefore 87.2%. The audit utility writes
+a category-colored PLY (green beneficial, red harmful, yellow unchanged, grey
+unresolved) and reports distributions of residual, finite-support distance,
+normal confidence, and energy gain.
+
+On `top_left_cut`, the final 889 changes include the previously reported local
+competitions 29-to-4 (89 points), 11-to-29 (10), 11-to-4 (48), and 21-to-4
+(21), without any plane-id-specific condition. These counts are diagnostics,
+not ground-truth accuracy. Binary PLY support was added to the projection
+renderer so the baseline, corrected labels, and red correction overlay can be
+inspected without producing a second multi-hundred-megabyte ASCII result.
+
+This stage remains opt-in. It improves both clean STEP validations in the paired
+run and preserves the synthetic guards, but its roughly 9--12 second raw-grid
+cost is substantial and the two real scans still lack aligned point-instance
+ground truth. The narrow `--finite-boundary-postprocess` remains the recommended
+option for verified local edge spill; connected-region optimization is the
+recommended research option for broad triangular spill.
