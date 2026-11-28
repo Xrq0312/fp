@@ -156,9 +156,53 @@ or under-segmentation; `top_left_cut2` macro IoU changed from 0.971293 to
 0.971183, while `top_down2` was 0.993013. The stepped-box regression remained
 perfect and the crossing-plane macro IoU remained 0.985402.
 
-The red points in `topology_corrections.ply` are a diagnostic overlay showing
-points whose labels were corrected; they are not red labels in the final
-`edge_aware_plane_patches.ply` output.
+Correction PLY files now use the deterministic color of each point's final
+plane. Earlier files forced every changed point to red, which made a diagnostic
+subset look like an additional classification when loaded over the main PLY.
+The CSV retains the stage-local `from_plane` and `to_plane` and adds
+`final_plane`, because a later finite-support pass may legitimately supersede
+an earlier topology move. The renderer can still draw a red overlay explicitly
+when a changed-point diagnostic is wanted.
+
+### Edge-cell owner recovery and picking-list trace (2026-11-28)
+
+Four points in `picking_list1.txt` exposed a second form of thin boundary spill
+in `top_left_cut`. In the preceding result all four were assigned to plane 29,
+whereas four nearby counterexample points in `picking_list2.txt` belonged to
+plane 4. The first list's cells were already owned by plane 4 at surfel level.
+For a representative point, plane 29 won infinite-plane distance (0.0345 mm
+versus 0.0694 mm), but the observed normal agreed with plane 4 at 0.997 and
+with plane 29 at only 0.638; local support was also 19 versus 15. The dense
+classifier had excluded this evidence solely because the surfel was marked as
+edge-like.
+
+Topology dense assignment now permits an authoritative edge-cell owner under
+two conservative evidence paths. Either its smooth normal and neighborhood
+support dominate, or its normal is within the existing edge-angle tolerance
+and its relative advantage exceeds the same angle-derived cosine budget. Both
+paths additionally require tight finite envelopes, measured strict-neighborhood
+support, an established scene-adaptive owner, and a distance disadvantage no
+larger than three combined fitted RMS deviations. This is a general geometric
+rule; no coordinate, plane id, or dataset threshold is encoded.
+
+The exact float32 owner trace changed from
+`[29,29,29,29 | 4,4,4,4]` to `[4,4,4,4 | 4,4,4,4]`. On the full scan this
+created 8,746 decisive edge-owner moves before the later finite-region stage;
+plane count (49), output count (12,632,707), and adjacency corners (19) were
+unchanged. On `top_down`, plane count (20), output count (5,703,086), and
+corners (16) were also unchanged. The synthetic regressions remained:
+
+| Dataset | Plane precision / recall | Macro IoU | Corner precision / recall |
+| --- | --- | ---: | --- |
+| stepped_box | 1.0 / 1.0 | 1.000000 | 1.0 / 1.0 |
+| crossing_planes | 1.0 / 1.0 | 0.985402 | n/a |
+| near_parallel_planes | 1.0 / 1.0 | 1.000000 | n/a |
+
+All correction rows in the two real-data runs resolved to a final owner. Forced
+red rows are zero. Stage targets differed from final owners for 740/10,282
+topology rows and 370/744 finite-region rows on `top_left_cut`, and for
+291/2,061 topology rows on `top_down`; recording `final_plane` is therefore
+necessary rather than cosmetic.
 
 ## Correctness and performance audit
 

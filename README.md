@@ -8,12 +8,21 @@ geometry outputs:
 - `feature_edges.ply`: surfel centers on plane boundaries
 - `extracted_corners.ply`: validated three-plane corner points
 - `topology_corrections.ply/.csv`: points whose joint label was conservatively
-  changed by `--pipeline topology`, including source/target candidate ids
+  changed by `--pipeline topology`, including source/target candidate ids and
+  the final plane after all later postprocessing
 
 After seed growth and coplanar merging, directly adjacent surfels perform one
 synchronous plane-competition pass. Distance, local normal agreement, envelope
 support, and connectivity all participate; labels do not propagate beyond the
 original boundary during this pass.
+
+`edge_aware_plane_patches.ply` is the classification result: every point in
+one final plane has the same deterministic color. Correction PLY files use
+that same final-plane color; they are subsets for locating changed points, not
+red classification layers. Their CSV `from_plane`/`to_plane` columns describe
+the stage-local decision, while `final_plane` is the owner in the saved result.
+`feature_edges.ply` is likewise a separate geometry diagnostic and should not
+be overlaid when inspecting only the final plane labels.
 
 Reliable surfel normals are also clustered into global direction families.
 These families are used only to repair repeated coplanar fragmentation during

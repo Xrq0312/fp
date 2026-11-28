@@ -141,6 +141,14 @@ postprocess switch no longer changes its own baseline input:
    supports the target and rejects the owner. Insufficient evidence retains the
    original label. All accepted destinations are then applied synchronously.
 
+Dense assignment also retains local evidence at sharp boundaries. An edge-like
+surfel is allowed to restore its established owner only when the owner wins a
+normal/support test, both finite envelopes contain the point tightly, and the
+distance loss remains within the two planes' measured fit uncertainty. This
+closes the gap between smooth-cell stable ownership and the later connected
+region optimizer without expanding the global assignment distance or using
+plane-specific exceptions.
+
 An optional `--region-normal-estimator pca-vcm-consensus` mode computes CGAL
 VCM normals on the extraction surfel centroids and accepts a normal-only
 candidate only when both the fine raw-point PCA estimate and VCM satisfy the

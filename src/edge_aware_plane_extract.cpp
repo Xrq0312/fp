@@ -149,12 +149,14 @@ struct TopologyCorrection {
     PointT point;
     int from_plane = -1;
     int to_plane = -1;
+    int final_plane = -1;
 };
 
 struct DenseAssignmentStats {
     std::size_t normal_guided_points = 0;
     std::size_t locally_supported_points = 0;
     std::size_t established_guided_points = 0;
+    std::size_t edge_owner_guided_points = 0;
     std::size_t topology_guided_points = 0;
     std::size_t boundary_rejected_candidates = 0;
     std::size_t boundary_constraints = 0;
@@ -277,6 +279,7 @@ struct FiniteSupportRegionDecision {
     bool owner_observation_ambiguous = false;
     bool accepted_by_residual = false;
     bool accepted_by_normal = false;
+    int final_plane = -1;
 };
 
 struct FiniteSupportRegionStats {
@@ -1524,10 +1527,11 @@ static DenseAssignmentStats assign_full_points(
         const int local_owner = local != index_by_key.end()
             ? labels[static_cast<std::size_t>(local->second)]
             : -1;
-        const int established_local_owner = local_surfel != nullptr && !local_surfel->edge_like &&
-                local_owner >= 0 &&
+        const int authoritative_local_owner = local_surfel != nullptr && local_owner >= 0 &&
                 owner_log_support[static_cast<std::size_t>(local_owner)] >= owner_authority_floor
             ? local_owner : -1;
+        const int established_local_owner = local_surfel != nullptr && !local_surfel->edge_like
+            ? authoritative_local_owner : -1;
         const bool has_local_normal = enable_normal_guidance && local_surfel != nullptr;
 
         candidates.clear();
@@ -1663,6 +1667,52 @@ static DenseAssignmentStats assign_full_points(
                 selected = owner_candidate;
                 ++stats.normal_guided_points;
                 ++stats.established_guided_points;
+            }
+        }
+
+        // An edge cell is not automatically unreliable. At a measured sharp
+        // boundary its PCA normal can still agree almost exactly with one
+        // established face while rejecting the pointwise nearest infinite
+        // plane. Previously every edge cell was excluded from the local-owner
+        // safeguard, which created thin, connected stripes inside the true
+        // face whenever both rectangular envelopes overlapped. Admit the
+        // observed owner only when normal, finite envelope, neighborhood
+        // support, and fitted uncertainty all agree.
+        if (topology_aware && enable_normal_guidance && local_surfel != nullptr &&
+            local_surfel->edge_like && authoritative_local_owner >= 0 &&
+            candidates[selected].id != authoritative_local_owner &&
+            candidates[selected].inside_tight &&
+            candidates[selected].normal_dot < edge_cos) {
+            std::size_t owner_candidate = candidate_count;
+            for (std::size_t i = 0; i < candidate_count; ++i) {
+                if (candidates[i].id != authoritative_local_owner) continue;
+                if (!candidates[i].inside_tight) continue;
+                const bool support_dominates = candidates[i].normal_dot >= smooth_cos &&
+                    candidates[i].local_support > candidates[selected].local_support &&
+                    candidates[i].strict_local_support >= candidates[selected].strict_local_support;
+                const bool relative_normal_dominates = candidates[i].normal_dot >= edge_cos &&
+                    candidates[i].normal_dot - candidates[selected].normal_dot >= 1.0f - edge_cos &&
+                    candidates[i].strict_local_support >= cfg.min_plane_local_support;
+                if (!support_dominates && !relative_normal_dominates) continue;
+                const PlanePatch& owner_patch = patches[static_cast<std::size_t>(candidates[i].id)];
+                const PlanePatch& selected_patch = patches[static_cast<std::size_t>(candidates[selected].id)];
+                const float fit_uncertainty = std::max(
+                    3.0f * std::hypot(owner_patch.rms_distance, selected_patch.rms_distance),
+                    1e-6f * cfg.surfel_size);
+                if (candidates[i].distance > candidates[selected].distance + fit_uncertainty) continue;
+                owner_candidate = i;
+                break;
+            }
+            if (owner_candidate < candidate_count) {
+                stats.corrections.push_back({
+                    p,
+                    candidates[selected].id,
+                    candidates[owner_candidate].id
+                });
+                selected = owner_candidate;
+                ++stats.normal_guided_points;
+                ++stats.edge_owner_guided_points;
+                ++stats.locally_supported_points;
             }
         }
 
@@ -3723,6 +3773,54 @@ static void write_color_ply_header(std::ofstream& out, std::size_t vertex_count)
     out.precision(6);
 }
 
+struct PointCoordinateKey {
+    std::uint32_t x = 0;
+    std::uint32_t y = 0;
+    std::uint32_t z = 0;
+
+    bool operator==(const PointCoordinateKey& other) const {
+        return x == other.x && y == other.y && z == other.z;
+    }
+};
+
+struct PointCoordinateKeyHash {
+    std::size_t operator()(const PointCoordinateKey& key) const {
+        std::size_t value = static_cast<std::size_t>(key.x) * 0x9e3779b1u;
+        value ^= static_cast<std::size_t>(key.y) * 0x85ebca77u;
+        value ^= static_cast<std::size_t>(key.z) * 0xc2b2ae3du;
+        return value;
+    }
+};
+
+static PointCoordinateKey point_coordinate_key(const PointT& point) {
+    PointCoordinateKey key;
+    std::memcpy(&key.x, &point.x, sizeof(float));
+    std::memcpy(&key.y, &point.y, sizeof(float));
+    std::memcpy(&key.z, &point.z, sizeof(float));
+    return key;
+}
+
+template <typename Decision>
+static void resolve_final_planes(
+    const std::vector<PlanePatch>& patches,
+    std::vector<Decision>& decisions) {
+    std::unordered_multimap<PointCoordinateKey, std::size_t, PointCoordinateKeyHash> requested;
+    requested.reserve(decisions.size());
+    for (std::size_t i = 0; i < decisions.size(); ++i) {
+        decisions[i].final_plane = -1;
+        requested.emplace(point_coordinate_key(decisions[i].point), i);
+    }
+    if (requested.empty()) return;
+    for (std::size_t plane_id = 0; plane_id < patches.size(); ++plane_id) {
+        for (const PointT& point : patches[plane_id].output->points) {
+            const auto range = requested.equal_range(point_coordinate_key(point));
+            for (auto match = range.first; match != range.second; ++match) {
+                decisions[match->second].final_plane = static_cast<int>(plane_id);
+            }
+        }
+    }
+}
+
 static void save_plane_patches(
     const fs::path& path,
     const std::vector<PlanePatch>& patches,
@@ -3789,17 +3887,23 @@ static void save_topology_corrections(
     if (!ply) throw std::runtime_error("Failed to write topology corrections: " + ply_path.string());
     write_color_ply_header(ply, corrections.size());
     for (const TopologyCorrection& correction : corrections) {
+        const auto color = correction.final_plane >= 0
+            ? color_for(static_cast<std::size_t>(correction.final_plane))
+            : std::array<std::uint8_t, 3>{128, 128, 128};
         ply << correction.point.x << ' ' << correction.point.y << ' ' << correction.point.z
-            << " 255 48 48\n";
+            << ' ' << static_cast<int>(color[0])
+            << ' ' << static_cast<int>(color[1])
+            << ' ' << static_cast<int>(color[2]) << '\n';
     }
 
     std::ofstream csv(csv_path);
     if (!csv) throw std::runtime_error("Failed to write topology corrections: " + csv_path.string());
-    csv << "x,y,z,from_plane,to_plane\n";
+    csv << "x,y,z,from_plane,to_plane,final_plane\n";
     csv << std::setprecision(9);
     for (const TopologyCorrection& correction : corrections) {
         csv << correction.point.x << ',' << correction.point.y << ',' << correction.point.z << ','
-            << correction.from_plane << ',' << correction.to_plane << '\n';
+            << correction.from_plane << ',' << correction.to_plane << ','
+            << correction.final_plane << '\n';
     }
 }
 
@@ -3811,12 +3915,17 @@ static void save_finite_support_region_decisions(
     if (!ply) throw std::runtime_error("Failed to write finite-support decisions: " + ply_path.string());
     write_color_ply_header(ply, decisions.size());
     for (const FiniteSupportRegionDecision& decision : decisions) {
+        const auto color = decision.final_plane >= 0
+            ? color_for(static_cast<std::size_t>(decision.final_plane))
+            : std::array<std::uint8_t, 3>{128, 128, 128};
         ply << decision.point.x << ' ' << decision.point.y << ' ' << decision.point.z
-            << " 255 48 48\n";
+            << ' ' << static_cast<int>(color[0])
+            << ' ' << static_cast<int>(color[1])
+            << ' ' << static_cast<int>(color[2]) << '\n';
     }
     std::ofstream csv(csv_path);
     if (!csv) throw std::runtime_error("Failed to write finite-support decisions: " + csv_path.string());
-    csv << "x,y,z,from_plane,to_plane,component,from_energy,to_energy,"
+    csv << "x,y,z,from_plane,to_plane,final_plane,component,from_energy,to_energy,"
            "from_support_distance,to_support_distance,normal_confidence,"
            "from_residual,to_residual,from_normal_dot,to_normal_dot,"
            "node_retain_energy,node_target_energy,candidate_from_missing_support,"
@@ -3825,7 +3934,8 @@ static void save_finite_support_region_decisions(
     csv << std::setprecision(9);
     for (const FiniteSupportRegionDecision& decision : decisions) {
         csv << decision.point.x << ',' << decision.point.y << ',' << decision.point.z << ','
-            << decision.from_plane << ',' << decision.to_plane << ',' << decision.component << ','
+            << decision.from_plane << ',' << decision.to_plane << ',' << decision.final_plane << ','
+            << decision.component << ','
             << decision.from_energy << ',' << decision.to_energy << ','
             << decision.from_support_distance << ',' << decision.to_support_distance << ','
             << decision.normal_confidence << ','
@@ -3952,6 +4062,7 @@ static void report_probe(
         float distance = 0.0f;
         float normal_dot = 0.0f;
         int local_support = 0;
+        int strict_local_support = 0;
         bool inside_tight = false;
         bool inside_assign = false;
     };
@@ -3978,6 +4089,9 @@ static void report_probe(
                 const int label = labels[static_cast<std::size_t>(neighbor->second)];
                 if (label >= 0 && static_cast<std::size_t>(label) < candidates.size()) {
                     ++candidates[static_cast<std::size_t>(label)].local_support;
+                    if (std::abs(dx) <= 1 && std::abs(dy) <= 1 && std::abs(dz) <= 1) {
+                        ++candidates[static_cast<std::size_t>(label)].strict_local_support;
+                    }
                 }
             }
         }
@@ -4027,6 +4141,7 @@ static void report_probe(
                   << ", distance=" << candidate.distance
                   << ", normal_dot=" << candidate.normal_dot
                   << ", local_support=" << candidate.local_support
+                  << ", strict_local_support=" << candidate.strict_local_support
                   << ", tight=" << (candidate.inside_tight ? "in" : "out")
                   << ", assign=" << (candidate.inside_assign ? "in" : "out")
                   << ", accepted=" << (candidate.distance <= cfg.assign_distance && candidate.inside_assign ? "yes" : "no")
@@ -4275,7 +4390,7 @@ int main(int argc, char** argv) {
         // Region competition must see every extracted model. Filtering or
         // absorbing a small plane first irreversibly removes a legitimate
         // finite-support alternative and biases the ablation.
-        const FiniteSupportRegionStats support_regions = cfg.finite_support_region_optimization
+        FiniteSupportRegionStats support_regions = cfg.finite_support_region_optimization
             ? optimize_finite_support_regions(
                 cloud, patches, surfels, bounds, cfg)
             : FiniteSupportRegionStats{};
@@ -4286,7 +4401,7 @@ int main(int argc, char** argv) {
         now = Clock::now();
         timings.finalize_ms = elapsed_ms(stage_start, now);
         stage_start = now;
-        const FiniteBoundaryPostprocessStats boundary_postprocess = cfg.finite_boundary_postprocess
+        FiniteBoundaryPostprocessStats boundary_postprocess = cfg.finite_boundary_postprocess
             ? correct_points_from_raw_geometry(
                 cloud, patches, surfels, neighborhoods, cfg)
             : FiniteBoundaryPostprocessStats{};
@@ -4317,6 +4432,10 @@ int main(int argc, char** argv) {
         now = Clock::now();
         timings.corners_ms = elapsed_ms(stage_start, now);
         stage_start = now;
+
+        resolve_final_planes(patches, dense_assignment.corrections);
+        resolve_final_planes(patches, boundary_postprocess.corrections);
+        resolve_final_planes(patches, support_regions.decisions);
 
         fs::path out_dir = cfg.output_dir / cfg.input.stem();
         fs::create_directories(out_dir);
@@ -4396,9 +4515,10 @@ int main(int argc, char** argv) {
             }
             std::cout << "Normal-guided dense candidates: " << dense_assignment.normal_guided_points
                       << ", established evidence: " << dense_assignment.established_guided_points
+                      << ", decisive edge owners: " << dense_assignment.edge_owner_guided_points
                       << ", applied: " << (normal_guidance_applied ? "yes" : "no") << "\n";
             std::cout << "Local-support dense candidates: " << dense_assignment.locally_supported_points << "\n";
-            std::cout << "Topology-guided dense assignments: "
+            std::cout << "Boundary-side guided dense assignments: "
                       << dense_assignment.topology_guided_points << "\n";
             std::cout << "Boundary-rejected dense candidates: "
                       << dense_assignment.boundary_rejected_candidates << "\n";
